@@ -1,6 +1,6 @@
-"use client";
+'use client';
 
-import { useEffect, useState } from "react";
+import { useEffect, useState } from 'react';
 import {
   Table,
   TableBody,
@@ -9,8 +9,8 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-} from "@/components/ui/table";
-import { Button } from "@/components/ui/button";
+} from '@/components/ui/table';
+import { Button } from '@/components/ui/button';
 
 interface VM {
   name: string;
@@ -26,7 +26,7 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/vms")
+    fetch('/api/vms')
       .then((res) => res.json())
       .then((data) => {
         if (data.error) {
@@ -45,9 +45,7 @@ export default function Dashboard() {
 
   if (error) {
     return (
-      <div className="container mx-auto py-10 text-red-600">
-        Error: {error}
-      </div>
+      <div className="container mx-auto py-10 text-red-600">Error: {error}</div>
     );
   }
 
@@ -71,25 +69,33 @@ export default function Dashboard() {
             <TableRow key={vm.id}>
               <TableCell className="font-medium">{vm.name}</TableCell>
               <TableCell>{vm.location}</TableCell>
-              <TableCell>{vm.size?.replace(/_/g, " ")}</TableCell>
+              <TableCell>{vm.size?.replace(/_/g, ' ')}</TableCell>
               <TableCell>
                 <span
                   className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                    vm.powerState.includes("running")
-                      ? "bg-green-100 text-green-800"
-                      : vm.powerState.includes("stopped")
-                      ? "bg-gray-100 text-gray-800"
-                      : "bg-yellow-100 text-yellow-800"
+                    vm.powerState.includes('running')
+                      ? 'bg-green-100 text-green-800'
+                      : vm.powerState.includes('stopped')
+                      ? 'bg-gray-100 text-gray-800'
+                      : 'bg-yellow-100 text-yellow-800'
                   }`}
                 >
                   {vm.powerState}
                 </span>
               </TableCell>
-              <TableCell className="font-mono text-xs text-gray-500 max-w-md truncate" title={vm.id}>
+              <TableCell
+                className="font-mono text-xs text-gray-500 max-w-md truncate"
+                title={vm.id}
+              >
                 {vm.id}
               </TableCell>
               <TableCell>
-                <Button className="cursor-pointer">Connect</Button>
+                <Button
+                  className="cursor-pointer"
+                  onClick={() => (window.location.href = '/guac')}
+                >
+                  Connect
+                </Button>
               </TableCell>
             </TableRow>
           ))}
