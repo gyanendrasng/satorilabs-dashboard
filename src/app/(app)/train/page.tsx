@@ -245,12 +245,18 @@ export default function TrainPage() {
             };
             getDisplayMedia?: (c: unknown) => Promise<MediaStream>;
           };
-          const getDisplayMediaFn =
-            anyNavigator.mediaDevices?.getDisplayMedia ||
-            anyNavigator.getDisplayMedia ||
-            null;
 
-          if (!getDisplayMediaFn) {
+          if (anyNavigator.mediaDevices?.getDisplayMedia) {
+            stream = await anyNavigator.mediaDevices.getDisplayMedia.call(
+              anyNavigator.mediaDevices,
+              displayConstraints as unknown as MediaStreamConstraints
+            );
+          } else if (anyNavigator.getDisplayMedia) {
+            stream = await anyNavigator.getDisplayMedia.call(
+              navigator,
+              displayConstraints as unknown as MediaStreamConstraints
+            );
+          } else {
             const insecure =
               typeof window !== 'undefined' &&
               window.location.protocol !== 'https:' &&
@@ -263,10 +269,6 @@ export default function TrainPage() {
             setIsRecording(false);
             return;
           }
-
-          stream = await getDisplayMediaFn(
-            displayConstraints as unknown as MediaStreamConstraints
-          );
           // We captured the whole tab; we'll software-crop to the iframe below
           shouldCropToIframe = true;
         } catch (err) {
