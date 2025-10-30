@@ -75,6 +75,7 @@ export default function GuacPage() {
           width="100%"
           height="800"
           style={{ border: 'none' }}
+          allow="display-capture; fullscreen; microphone; camera; clipboard-write"
           allowFullScreen
         />
       ) : (

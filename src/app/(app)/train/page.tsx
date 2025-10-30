@@ -197,45 +197,63 @@ export default function TrainPage() {
         }
       };
 
-      let didEnterFullscreen = false;
+      const didEnterFullscreen = false;
+      let shouldCropToIframe = false;
       let stream = await tryCaptureIframeStream();
 
       if (!stream) {
-        // Fallback: capture the tab and crop to the iframe region
-        const container = vmContainerRef.current;
-        if (container && container.requestFullscreen) {
-          try {
-            await container.requestFullscreen();
-            didEnterFullscreen = true;
-          } catch {
-            // Ignore fullscreen errors (user may deny)
+        // If embedded, ensure the parent iframe allows display-capture
+        try {
+          const inIframe = window.top !== window.self;
+          const policy = (
+            document as unknown as {
+              permissionsPolicy?: { allowsFeature: (f: string) => boolean };
+            }
+          ).permissionsPolicy;
+          const displayCaptureAllowed = policy
+            ? policy.allowsFeature('display-capture')
+            : true;
+          if (inIframe && !displayCaptureAllowed) {
+            setStatus(
+              'Screen capture blocked by embedding permissions. The parent iframe must include allow="display-capture; fullscreen".'
+            );
           }
-        }
+        } catch {}
 
+        // Fallback: capture the tab and crop to the iframe region
         const displayConstraints = {
           video: {
             frameRate: 30,
-            // Chromium-specific hints to prefer current tab capture
             preferCurrentTab: true,
             selfBrowserSurface: 'include',
             displaySurface: 'browser',
             surfaceSwitching: 'exclude',
-            // Hide Screen/Window options; show only browser/tab
             monitorTypeSurfaces: 'exclude',
             logicalSurface: true,
           },
-          // Capture tab audio only; hint to exclude system audio
           audio: {
             echoCancellation: true,
             noiseSuppression: true,
             autoGainControl: true,
-            // Non-standard; hints for Chromium-based browsers
             systemAudio: 'exclude',
           },
         } as const;
-        stream = await navigator.mediaDevices.getDisplayMedia(
-          displayConstraints as unknown as MediaStreamConstraints
-        );
+        try {
+          stream = await navigator.mediaDevices.getDisplayMedia(
+            displayConstraints as unknown as MediaStreamConstraints
+          );
+          // We captured the whole tab; we'll software-crop to the iframe below
+          shouldCropToIframe = true;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          setStatus(
+            `Screen capture not started: ${
+              message || 'Permission denied or blocked.'
+            }`
+          );
+          setIsRecording(false);
+          return;
+        }
 
         // Try to crop the captured tab to only the VM iframe (Region Capture)
         try {
@@ -259,16 +277,25 @@ export default function TrainPage() {
         // We'll exit fullscreen in onstop only if we entered it here
       }
 
-      // Composite the video with overlays (click indicators)
+      // Composite the video with overlays (click indicators), and crop if needed
       try {
         const vt = stream.getVideoTracks()[0];
         const settings = vt.getSettings();
-        const targetWidth = (settings.width ||
-          iframeRef.current?.clientWidth ||
+
+        const iframeEl = iframeRef.current;
+        const iframeRect = iframeEl?.getBoundingClientRect();
+
+        let targetWidth = (settings.width ||
+          iframeEl?.clientWidth ||
           1280) as number;
-        const targetHeight = (settings.height ||
-          iframeRef.current?.clientHeight ||
+        let targetHeight = (settings.height ||
+          iframeEl?.clientHeight ||
           720) as number;
+
+        if (shouldCropToIframe && iframeRect) {
+          targetWidth = Math.max(1, Math.round(iframeRect.width));
+          targetHeight = Math.max(1, Math.round(iframeRect.height));
+        }
 
         const videoEl = document.createElement('video');
         videoEl.srcObject = stream;
@@ -316,10 +343,36 @@ export default function TrainPage() {
 
         const drawFrame = () => {
           if (!ctx) return;
-          // Draw the base video frame
+          // Draw the base video frame (cropped to iframe if needed)
           ctx.clearRect(0, 0, targetWidth, targetHeight);
           try {
-            ctx.drawImage(videoEl, 0, 0, targetWidth, targetHeight);
+            if (shouldCropToIframe && iframeRef.current) {
+              const rect = iframeRef.current.getBoundingClientRect();
+              // Map from viewport pixels to captured video pixels
+              const sourceW = (settings.width || window.innerWidth) as number;
+              const sourceH = (settings.height || window.innerHeight) as number;
+              const scaleX = sourceW / window.innerWidth;
+              const scaleY = sourceH / window.innerHeight;
+
+              const sx = Math.max(0, Math.round(rect.left * scaleX));
+              const sy = Math.max(0, Math.round(rect.top * scaleY));
+              const sWidth = Math.max(1, Math.round(rect.width * scaleX));
+              const sHeight = Math.max(1, Math.round(rect.height * scaleY));
+
+              ctx.drawImage(
+                videoEl,
+                sx,
+                sy,
+                sWidth,
+                sHeight,
+                0,
+                0,
+                targetWidth,
+                targetHeight
+              );
+            } else {
+              ctx.drawImage(videoEl, 0, 0, targetWidth, targetHeight);
+            }
           } catch {
             // ignore draw errors while video warms up
           }
@@ -409,9 +462,16 @@ export default function TrainPage() {
 
       mediaRecorder.start();
       setIsRecording(true);
-    } catch {
-      // User may cancel the capture prompt or an error may occur
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setStatus(`Recording failed to start: ${message || 'Unknown error'}`);
       setIsRecording(false);
+      // Best-effort exit from fullscreen if active
+      try {
+        if (document.fullscreenElement) {
+          await document.exitFullscreen();
+        }
+      } catch {}
     }
   }
 
@@ -548,6 +608,7 @@ export default function TrainPage() {
                 width="100%"
                 height={800}
                 style={{ border: 'none' }}
+                allow="display-capture; fullscreen; microphone; camera; clipboard-write"
                 allowFullScreen
               />
             ) : (
