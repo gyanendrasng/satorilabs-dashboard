@@ -65,7 +65,7 @@ export default function TrainPage() {
     async function run() {
       try {
         setStatus('Creating connection via server...');
-        const resp = await fetch('/api/guacamole/create-connection', {
+        const resp = await fetch('/backend/guacamole/create-connection', {
           method: 'POST',
         });
         const data: CreateConnectionResponse = await resp.json();
@@ -90,7 +90,7 @@ export default function TrainPage() {
     return () => {
       cancelled = true;
       if (created && connectionId) {
-        fetch('/api/guacamole/delete-connection', {
+        fetch('/backend/guacamole/delete-connection', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ identifier: connectionId }),

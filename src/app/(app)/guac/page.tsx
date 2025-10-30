@@ -18,7 +18,7 @@ export default function GuacPage() {
     async function run() {
       try {
         setStatus('Creating connection via server...');
-        const resp = await fetch('/api/guacamole/create-connection', {
+        const resp = await fetch('/backend/guacamole/create-connection', {
           method: 'POST',
         });
         const data = await resp.json();
@@ -41,7 +41,7 @@ export default function GuacPage() {
       cancelled = true;
       // Best-effort cleanup if we created an ephemeral connection
       if (created && connectionId) {
-        fetch('/api/guacamole/delete-connection', {
+        fetch('/backend/guacamole/delete-connection', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ identifier: connectionId }),

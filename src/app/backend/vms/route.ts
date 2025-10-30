@@ -17,7 +17,7 @@ export async function GET() {
 
     for await (const vm of client.virtualMachines.listAll()) {
       // 🔹 extract the resource group name from the full VM ID
-      const rgName = vm.id?.split('/')[4]!;
+      const rgName = vm.id?.split('/')![4]!;
       let powerState = 'Unknown';
 
       try {
@@ -52,3 +52,5 @@ export async function GET() {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
+
+

@@ -26,7 +26,7 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch('/api/vms')
+    fetch('/backend/vms')
       .then((res) => res.json())
       .then((data) => {
         if (data.error) {
