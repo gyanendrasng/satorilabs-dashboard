@@ -239,7 +239,32 @@ export default function TrainPage() {
           },
         } as const;
         try {
-          stream = await navigator.mediaDevices.getDisplayMedia(
+          const anyNavigator = navigator as unknown as {
+            mediaDevices?: {
+              getDisplayMedia?: (c: unknown) => Promise<MediaStream>;
+            };
+            getDisplayMedia?: (c: unknown) => Promise<MediaStream>;
+          };
+          const getDisplayMediaFn =
+            anyNavigator.mediaDevices?.getDisplayMedia ||
+            anyNavigator.getDisplayMedia ||
+            null;
+
+          if (!getDisplayMediaFn) {
+            const insecure =
+              typeof window !== 'undefined' &&
+              window.location.protocol !== 'https:' &&
+              window.location.hostname !== 'localhost';
+            setStatus(
+              insecure
+                ? 'Screen capture requires HTTPS (or localhost). Please use a secure origin.'
+                : 'Screen capture API is not supported in this browser. Try the latest Chrome/Edge on desktop.'
+            );
+            setIsRecording(false);
+            return;
+          }
+
+          stream = await getDisplayMediaFn(
             displayConstraints as unknown as MediaStreamConstraints
           );
           // We captured the whole tab; we'll software-crop to the iframe below

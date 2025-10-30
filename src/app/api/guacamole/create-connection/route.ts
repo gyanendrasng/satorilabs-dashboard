@@ -131,6 +131,7 @@ export async function POST() {
       created: true,
     });
   } catch (err: unknown) {
+    console.log(err)
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json(
       { error: message || 'Create connection error' },
