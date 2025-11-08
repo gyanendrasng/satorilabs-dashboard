@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import {
   Table,
   TableBody,
@@ -11,6 +12,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Button } from '@/components/ui/button';
+import { useSession, authClient } from '@/lib/auth-client';
 
 interface VM {
   name: string;
@@ -21,11 +23,14 @@ interface VM {
 }
 
 export default function Dashboard() {
+  const { data: session, isPending } = useSession();
+  const router = useRouter();
   const [vms, setVms] = useState<VM[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    // Middleware ensures we're authenticated, so just fetch VMs
     fetch('/backend/vms')
       .then((res) => res.json())
       .then((data) => {
@@ -39,6 +44,15 @@ export default function Dashboard() {
       .finally(() => setLoading(false));
   }, []);
 
+  const handleSignOut = async () => {
+    await authClient.signOut();
+    router.push('/sign-in');
+  };
+
+  if (isPending) {
+    return <div className="container mx-auto py-10">Loading session...</div>;
+  }
+
   if (loading) {
     return <div className="container mx-auto py-10">Loading VMs...</div>;
   }
@@ -51,7 +65,17 @@ export default function Dashboard() {
 
   return (
     <div className="container mx-auto py-10">
-      <h1 className="text-3xl font-bold mb-6">Virtual Machines</h1>
+      <div className="flex justify-between items-center mb-6">
+        <div>
+          <h1 className="text-3xl font-bold">Virtual Machines</h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Welcome, {session?.user?.name || session?.user?.email || 'User'}
+          </p>
+        </div>
+        <Button variant="outline" onClick={handleSignOut}>
+          Sign Out
+        </Button>
+      </div>
       <Table>
         <TableCaption>A list of all Azure virtual machines.</TableCaption>
         <TableHeader>
