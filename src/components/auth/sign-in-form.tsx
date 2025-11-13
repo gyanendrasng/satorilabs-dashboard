@@ -33,6 +33,7 @@ export function SignInForm() {
         {
           email,
           password,
+          callbackURL:'/dashboard'
         },
         {
           onSuccess: () => {
