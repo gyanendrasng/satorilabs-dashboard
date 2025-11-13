@@ -638,10 +638,13 @@ export default function TrainingSessionPage() {
           } catch (chunkErr) {
             console.error(`Error uploading chunk part ${currentPartNumber}:`, chunkErr);
             throw chunkErr;
-          } finally {
-            pendingUploadsRef.current.delete(uploadPromise);
           }
         })();
+
+        // Add cleanup after promise is created
+        uploadPromise.finally(() => {
+          pendingUploadsRef.current.delete(uploadPromise);
+        });
 
         pendingUploadsRef.current.add(uploadPromise);
         partNumberRef.current += 1;
