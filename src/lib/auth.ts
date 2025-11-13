@@ -14,4 +14,5 @@ export const auth = betterAuth({
   baseURL: 'https://app.satorilabs.tech',
   basePath: '/backend/auth',
   secret: process.env.BETTER_AUTH_SECRET,
+  trustedOrigins: ['https://app.satorilabs.tech'],
 });
