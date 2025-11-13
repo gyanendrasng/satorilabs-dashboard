@@ -41,7 +41,7 @@ export async function middleware(request: NextRequest) {
     );
 
     console.log('response', response);
-    
+
     if (!response.ok) {
       // Invalid session, redirect to sign-in
       // const signInUrl = new URL('/sign-in', request.url);
@@ -79,6 +79,6 @@ export const config = {
      * - favicon.ico (favicon file)
      * - public assets
      */
-    '/((?!backend|_next/static|_next/image|favicon.ico|.*\\.png$|.*\\.jpg$|.*\\.jpeg$|.*\\.gif$|.*\\.svg$).*)',
+    // '/((?!backend|_next/static|_next/image|favicon.ico|.*\\.png$|.*\\.jpg$|.*\\.jpeg$|.*\\.gif$|.*\\.svg$).*)',
   ],
 };
