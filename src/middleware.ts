@@ -40,20 +40,22 @@ export async function middleware(request: NextRequest) {
       }
     );
 
+    console.log('response', response);
+    
     if (!response.ok) {
       // Invalid session, redirect to sign-in
-      const signInUrl = new URL('/sign-in', request.url);
-      signInUrl.searchParams.set('callbackUrl', pathname);
-      return NextResponse.redirect(signInUrl);
+      // const signInUrl = new URL('/sign-in', request.url);
+      // signInUrl.searchParams.set('callbackUrl', pathname);
+      // return NextResponse.redirect(signInUrl);
     }
 
     const session = await response.json();
 
     if (!session || !session.user) {
       // No valid session, redirect to sign-in
-      const signInUrl = new URL('/sign-in', request.url);
-      signInUrl.searchParams.set('callbackUrl', pathname);
-      return NextResponse.redirect(signInUrl);
+      // const signInUrl = new URL('/sign-in', request.url);
+      // signInUrl.searchParams.set('callbackUrl', pathname);
+      // return NextResponse.redirect(signInUrl);
     }
 
     // Valid session, allow access
