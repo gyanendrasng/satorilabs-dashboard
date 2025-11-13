@@ -63,7 +63,7 @@ export default function TrainingSessionPage() {
       try {
         setIsLoading(true);
         const response = await fetch(`/api/chat/${sessionId}`);
-        
+
         if (!response.ok) {
           if (response.status === 404) {
             setError('Training session not found');
@@ -161,6 +161,59 @@ export default function TrainingSessionPage() {
   const rafIdRef = useRef<number | null>(null);
   const removeIframeClickListenerRef = useRef<(() => void) | null>(null);
 
+  // S3 upload state
+  const uploadIdRef = useRef<string | null>(null);
+  const partNumberRef = useRef<number>(1);
+  const uploadedPartsRef = useRef<Array<{ partNumber: number; etag: string }>>(
+    []
+  );
+  const recordingStartTimeRef = useRef<number | null>(null);
+  const clicksToUploadRef = useRef<
+    Array<{ x: number; y: number; t: number; timestamp: number }>
+  >([]);
+  const clickUploadTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingUploadsRef = useRef<Set<Promise<void>>>(new Set());
+  // Buffer chunks until we reach minimum part size (5 MB for S3/R2)
+  const chunkBufferRef = useRef<Blob[]>([]);
+  const chunkBufferSizeRef = useRef<number>(0);
+  const MIN_PART_SIZE = 5 * 1024 * 1024; // 5 MB minimum part size
+
+  // Upload clicks to S3
+  const uploadClicks = async () => {
+    if (
+      clicksToUploadRef.current.length === 0 ||
+      !recordingStartTimeRef.current
+    ) {
+      return;
+    }
+
+    const clicksToSend = [...clicksToUploadRef.current];
+    clicksToUploadRef.current = [];
+
+    try {
+      const response = await fetch('/api/upload/clicks', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId,
+          clicks: clicksToSend,
+        }),
+      });
+
+      if (!response.ok) {
+        console.error('Failed to upload clicks:', await response.text());
+        // Re-add clicks to queue for retry
+        clicksToUploadRef.current.unshift(...clicksToSend);
+      }
+    } catch (err) {
+      console.error('Error uploading clicks:', err);
+      // Re-add clicks to queue for retry
+      clicksToUploadRef.current.unshift(...clicksToSend);
+    }
+  };
+
   async function startRecording() {
     try {
       setDownloadUrl((prev) => {
@@ -175,7 +228,9 @@ export default function TrainingSessionPage() {
           const doc = iframe.contentDocument || iframe.contentWindow?.document;
           if (!doc) return null;
 
-          const canvas = doc.querySelector('canvas') as HTMLCanvasElement | null;
+          const canvas = doc.querySelector(
+            'canvas'
+          ) as HTMLCanvasElement | null;
           const audioEl = doc.querySelector('audio, video') as
             | (HTMLMediaElement & { captureStream?: () => MediaStream })
             | null;
@@ -290,7 +345,9 @@ export default function TrainingSessionPage() {
 
         try {
           const iframeEl = iframeRef.current;
-          const videoTrack = stream.getVideoTracks()[0] as CropTrack | undefined;
+          const videoTrack = stream.getVideoTracks()[0] as
+            | CropTrack
+            | undefined;
           const cropTargetStatic: CropTargetStatic = (
             window as unknown as {
               CropTarget?: { fromElement(el: Element): Promise<unknown> };
@@ -310,8 +367,12 @@ export default function TrainingSessionPage() {
         const iframeEl = iframeRef.current;
         const iframeRect = iframeEl?.getBoundingClientRect();
 
-        let targetWidth = (settings.width || iframeEl?.clientWidth || 1280) as number;
-        let targetHeight = (settings.height || iframeEl?.clientHeight || 720) as number;
+        let targetWidth = (settings.width ||
+          iframeEl?.clientWidth ||
+          1280) as number;
+        let targetHeight = (settings.height ||
+          iframeEl?.clientHeight ||
+          720) as number;
 
         if (shouldCropToIframe && iframeRect) {
           targetWidth = Math.max(1, Math.round(iframeRect.width));
@@ -339,7 +400,27 @@ export default function TrainingSessionPage() {
               const vh = win.innerHeight || targetHeight;
               const x = (e.clientX / vw) * targetWidth;
               const y = (e.clientY / vh) * targetHeight;
-              clickRipplesRef.current.push({ x, y, t: performance.now() });
+              const now = performance.now();
+              clickRipplesRef.current.push({ x, y, t: now });
+
+              // Track click for S3 upload with timestamp relative to recording start
+              if (recordingStartTimeRef.current) {
+                const timestamp = now - recordingStartTimeRef.current;
+                clicksToUploadRef.current.push({ x, y, t: now, timestamp });
+
+                // Debounce click uploads - upload every 5 seconds or every 10 clicks
+                if (clickUploadTimeoutRef.current) {
+                  clearTimeout(clickUploadTimeoutRef.current);
+                }
+
+                if (clicksToUploadRef.current.length >= 10) {
+                  uploadClicks();
+                } else {
+                  clickUploadTimeoutRef.current = setTimeout(() => {
+                    uploadClicks();
+                  }, 5000);
+                }
+              }
             };
             doc.addEventListener('pointerdown', handler, { capture: true });
             removeIframeClickListenerRef.current = () => {
@@ -366,7 +447,17 @@ export default function TrainingSessionPage() {
               const sWidth = Math.max(1, Math.round(rect.width * scaleX));
               const sHeight = Math.max(1, Math.round(rect.height * scaleY));
 
-              ctx.drawImage(videoEl, sx, sy, sWidth, sHeight, 0, 0, targetWidth, targetHeight);
+              ctx.drawImage(
+                videoEl,
+                sx,
+                sy,
+                sWidth,
+                sHeight,
+                0,
+                0,
+                targetWidth,
+                targetHeight
+              );
             } else {
               ctx.drawImage(videoEl, 0, 0, targetWidth, targetHeight);
             }
@@ -407,30 +498,280 @@ export default function TrainingSessionPage() {
 
       streamRef.current = stream;
 
+      // Initialize S3 multipart upload
+      let uploadId: string;
+      try {
+        const initResponse = await fetch('/api/upload/recording/init', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ sessionId }),
+        });
+
+        if (!initResponse.ok) {
+          throw new Error('Failed to initialize S3 upload');
+        }
+
+        const initData = await initResponse.json();
+        uploadId = initData.uploadId;
+        uploadIdRef.current = uploadId;
+        partNumberRef.current = 1;
+        uploadedPartsRef.current = [];
+        recordingStartTimeRef.current = performance.now();
+        clicksToUploadRef.current = [];
+        pendingUploadsRef.current.clear();
+        chunkBufferRef.current = [];
+        chunkBufferSizeRef.current = 0;
+      } catch (uploadErr) {
+        console.error('Failed to initialize S3 upload:', uploadErr);
+        setStatus('Warning: Recording will not be uploaded to S3');
+      }
+
       const chunks: BlobPart[] = [];
       const mimeCandidates = [
         'video/webm;codecs=vp9',
         'video/webm;codecs=vp8',
         'video/webm',
       ];
-      const selectedMime = mimeCandidates.find((t) => MediaRecorder.isTypeSupported(t));
+      const selectedMime = mimeCandidates.find((t) =>
+        MediaRecorder.isTypeSupported(t)
+      );
       const mediaRecorder = new MediaRecorder(
         stream,
         selectedMime ? { mimeType: selectedMime } : undefined
       );
       mediaRecorderRef.current = mediaRecorder;
 
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunks.push(e.data);
+      // Upload chunk to S3 when available
+      // Buffer chunks and ensure all non-final parts are exactly MIN_PART_SIZE
+      const flushChunkBuffer = async (isFinal: boolean = false) => {
+        if (!uploadIdRef.current || chunkBufferRef.current.length === 0) {
+          return;
+        }
+
+        // For non-final parts, we need exactly MIN_PART_SIZE
+        // For final part, we can upload whatever remains
+        if (!isFinal && chunkBufferSizeRef.current < MIN_PART_SIZE) {
+          return;
+        }
+
+        const currentPartNumber = partNumberRef.current;
+        let partBlob: Blob;
+        const remainingChunks: Blob[] = [];
+
+        if (isFinal) {
+          // Final part: upload everything remaining
+          partBlob = new Blob([...chunkBufferRef.current], {
+            type: selectedMime || 'video/webm',
+          });
+          chunkBufferRef.current = [];
+          chunkBufferSizeRef.current = 0;
+        } else {
+          // Non-final part: extract exactly MIN_PART_SIZE bytes
+          let bytesExtracted = 0;
+          const chunksForPart: Blob[] = [];
+
+          for (const chunk of chunkBufferRef.current) {
+            if (bytesExtracted >= MIN_PART_SIZE) {
+              // We've extracted enough, keep the rest
+              remainingChunks.push(chunk);
+              continue;
+            }
+
+            const chunkSize = chunk.size;
+            const remainingNeeded = MIN_PART_SIZE - bytesExtracted;
+
+            if (bytesExtracted + chunkSize <= MIN_PART_SIZE) {
+              // Use entire chunk
+              chunksForPart.push(chunk);
+              bytesExtracted += chunkSize;
+            } else {
+              // Need to split chunk: take exactly what we need
+              const part1 = chunk.slice(0, remainingNeeded);
+              const part2 = chunk.slice(remainingNeeded);
+              chunksForPart.push(part1);
+              remainingChunks.push(part2);
+              bytesExtracted = MIN_PART_SIZE;
+            }
+          }
+
+          partBlob = new Blob(chunksForPart, {
+            type: selectedMime || 'video/webm',
+          });
+
+          // Update buffer with remaining chunks
+          chunkBufferRef.current = remainingChunks;
+          chunkBufferSizeRef.current = remainingChunks.reduce(
+            (sum, chunk) => sum + chunk.size,
+            0
+          );
+        }
+
+        const uploadPromise = (async () => {
+          try {
+            const formData = new FormData();
+            formData.append('sessionId', sessionId);
+            formData.append('uploadId', uploadIdRef.current!);
+            formData.append('partNumber', currentPartNumber.toString());
+            formData.append('chunk', partBlob);
+
+            const uploadResponse = await fetch('/api/upload/recording/part', {
+              method: 'POST',
+              body: formData,
+            });
+
+            if (uploadResponse.ok) {
+              const partData = await uploadResponse.json();
+              uploadedPartsRef.current.push({
+                partNumber: partData.partNumber,
+                etag: partData.etag,
+              });
+            } else {
+              const errorText = await uploadResponse.text();
+              console.error(
+                `Failed to upload chunk part ${currentPartNumber}:`,
+                errorText
+              );
+              throw new Error(`Upload failed: ${errorText}`);
+            }
+          } catch (chunkErr) {
+            console.error(`Error uploading chunk part ${currentPartNumber}:`, chunkErr);
+            throw chunkErr;
+          } finally {
+            pendingUploadsRef.current.delete(uploadPromise);
+          }
+        })();
+
+        pendingUploadsRef.current.add(uploadPromise);
+        partNumberRef.current += 1;
       };
 
-      mediaRecorder.onstop = () => {
+      mediaRecorder.ondataavailable = async (e) => {
+        if (e.data && e.data.size > 0) {
+          chunks.push(e.data);
+
+          // Buffer chunks for S3 upload
+          if (uploadIdRef.current) {
+            chunkBufferRef.current.push(e.data);
+            chunkBufferSizeRef.current += e.data.size;
+
+            // Upload parts of exactly MIN_PART_SIZE when buffer has enough data
+            // Keep flushing until buffer is less than MIN_PART_SIZE
+            while (
+              uploadIdRef.current &&
+              chunkBufferSizeRef.current >= MIN_PART_SIZE
+            ) {
+              await flushChunkBuffer(false);
+            }
+          }
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
         const blob = new Blob(chunks, { type: selectedMime || 'video/webm' });
         const url = URL.createObjectURL(blob);
         setDownloadUrl(url);
         setIsRecording(false);
+
+        // Flush any remaining buffered chunks (final part)
+        if (uploadIdRef.current && chunkBufferRef.current.length > 0) {
+          setStatus('Uploading final chunk...');
+          await flushChunkBuffer(true);
+        }
+
+        // Wait for all pending chunk uploads to complete before finalizing
+        if (uploadIdRef.current && pendingUploadsRef.current.size > 0) {
+          setStatus('Waiting for uploads to complete...');
+          try {
+            // Wait for all pending uploads with a timeout
+            await Promise.allSettled(
+              Array.from(pendingUploadsRef.current)
+            );
+            
+            // Give a small delay to ensure all parts are registered
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          } catch (err) {
+            console.error('Error waiting for uploads:', err);
+          }
+        }
+
+        // Complete multipart upload if it was started
+        // Only complete if we have at least one part uploaded
+        if (uploadIdRef.current && uploadedPartsRef.current.length > 0) {
+          setStatus('Completing upload...');
+          try {
+            const completeResponse = await fetch(
+              '/api/upload/recording/complete',
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  sessionId,
+                  uploadId: uploadIdRef.current,
+                  parts: uploadedPartsRef.current,
+                }),
+              }
+            );
+
+            if (completeResponse.ok) {
+              setStatus('Recording uploaded successfully');
+            } else {
+              const errorText = await completeResponse.text();
+              console.error('Failed to complete upload:', errorText);
+              setStatus(`Upload failed: ${errorText}`);
+              // Try to abort the upload
+              try {
+                await fetch('/api/upload/recording/abort', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({
+                    sessionId,
+                    uploadId: uploadIdRef.current,
+                  }),
+                });
+              } catch {}
+            }
+          } catch (completeErr) {
+            console.error('Error completing upload:', completeErr);
+            setStatus(`Upload error: ${completeErr instanceof Error ? completeErr.message : 'Unknown error'}`);
+          }
+        } else if (uploadIdRef.current && uploadedPartsRef.current.length === 0) {
+          // No parts were uploaded, abort the multipart upload
+          try {
+            await fetch('/api/upload/recording/abort', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                sessionId,
+                uploadId: uploadIdRef.current,
+              }),
+            });
+          } catch {}
+        }
+
+        // Upload remaining clicks
+        if (
+          clicksToUploadRef.current.length > 0 &&
+          recordingStartTimeRef.current
+        ) {
+          await uploadClicks();
+        }
+
+        // Cleanup
         stream.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
+        uploadIdRef.current = null;
+        recordingStartTimeRef.current = null;
+        pendingUploadsRef.current.clear();
+        chunkBufferRef.current = [];
+        chunkBufferSizeRef.current = 0;
         if (didEnterFullscreen && document.fullscreenElement) {
           document.exitFullscreen().catch(() => {});
         }
@@ -444,15 +785,39 @@ export default function TrainingSessionPage() {
           } catch {}
           removeIframeClickListenerRef.current = null;
         }
+        if (clickUploadTimeoutRef.current) {
+          clearTimeout(clickUploadTimeoutRef.current);
+          clickUploadTimeoutRef.current = null;
+        }
         clickRipplesRef.current = [];
       };
 
-      mediaRecorder.start();
+      // Start recording with timeslice to get data chunks periodically (every 1 second)
+      // This ensures chunks are uploaded continuously during recording
+      mediaRecorder.start(1000); // timeslice: 1000ms = 1 second
       setIsRecording(true);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setStatus(`Recording failed to start: ${message || 'Unknown error'}`);
       setIsRecording(false);
+
+      // Abort any multipart upload that was started
+      if (uploadIdRef.current) {
+        try {
+          await fetch('/api/upload/recording/abort', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              sessionId,
+              uploadId: uploadIdRef.current,
+            }),
+          });
+        } catch {}
+        uploadIdRef.current = null;
+      }
+
       try {
         if (document.fullscreenElement) {
           await document.exitFullscreen();
@@ -463,7 +828,14 @@ export default function TrainingSessionPage() {
 
   function stopRecording() {
     try {
-      mediaRecorderRef.current?.stop();
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== 'inactive') {
+        // Request final data chunk before stopping
+        if (recorder.state === 'recording') {
+          recorder.requestData();
+        }
+        recorder.stop();
+      }
     } catch {}
   }
 
@@ -485,7 +857,9 @@ export default function TrainingSessionPage() {
       <div className="container mx-auto py-6">
         <div className="flex items-center justify-center h-[600px]">
           <div className="flex flex-col items-center gap-4 text-center">
-            <div className="text-destructive text-xl font-semibold">{error}</div>
+            <div className="text-destructive text-xl font-semibold">
+              {error}
+            </div>
             <button
               onClick={handleBack}
               className="text-sm text-primary underline underline-offset-4"
@@ -502,7 +876,11 @@ export default function TrainingSessionPage() {
     <div className="container mx-auto py-6">
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Left: Chat Interface */}
-        <div className={`flex flex-col rounded-lg border ${isRecording ? 'hidden' : ''}`}>
+        <div
+          className={`flex flex-col rounded-lg border ${
+            isRecording ? 'hidden' : ''
+          }`}
+        >
           <TrainingChat
             session={session}
             onBack={handleBack}
@@ -512,7 +890,9 @@ export default function TrainingSessionPage() {
 
         {/* Right: VM Screen */}
         <div
-          className={`flex flex-col rounded-lg border ${isRecording ? 'col-span-2' : ''}`}
+          className={`flex flex-col rounded-lg border ${
+            isRecording ? 'col-span-2' : ''
+          }`}
           ref={vmContainerRef}
         >
           <div className="px-4 py-3 border-b flex items-center justify-between gap-4">
@@ -522,7 +902,11 @@ export default function TrainingSessionPage() {
             </div>
             <div className="flex items-center gap-2">
               {!isRecording ? (
-                <Button size="sm" onClick={startRecording} aria-label="Start recording">
+                <Button
+                  size="sm"
+                  onClick={startRecording}
+                  aria-label="Start recording"
+                >
                   <CircleDot className="size-4" />
                   <span className="hidden sm:inline ml-2">Record</span>
                 </Button>
