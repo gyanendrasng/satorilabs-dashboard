@@ -29,7 +29,7 @@ export async function POST(request: Request) {
       key,
     });
   } catch (error) {
-    console.error('[/api/upload/recording/init] Error:', error);
+    console.error('[/backend/upload/recording/init] Error:', error);
     return NextResponse.json(
       {
         error: 'Failed to initialize upload',
@@ -39,3 +39,4 @@ export async function POST(request: Request) {
     );
   }
 }
+

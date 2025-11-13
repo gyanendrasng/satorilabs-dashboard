@@ -5,14 +5,14 @@ import { prisma } from '@/lib/prisma';
 // GET - List all chats for the authenticated user
 export async function GET(request: Request) {
   try {
-    console.log('[/api/chats] GET request received');
+    console.log('[/backend/chats] GET request received');
 
     const session = await auth.api.getSession({
       headers: request.headers,
     });
 
     console.log(
-      '[/api/chats] Session:',
+      '[/backend/chats] Session:',
       session ? 'authenticated' : 'not authenticated'
     );
 
@@ -38,9 +38,9 @@ export async function GET(request: Request) {
 
     return NextResponse.json({ chats });
   } catch (error) {
-    console.error('[/api/chats] Error:', error);
+    console.error('[/backend/chats] Error:', error);
     console.error(
-      '[/api/chats] Error stack:',
+      '[/backend/chats] Error stack:',
       error instanceof Error ? error.stack : 'No stack'
     );
     return NextResponse.json(
@@ -82,3 +82,4 @@ export async function POST(request: Request) {
     );
   }
 }
+

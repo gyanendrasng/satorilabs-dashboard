@@ -82,7 +82,7 @@ export function TrainingChat({
     while (pollingRef.current) {
       try {
         const response = await fetch(
-          `/api/chat/poll?responseId=${encodeURIComponent(
+          `/backend/chat/poll?responseId=${encodeURIComponent(
             responseId
           )}&lastChunkIndex=${lastChunkIndex}`
         );
@@ -166,7 +166,7 @@ export function TrainingChat({
 
     try {
       // Submit message to API
-      const response = await fetch('/api/chat', {
+      const response = await fetch('/backend/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -206,7 +206,7 @@ export function TrainingChat({
     }
 
     try {
-      const response = await fetch(`/api/chat/${session.id}`, {
+      const response = await fetch(`/backend/chat/${session.id}`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',

@@ -5,12 +5,12 @@ import { formatDistanceToNow } from 'date-fns';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { 
-  MessageSquare, 
-  Plus, 
-  Trash2, 
+import {
+  MessageSquare,
+  Plus,
+  Trash2,
   ChevronRight,
-  Loader2 
+  Loader2,
 } from 'lucide-react';
 import {
   Dialog,
@@ -41,9 +41,9 @@ interface TrainingListProps {
   onCreateSession: () => void;
 }
 
-export function TrainingList({ 
-  onSelectSession, 
-  onCreateSession
+export function TrainingList({
+  onSelectSession,
+  onCreateSession,
 }: TrainingListProps) {
   const [sessions, setSessions] = useState<TrainingSession[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -53,7 +53,7 @@ export function TrainingList({
   const loadSessions = async () => {
     try {
       setIsLoading(true);
-      const response = await fetch('/api/chats');
+      const response = await fetch('/backend/chats');
       if (!response.ok) {
         throw new Error('Failed to load sessions');
       }
@@ -76,7 +76,7 @@ export function TrainingList({
     setDeletingId(sessionId);
 
     try {
-      const response = await fetch(`/api/chat/${sessionId}`, {
+      const response = await fetch(`/backend/chat/${sessionId}`, {
         method: 'DELETE',
       });
 
@@ -85,8 +85,7 @@ export function TrainingList({
       }
 
       // Remove from local state
-      setSessions(prev => prev.filter(s => s.id !== sessionId));
-      
+      setSessions((prev) => prev.filter((s) => s.id !== sessionId));
     } catch (error) {
       console.error('Failed to delete session:', error);
     } finally {
@@ -101,8 +100,8 @@ export function TrainingList({
     }
     const lastMessage = session.messages[session.messages.length - 1];
     const preview = lastMessage.content.slice(0, 100);
-    return preview.length < lastMessage.content.length 
-      ? `${preview}...` 
+    return preview.length < lastMessage.content.length
+      ? `${preview}...`
       : preview;
   };
 
@@ -185,13 +184,13 @@ export function TrainingList({
                           <DialogHeader>
                             <DialogTitle>Delete Training Session</DialogTitle>
                             <DialogDescription>
-                              Are you sure you want to delete "{session.title}"? 
+                              Are you sure you want to delete "{session.title}"?
                               This action cannot be undone.
                             </DialogDescription>
                           </DialogHeader>
                           <DialogFooter>
                             <Button variant="outline">Cancel</Button>
-                            <Button 
+                            <Button
                               variant="destructive"
                               onClick={(e) => handleDelete(e, session.id)}
                             >

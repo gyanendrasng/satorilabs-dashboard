@@ -28,7 +28,7 @@ export async function POST(request: Request) {
       success: true,
     });
   } catch (error) {
-    console.error('[/api/upload/recording/abort] Error:', error);
+    console.error('[/backend/upload/recording/abort] Error:', error);
     return NextResponse.json(
       {
         error: 'Failed to abort upload',
@@ -38,3 +38,4 @@ export async function POST(request: Request) {
     );
   }
 }
+

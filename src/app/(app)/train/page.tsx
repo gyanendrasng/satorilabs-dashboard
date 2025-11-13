@@ -27,7 +27,7 @@ export default function TrainPage() {
 
   const handleCreateSession = async () => {
     try {
-      const response = await fetch('/api/chats', {
+      const response = await fetch('/backend/chats', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

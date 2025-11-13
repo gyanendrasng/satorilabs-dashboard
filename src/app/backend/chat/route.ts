@@ -5,14 +5,14 @@ import { prisma } from '@/lib/prisma';
 
 export async function POST(request: Request) {
   try {
-    console.log('[/api/chat] POST request received');
+    console.log('[/backend/chat] POST request received');
 
     const session = await auth.api.getSession({
       headers: request.headers,
     });
 
     console.log(
-      '[/api/chat] Session:',
+      '[/backend/chat] Session:',
       session ? 'authenticated' : 'not authenticated'
     );
 
@@ -93,9 +93,9 @@ export async function POST(request: Request) {
       message: 'Response generation started',
     });
   } catch (error) {
-    console.error('[/api/chat] Error:', error);
+    console.error('[/backend/chat] Error:', error);
     console.error(
-      '[/api/chat] Error stack:',
+      '[/backend/chat] Error stack:',
       error instanceof Error ? error.stack : 'No stack'
     );
     return NextResponse.json(
@@ -107,3 +107,4 @@ export async function POST(request: Request) {
     );
   }
 }
+

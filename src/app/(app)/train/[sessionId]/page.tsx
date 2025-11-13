@@ -62,7 +62,7 @@ export default function TrainingSessionPage() {
     async function loadSession() {
       try {
         setIsLoading(true);
-        const response = await fetch(`/api/chat/${sessionId}`);
+        const response = await fetch(`/backend/chat/${sessionId}`);
 
         if (!response.ok) {
           if (response.status === 404) {
@@ -191,7 +191,7 @@ export default function TrainingSessionPage() {
     clicksToUploadRef.current = [];
 
     try {
-      const response = await fetch('/api/upload/clicks', {
+      const response = await fetch('/backend/upload/clicks', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -501,7 +501,7 @@ export default function TrainingSessionPage() {
       // Initialize S3 multipart upload
       let uploadId: string;
       try {
-        const initResponse = await fetch('/api/upload/recording/init', {
+        const initResponse = await fetch('/backend/upload/recording/init', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -616,10 +616,13 @@ export default function TrainingSessionPage() {
             formData.append('partNumber', currentPartNumber.toString());
             formData.append('chunk', partBlob);
 
-            const uploadResponse = await fetch('/api/upload/recording/part', {
-              method: 'POST',
-              body: formData,
-            });
+            const uploadResponse = await fetch(
+              '/backend/upload/recording/part',
+              {
+                method: 'POST',
+                body: formData,
+              }
+            );
 
             if (uploadResponse.ok) {
               const partData = await uploadResponse.json();
@@ -706,7 +709,7 @@ export default function TrainingSessionPage() {
           setStatus('Completing upload...');
           try {
             const completeResponse = await fetch(
-              '/api/upload/recording/complete',
+              '/backend/upload/recording/complete',
               {
                 method: 'POST',
                 headers: {
@@ -728,7 +731,7 @@ export default function TrainingSessionPage() {
               setStatus(`Upload failed: ${errorText}`);
               // Try to abort the upload
               try {
-                await fetch('/api/upload/recording/abort', {
+                await fetch('/backend/upload/recording/abort', {
                   method: 'POST',
                   headers: {
                     'Content-Type': 'application/json',
@@ -756,7 +759,7 @@ export default function TrainingSessionPage() {
         ) {
           // No parts were uploaded, abort the multipart upload
           try {
-            await fetch('/api/upload/recording/abort', {
+            await fetch('/backend/upload/recording/abort', {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
@@ -817,7 +820,7 @@ export default function TrainingSessionPage() {
       // Abort any multipart upload that was started
       if (uploadIdRef.current) {
         try {
-          await fetch('/api/upload/recording/abort', {
+          await fetch('/backend/upload/recording/abort', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',

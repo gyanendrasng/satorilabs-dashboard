@@ -36,7 +36,7 @@ export async function POST(request: Request) {
       key,
     });
   } catch (error) {
-    console.error('[/api/upload/recording/complete] Error:', error);
+    console.error('[/backend/upload/recording/complete] Error:', error);
     return NextResponse.json(
       {
         error: 'Failed to complete upload',
@@ -46,3 +46,4 @@ export async function POST(request: Request) {
     );
   }
 }
+

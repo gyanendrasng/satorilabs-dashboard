@@ -53,7 +53,7 @@ export async function POST(request: Request) {
       uploaded: clicks.length,
     });
   } catch (error) {
-    console.error('[/api/upload/clicks] Error:', error);
+    console.error('[/backend/upload/clicks] Error:', error);
     return NextResponse.json(
       {
         error: 'Failed to upload click timestamps',
@@ -63,3 +63,4 @@ export async function POST(request: Request) {
     );
   }
 }
+

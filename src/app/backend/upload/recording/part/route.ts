@@ -38,7 +38,7 @@ export async function POST(request: Request) {
       etag: part.ETag,
     });
   } catch (error) {
-    console.error('[/api/upload/recording/part] Error:', error);
+    console.error('[/backend/upload/recording/part] Error:', error);
     return NextResponse.json(
       {
         error: 'Failed to upload part',
@@ -48,3 +48,4 @@ export async function POST(request: Request) {
     );
   }
 }
+
