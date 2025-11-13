@@ -11,7 +11,7 @@ export const auth = betterAuth({
   emailAndPassword: {
     enabled: true,
   },
-  baseURL: process.env.BETTER_AUTH_URL || 'http://localhost:3000',
+  baseURL: process.env.BETTER_AUTH_URL || 'https://app.satorilabs.tech',
   basePath: '/backend/auth',
   secret: process.env.BETTER_AUTH_SECRET,
 });

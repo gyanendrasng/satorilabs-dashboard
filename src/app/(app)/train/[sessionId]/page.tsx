@@ -636,7 +636,10 @@ export default function TrainingSessionPage() {
               throw new Error(`Upload failed: ${errorText}`);
             }
           } catch (chunkErr) {
-            console.error(`Error uploading chunk part ${currentPartNumber}:`, chunkErr);
+            console.error(
+              `Error uploading chunk part ${currentPartNumber}:`,
+              chunkErr
+            );
             throw chunkErr;
           }
         })();
@@ -688,10 +691,8 @@ export default function TrainingSessionPage() {
           setStatus('Waiting for uploads to complete...');
           try {
             // Wait for all pending uploads with a timeout
-            await Promise.allSettled(
-              Array.from(pendingUploadsRef.current)
-            );
-            
+            await Promise.allSettled(Array.from(pendingUploadsRef.current));
+
             // Give a small delay to ensure all parts are registered
             await new Promise((resolve) => setTimeout(resolve, 500));
           } catch (err) {
@@ -741,9 +742,18 @@ export default function TrainingSessionPage() {
             }
           } catch (completeErr) {
             console.error('Error completing upload:', completeErr);
-            setStatus(`Upload error: ${completeErr instanceof Error ? completeErr.message : 'Unknown error'}`);
+            setStatus(
+              `Upload error: ${
+                completeErr instanceof Error
+                  ? completeErr.message
+                  : 'Unknown error'
+              }`
+            );
           }
-        } else if (uploadIdRef.current && uploadedPartsRef.current.length === 0) {
+        } else if (
+          uploadIdRef.current &&
+          uploadedPartsRef.current.length === 0
+        ) {
           // No parts were uploaded, abort the multipart upload
           try {
             await fetch('/api/upload/recording/abort', {
