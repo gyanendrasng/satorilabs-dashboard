@@ -159,6 +159,7 @@ export default function TrainingSessionPage() {
   const streamRef = useRef<MediaStream | null>(null);
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const playIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const clickRipplesRef = useRef<{ x: number; y: number; t: number }[]>([]);
   const rafIdRef = useRef<number | null>(null);
   const removeIframeClickListenerRef = useRef<(() => void) | null>(null);
@@ -405,15 +406,11 @@ export default function TrainingSessionPage() {
         await ensurePlaying();
 
         // Keep video playing - check periodically
-        // Store interval ID in a way that can be accessed later
-        let playIntervalId: NodeJS.Timeout | null = setInterval(() => {
+        playIntervalRef.current = setInterval(() => {
           if (videoEl.paused && streamRef.current) {
             ensurePlaying();
           }
         }, 1000);
-
-        // Store interval ID for cleanup in onstop handler
-        const playIntervalRef = { current: playIntervalId };
 
         const canvas = document.createElement('canvas');
         canvas.width = targetWidth;
