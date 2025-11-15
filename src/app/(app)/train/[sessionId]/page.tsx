@@ -157,6 +157,8 @@ export default function TrainingSessionPage() {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const videoElRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const clickRipplesRef = useRef<{ x: number; y: number; t: number }[]>([]);
   const rafIdRef = useRef<number | null>(null);
   const removeIframeClickListenerRef = useRef<(() => void) | null>(null);
@@ -383,12 +385,42 @@ export default function TrainingSessionPage() {
         videoEl.srcObject = stream;
         videoEl.muted = true;
         videoEl.playsInline = true;
-        void videoEl.play().catch(() => {});
+        videoEl.autoplay = true;
+        videoEl.setAttribute('playsinline', 'true');
+        // Store in ref to prevent garbage collection
+        videoElRef.current = videoEl;
+
+        // Ensure video keeps playing
+        const ensurePlaying = async () => {
+          if (videoEl.paused) {
+            try {
+              await videoEl.play();
+            } catch (err) {
+              console.warn('Video play failed:', err);
+            }
+          }
+        };
+
+        // Play initially
+        await ensurePlaying();
+
+        // Keep video playing - check periodically
+        // Store interval ID in a way that can be accessed later
+        let playIntervalId: NodeJS.Timeout | null = setInterval(() => {
+          if (videoEl.paused && streamRef.current) {
+            ensurePlaying();
+          }
+        }, 1000);
+
+        // Store interval ID for cleanup in onstop handler
+        const playIntervalRef = { current: playIntervalId };
 
         const canvas = document.createElement('canvas');
         canvas.width = targetWidth;
         canvas.height = targetHeight;
         const ctx = canvas.getContext('2d');
+        // Store canvas in ref to prevent garbage collection
+        canvasRef.current = canvas;
 
         try {
           const iframe = iframeRef.current;
@@ -678,6 +710,12 @@ export default function TrainingSessionPage() {
       };
 
       mediaRecorder.onstop = async () => {
+        // Cleanup video play interval if it exists
+        if (playIntervalRef.current) {
+          clearInterval(playIntervalRef.current);
+          playIntervalRef.current = null;
+        }
+
         const blob = new Blob(chunks, { type: selectedMime || 'video/webm' });
         const url = URL.createObjectURL(blob);
         setDownloadUrl(url);
@@ -783,6 +821,27 @@ export default function TrainingSessionPage() {
         // Cleanup
         stream.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
+
+        // Cleanup video element
+        if (videoElRef.current) {
+          videoElRef.current.srcObject = null;
+          videoElRef.current = null;
+        }
+
+        // Cleanup canvas
+        if (canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          if (ctx) {
+            ctx.clearRect(
+              0,
+              0,
+              canvasRef.current.width,
+              canvasRef.current.height
+            );
+          }
+          canvasRef.current = null;
+        }
+
         uploadIdRef.current = null;
         recordingStartTimeRef.current = null;
         pendingUploadsRef.current.clear();
