@@ -22,12 +22,23 @@ import {
   PromptInputActionMenu,
   PromptInputActionMenuTrigger,
   PromptInputActionMenuContent,
+  PromptInputActionMenuItem,
   PromptInputActionAddAttachments,
   type PromptInputMessage,
 } from '@/components/ai-elements/prompt-input';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { SendHorizontalIcon, ArrowLeft, Edit2, Check, X } from 'lucide-react';
+import { Progress } from '@/components/ui/progress';
+import {
+  SendHorizontalIcon,
+  ArrowLeft,
+  Edit2,
+  Check,
+  X,
+  Video,
+  Upload,
+  X as XIcon,
+} from 'lucide-react';
 
 interface ChatMessage {
   id: string;
@@ -62,6 +73,22 @@ export function TrainingChat({
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editedTitle, setEditedTitle] = useState('');
   const pollingRef = useRef<boolean>(false);
+
+  // Video upload state
+  const [isUploadingVideo, setIsUploadingVideo] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [selectedVideo, setSelectedVideo] = useState<File | null>(null);
+  const [uploadedVideoKey, setUploadedVideoKey] = useState<string | null>(null);
+
+  // Video upload refs
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const videoUploadIdRef = useRef<string | null>(null);
+  const videoUploadKeyRef = useRef<string | null>(null);
+  const partNumberRef = useRef<number>(1);
+  const uploadedPartsRef = useRef<Array<{ partNumber: number; etag: string }>>(
+    []
+  );
+  const pendingUploadsRef = useRef<Set<Promise<void>>>(new Set());
 
   // Load messages when session changes
   useEffect(() => {
@@ -140,20 +167,42 @@ export function TrainingChat({
   // Handle message submission
   async function handleSubmit({ text, files }: PromptInputMessage) {
     const userText = (text || '').trim();
-    if (!userText && (!files || files.length === 0)) return;
+    const hasVideo = selectedVideo || uploadedVideoKey;
+    if (!userText && (!files || files.length === 0) && !hasVideo) return;
     if (isLoading || !session) return;
 
     setError(null);
     setIsLoading(true);
 
+    let videoKey = uploadedVideoKey;
+
+    // Upload video if selected but not yet uploaded
+    if (selectedVideo && !uploadedVideoKey) {
+      videoKey = await uploadVideo(selectedVideo);
+      if (!videoKey) {
+        setIsLoading(false);
+        return; // Upload failed, don't send message
+      }
+    }
+
     // Add user message immediately
     const userMsgId = crypto.randomUUID();
+    let messageContent = userText;
+    if (videoKey) {
+      messageContent += `\n\n[Video uploaded: ${
+        selectedVideo?.name || 'video'
+      }]`;
+    }
+
     const userMessage: ChatMessage = {
       id: userMsgId,
       role: 'user',
-      content: userText,
+      content: messageContent,
     };
     setMessages((prev) => [...prev, userMessage]);
+
+    // Clear video after sending
+    clearVideo();
 
     // Add placeholder assistant message
     const assistantMsgId = crypto.randomUUID();
@@ -165,16 +214,26 @@ export function TrainingChat({
     setMessages((prev) => [...prev, assistantMessage]);
 
     try {
-      // Submit message to API
+      // Submit message to API with video attachment
+      const requestBody: {
+        chatId: string;
+        message: string;
+        videoKey?: string;
+      } = {
+        chatId: session.id,
+        message: userText,
+      };
+
+      if (videoKey) {
+        requestBody.videoKey = videoKey;
+      }
+
       const response = await fetch('/backend/chat', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          chatId: session.id,
-          message: userText,
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
@@ -222,6 +281,200 @@ export function TrainingChat({
       setEditedTitle(session.title);
     } finally {
       setIsEditingTitle(false);
+    }
+  };
+
+  // Video upload functions
+  const handleVideoSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file && file.type.startsWith('video/')) {
+      setSelectedVideo(file);
+      setError(null);
+    } else {
+      setError('Please select a valid video file');
+    }
+  };
+
+  const uploadVideo = async (file: File) => {
+    if (!session) return null;
+
+    try {
+      setIsUploadingVideo(true);
+      setUploadProgress(0);
+
+      // Initialize multipart upload
+      const initResponse = await fetch('/backend/upload/video/init', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: session.id,
+          filename: file.name,
+          contentType: file.type,
+        }),
+      });
+
+      if (!initResponse.ok) {
+        throw new Error('Failed to initialize video upload');
+      }
+
+      const initData = await initResponse.json();
+      const uploadId = initData.uploadId;
+      const key = initData.key;
+      videoUploadIdRef.current = uploadId;
+      videoUploadKeyRef.current = key;
+
+      partNumberRef.current = 1;
+      uploadedPartsRef.current = [];
+      pendingUploadsRef.current.clear();
+
+      const chunkSize = 5 * 1024 * 1024; // 5MB chunks
+      const totalChunks = Math.ceil(file.size / chunkSize);
+      let uploadedChunks = 0;
+
+      console.log(
+        `Starting upload of ${file.size} bytes in ${totalChunks} chunks`
+      );
+
+      // Upload file in chunks
+      for (let start = 0; start < file.size; start += chunkSize) {
+        const end = Math.min(start + chunkSize, file.size);
+        const chunk = file.slice(start, end);
+        const currentPartNumber = partNumberRef.current;
+
+        console.log(
+          `Preparing chunk ${currentPartNumber}: bytes ${start}-${end} (${chunk.size} bytes)`
+        );
+
+        const uploadPromise = (async () => {
+          try {
+            const formData = new FormData();
+            formData.append('sessionId', session.id);
+            formData.append('uploadId', uploadId);
+            formData.append('key', videoUploadKeyRef.current!);
+            formData.append('partNumber', currentPartNumber.toString());
+            formData.append('chunk', chunk);
+
+            const uploadResponse = await fetch('/backend/upload/video/part', {
+              method: 'POST',
+              body: formData,
+            });
+
+            if (uploadResponse.ok) {
+              const partData = await uploadResponse.json();
+              console.log(
+                `Chunk ${currentPartNumber} uploaded successfully:`,
+                partData
+              );
+              uploadedPartsRef.current.push({
+                partNumber: partData.partNumber,
+                etag: partData.etag,
+              });
+              uploadedChunks++;
+              setUploadProgress((uploadedChunks / totalChunks) * 100);
+            } else {
+              const errorText = await uploadResponse.text();
+              console.error(
+                `Chunk ${currentPartNumber} upload failed:`,
+                errorText
+              );
+              throw new Error(
+                `Upload failed: ${uploadResponse.statusText} - ${errorText}`
+              );
+            }
+          } catch (chunkErr) {
+            console.error(
+              `Error uploading chunk ${currentPartNumber}:`,
+              chunkErr
+            );
+            throw chunkErr;
+          }
+        })();
+
+        pendingUploadsRef.current.add(uploadPromise);
+        uploadPromise.finally(() => {
+          pendingUploadsRef.current.delete(uploadPromise);
+        });
+
+        partNumberRef.current += 1;
+      }
+
+      // Wait for all uploads to complete
+      console.log('Waiting for all uploads to complete...');
+      await Promise.all(Array.from(pendingUploadsRef.current));
+      console.log(
+        `All uploads completed. Parts collected: ${uploadedPartsRef.current.length}`
+      );
+
+      // Complete multipart upload
+      console.log(
+        'Sending complete request with parts:',
+        uploadedPartsRef.current
+      );
+      const completeResponse = await fetch('/backend/upload/video/complete', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: session.id,
+          uploadId: uploadId,
+          key: videoUploadKeyRef.current,
+          parts: uploadedPartsRef.current,
+        }),
+      });
+
+      if (!completeResponse.ok) {
+        throw new Error('Failed to complete video upload');
+      }
+
+      const completeData = await completeResponse.json();
+      setUploadedVideoKey(completeData.key);
+      setUploadProgress(100);
+
+      return completeData.key;
+    } catch (error) {
+      console.error('Video upload error:', error);
+      setError(
+        `Video upload failed: ${
+          error instanceof Error ? error.message : 'Unknown error'
+        }`
+      );
+
+      // Abort upload if it was started
+      if (videoUploadIdRef.current) {
+        try {
+          await fetch('/backend/upload/video/abort', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              sessionId: session.id,
+              uploadId: videoUploadIdRef.current,
+              key: videoUploadKeyRef.current,
+            }),
+          });
+        } catch {}
+      }
+
+      return null;
+    } finally {
+      setIsUploadingVideo(false);
+      videoUploadIdRef.current = null;
+      videoUploadKeyRef.current = null;
+      pendingUploadsRef.current.clear();
+    }
+  };
+
+  const clearVideo = () => {
+    setSelectedVideo(null);
+    setUploadedVideoKey(null);
+    setUploadProgress(0);
+    setError(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
   };
 
@@ -315,7 +568,7 @@ export function TrainingChat({
               ) : (
                 <ConversationContent>
                   {messages.map((m) => (
-                    <Message key={m.id} from={m.role as any}>
+                    <Message key={m.id} from={m.role as 'user' | 'assistant'}>
                       <MessageAvatar
                         src={m.role === 'user' ? '/vercel.svg' : '/next.svg'}
                         name={m.role === 'user' ? 'You' : 'Assistant'}
@@ -343,13 +596,81 @@ export function TrainingChat({
             </Conversation>
 
             <div className="border-t p-2">
+              {/* Video upload progress */}
+              {isUploadingVideo && (
+                <div className="mb-2 p-3 bg-muted rounded-lg">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Upload className="size-4 animate-pulse" />
+                    <span className="text-sm font-medium">
+                      Uploading video...
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        // Cancel upload logic would go here
+                        setError('Upload cancelled');
+                        setIsUploadingVideo(false);
+                      }}
+                      className="ml-auto h-6 w-6 p-0"
+                    >
+                      <XIcon className="size-3" />
+                    </Button>
+                  </div>
+                  <Progress value={uploadProgress} className="h-2" />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {uploadProgress.toFixed(0)}% complete
+                  </p>
+                </div>
+              )}
+
+              {/* Selected video preview */}
+              {selectedVideo && !isUploadingVideo && (
+                <div className="mb-2 p-3 bg-muted rounded-lg">
+                  <div className="flex items-center gap-2">
+                    <Video className="size-4" />
+                    <span className="text-sm font-medium truncate">
+                      {selectedVideo.name}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      ({(selectedVideo.size / (1024 * 1024)).toFixed(1)} MB)
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={clearVideo}
+                      className="ml-auto h-6 w-6 p-0"
+                    >
+                      <XIcon className="size-3" />
+                    </Button>
+                  </div>
+                </div>
+              )}
+
               <PromptInput onSubmit={handleSubmit}>
                 <PromptInputBody className="items-end gap-2">
                   <PromptInputTools>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept="video/*"
+                      onChange={handleVideoSelect}
+                      className="hidden"
+                      id="video-upload"
+                    />
                     <PromptInputActionMenu>
                       <PromptInputActionMenuTrigger />
                       <PromptInputActionMenuContent>
                         <PromptInputActionAddAttachments />
+                        <PromptInputActionMenuItem
+                          onSelect={(e) => {
+                            e.preventDefault();
+                            document.getElementById('video-upload')?.click();
+                          }}
+                        >
+                          <Video className="mr-2 size-4" />
+                          Upload Video
+                        </PromptInputActionMenuItem>
                       </PromptInputActionMenuContent>
                     </PromptInputActionMenu>
                   </PromptInputTools>
@@ -358,7 +679,7 @@ export function TrainingChat({
                     placeholder="Type a message..."
                     disabled={isLoading}
                   />
-                  <PromptInputSubmit disabled={isLoading}>
+                  <PromptInputSubmit disabled={isLoading || isUploadingVideo}>
                     <SendHorizontalIcon className="size-4" />
                   </PromptInputSubmit>
                 </PromptInputBody>

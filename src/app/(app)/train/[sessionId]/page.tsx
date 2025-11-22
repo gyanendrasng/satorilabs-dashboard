@@ -424,11 +424,27 @@ export default function TrainingSessionPage() {
           const win = iframe?.contentWindow || null;
           const doc = iframe?.contentDocument || win?.document || null;
           if (doc && win) {
-            const handler = (e: MouseEvent) => {
+            const trackClick = (e: MouseEvent | TouchEvent | PointerEvent) => {
+              let clientX: number;
+              let clientY: number;
+
+              // Handle different event types
+              if ('touches' in e && e.touches.length > 0) {
+                // Touch event
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+              } else if ('clientX' in e) {
+                // Mouse or pointer event
+                clientX = e.clientX;
+                clientY = e.clientY;
+              } else {
+                return; // Unknown event type
+              }
+
               const vw = win.innerWidth || targetWidth;
               const vh = win.innerHeight || targetHeight;
-              const x = (e.clientX / vw) * targetWidth;
-              const y = (e.clientY / vh) * targetHeight;
+              const x = (clientX / vw) * targetWidth;
+              const y = (clientY / vh) * targetHeight;
               const now = performance.now();
               clickRipplesRef.current.push({ x, y, t: now });
 
@@ -451,14 +467,24 @@ export default function TrainingSessionPage() {
                 }
               }
             };
-            doc.addEventListener('pointerdown', handler, { capture: true });
+
+            // Listen to multiple event types to catch all clicks
+            const eventOptions = { capture: true, passive: true };
+            doc.addEventListener('pointerdown', trackClick, eventOptions);
+            doc.addEventListener('mousedown', trackClick, eventOptions);
+            doc.addEventListener('click', trackClick, eventOptions);
+            doc.addEventListener('touchstart', trackClick, eventOptions);
+
             removeIframeClickListenerRef.current = () => {
-              doc.removeEventListener('pointerdown', handler, {
-                capture: true,
-              } as unknown as EventListenerOptions);
+              doc.removeEventListener('pointerdown', trackClick, eventOptions);
+              doc.removeEventListener('mousedown', trackClick, eventOptions);
+              doc.removeEventListener('click', trackClick, eventOptions);
+              doc.removeEventListener('touchstart', trackClick, eventOptions);
             };
           }
-        } catch {}
+        } catch (err) {
+          console.warn('Failed to set up click detection:', err);
+        }
 
         const drawFrame = () => {
           if (!ctx) return;
