@@ -1,6 +1,11 @@
 import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
-import { completeMultipartUpload } from '@/lib/s3';
+import { completeMultipartUpload, generateSignedUrl } from '@/lib/s3';
+
+interface UploadPart {
+  partNumber: number;
+  etag: string;
+}
 
 export async function POST(request: Request) {
   try {
@@ -26,53 +31,65 @@ export async function POST(request: Request) {
       key,
       uploadId,
       partsCount: parts.length,
-      parts: parts.map(p => ({
-        partNumber: p.partNumber,
-        etag: p.etag,
-        etagLength: p.etag?.length || 0,
-        etagQuoted: p.etag?.startsWith('"') && p.etag?.endsWith('"')
-      })),
     });
 
-    // Validate parts array - ensure no gaps and all parts are present
-    const sortedParts = [...parts].sort((a, b) => a.partNumber - b.partNumber);
-    const expectedParts = Array.from({ length: sortedParts.length }, (_, i) => i + 1);
-
-    // Check for empty ETags
-    for (const part of parts) {
-      if (!part.etag || part.etag.trim() === '') {
-        throw new Error(`Part ${part.partNumber} has empty ETag`);
-      }
-      if (part.etag.includes('"')) {
-        throw new Error(`Part ${part.partNumber} ETag still contains quotes: ${part.etag}`);
-      }
-    }
-
-    // Validate part numbering (should be 1, 2, 3, ...)
-    for (let i = 0; i < sortedParts.length; i++) {
-      if (sortedParts[i].partNumber !== i + 1) {
-        throw new Error(`Invalid part numbering. Expected part ${i + 1}, got ${sortedParts[i].partNumber}. All parts: ${sortedParts.map(p => p.partNumber).join(', ')}`);
+    // Quick validation of parts
+    const uploadParts = parts as UploadPart[];
+    for (const part of uploadParts) {
+      if (!part.etag || part.etag.trim() === '' || part.etag.includes('"')) {
+        throw new Error(`Invalid ETag for part ${part.partNumber}`);
       }
     }
 
     // Transform parts to the format expected by AWS SDK
-    const transformedParts = parts.map((p: { partNumber: number; etag: string }) => ({
+    const transformedParts = uploadParts.map((p) => ({
       PartNumber: p.partNumber,
       ETag: p.etag,
     }));
 
-    console.log('Calling completeMultipartUpload with:', {
-      key,
-      uploadId,
-      partsForS3: transformedParts.sort((a, b) => a.PartNumber - b.PartNumber),
-    });
-
     await completeMultipartUpload(key, uploadId, transformedParts);
 
+    // Generate signed URL for the uploaded video (valid for 24 hours)
+    const signedUrl = await generateSignedUrl(key, 86400);
+    console.log('Generated signed URL for video:', { key, sessionId });
+
+    // Send to RunPod endpoint asynchronously (don't wait for it)
+    const runpodUrl = process.env.RUNPOD_CAPTION_URL;
+    if (runpodUrl) {
+      // Fire and forget - don't await this
+      fetch(runpodUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          job_id: sessionId,
+          video_url: signedUrl,
+        }),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            console.error('Failed to send to RunPod:', {
+              status: response.status,
+              statusText: response.statusText,
+            });
+          } else {
+            console.log('Successfully sent video to RunPod:', { sessionId });
+          }
+        })
+        .catch((error) => {
+          console.error('Error sending to RunPod:', error);
+        });
+    } else {
+      console.warn('RUNPOD_CAPTION_URL not configured, skipping RunPod notification');
+    }
+
+    // Return immediately without waiting for RunPod
     return NextResponse.json({
       success: true,
       key,
       sessionId,
+      signedUrl,
     });
   } catch (error) {
     console.error('[/backend/upload/video/complete] Error:', error);

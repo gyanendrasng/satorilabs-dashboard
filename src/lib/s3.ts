@@ -5,7 +5,9 @@ import {
   UploadPartCommand,
   CompleteMultipartUploadCommand,
   AbortMultipartUploadCommand,
+  GetObjectCommand,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 // Initialize S3 client with support for both AWS S3 and S3-compatible storage
 export function getS3Client() {
@@ -177,4 +179,24 @@ export async function uploadClickTimestamps(
   const body = JSON.stringify(clicks, null, 2);
 
   await uploadToS3(key, body, 'application/json');
+}
+
+// Generate a signed URL for accessing an S3 object
+export async function generateSignedUrl(
+  key: string,
+  expiresIn: number = 3600 // Default 1 hour
+): Promise<string> {
+  const client = getS3Client();
+  const bucket = process.env.S3_BUCKET;
+
+  if (!bucket) {
+    throw new Error('S3_BUCKET environment variable is not set');
+  }
+
+  const command = new GetObjectCommand({
+    Bucket: bucket,
+    Key: key,
+  });
+
+  return await getSignedUrl(client, command, { expiresIn });
 }

@@ -100,6 +100,35 @@ export function TrainingChat({
     }
   }, [session]);
 
+  // Poll for new messages every 2 seconds
+  useEffect(() => {
+    if (!session) return;
+
+    const fetchMessages = async () => {
+      try {
+        const response = await fetch(`/backend/chat/${session.id}`);
+        if (response.ok) {
+          const data = await response.json();
+          if (data.chat && data.chat.messages) {
+            setMessages(data.chat.messages);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to fetch messages:', err);
+      }
+    };
+
+    // Fetch immediately
+    fetchMessages();
+
+    // Then poll every 2 seconds
+    const intervalId = setInterval(fetchMessages, 2000);
+
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [session]);
+
   // Long polling for response
   async function pollForResponse(responseId: string, assistantMsgId: string) {
     pollingRef.current = true;
