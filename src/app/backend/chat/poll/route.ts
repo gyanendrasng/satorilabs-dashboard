@@ -40,12 +40,19 @@ export async function GET(request: Request) {
     }
 
     const responseData = responseStore.get(responseId);
+    console.log(`[/backend/chat/poll] responseId: ${responseId}, status: ${responseData?.status || 'not found'}`);
 
     if (!responseData) {
-      return NextResponse.json(
-        { error: 'Response not found or expired' },
-        { status: 404 }
-      );
+      // Response not in store yet - return pending status instead of 404
+      // This handles race conditions where poll arrives before responseStore is set
+      console.log(`[/backend/chat/poll] Response not in store, returning pending`);
+      return NextResponse.json({
+        status: 'pending',
+        chunks: [],
+        fullResponse: '',
+        currentIndex: 0,
+        complete: false,
+      });
     }
 
     // Get new chunks since lastChunkIndex

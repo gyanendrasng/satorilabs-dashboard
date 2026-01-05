@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
-import { generateDummyResponse, responseStore } from '@/lib/response-store';
 import { prisma } from '@/lib/prisma';
 
 // Dummy API key - in production, this should be stored in environment variables
-const DUMMY_API_KEY = process.env.WEBHOOK_API_KEY || 'dummy-webhook-api-key-12345';
+const DUMMY_API_KEY =
+  process.env.WEBHOOK_API_KEY || 'dummy-webhook-api-key-12345';
 
 function validateApiKey(request: Request): boolean {
   // Check for API key in Authorization header (Bearer token)
@@ -67,11 +67,11 @@ export async function POST(request: Request) {
       );
     }
 
-    // Save user message
-    const userMsg = await prisma.chatMessage.create({
+    // Save assistant message (webhook messages are from the assistant)
+    const assistantMsg = await prisma.chatMessage.create({
       data: {
         chatId: chat.id,
-        role: 'user',
+        role: 'assistant',
         content: message,
       },
     });
@@ -86,29 +86,15 @@ export async function POST(request: Request) {
       },
     });
 
-    // Generate unique response ID
-    const responseId = `${chat.id}-${Date.now()}`;
-
     // Prepare response payload
     const responsePayload = {
       chatId: chat.id,
-      messageId: userMsg.id,
-      responseId,
-      message: 'Response generation started',
+      messageId: assistantMsg.id,
+      message: 'Message added successfully',
       timestamp: new Date().toISOString(),
     };
 
-    // Start generating response asynchronously
-    generateDummyResponse(responseId, message).catch((err) => {
-      const current = responseStore.get(responseId);
-      if (current) {
-        current.status = 'error';
-        current.error = err.message || 'Generation failed';
-        responseStore.set(responseId, current);
-      }
-    });
-
-    // Return immediately with response ID for polling
+    // Return immediately
     return NextResponse.json(responsePayload);
   } catch (error) {
     console.error('[/backend/chat/webhook] Error:', error);
@@ -125,4 +111,3 @@ export async function POST(request: Request) {
     );
   }
 }
-

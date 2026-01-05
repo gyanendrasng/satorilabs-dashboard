@@ -38,6 +38,7 @@ import {
   Video,
   Upload,
   X as XIcon,
+  Settings,
 } from 'lucide-react';
 
 interface ChatMessage {
@@ -50,6 +51,7 @@ interface ChatMessage {
 interface TrainingSession {
   id: string;
   title: string;
+  mode?: 'training' | 'work';
   lastMessageAt?: string | null;
   createdAt?: string;
   updatedAt?: string;
@@ -72,7 +74,33 @@ export function TrainingChat({
   const [error, setError] = useState<string | null>(null);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editedTitle, setEditedTitle] = useState('');
+  const [mode, setMode] = useState<'training' | 'work'>(
+    session?.mode === 'work' ? 'work' : 'training'
+  );
   const pollingRef = useRef<boolean>(false);
+
+  // Update mode in database when changed
+  const handleModeChange = async (newMode: 'training' | 'work') => {
+    if (!session) return;
+
+    try {
+      const response = await fetch(`/backend/chat/${session.id}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ mode: newMode }),
+      });
+
+      if (response.ok) {
+        setMode(newMode);
+      } else {
+        console.error('Failed to update mode');
+      }
+    } catch (error) {
+      console.error('Error updating mode:', error);
+    }
+  };
 
   // Video upload state
   const [isUploadingVideo, setIsUploadingVideo] = useState(false);
@@ -247,10 +275,12 @@ export function TrainingChat({
       const requestBody: {
         chatId: string;
         message: string;
+        mode: string;
         videoKey?: string;
       } = {
         chatId: session.id,
         message: userText,
+        mode: mode,
       };
 
       if (videoKey) {
@@ -574,6 +604,29 @@ export function TrainingChat({
               </div>
             )}
           </div>
+
+          {/* Mode Selector */}
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">Mode:</span>
+            <div className="flex rounded-md border">
+              <Button
+                variant={mode === 'training' ? 'default' : 'ghost'}
+                size="sm"
+                onClick={() => handleModeChange('training')}
+                className="rounded-r-none border-r"
+              >
+                Training
+              </Button>
+              <Button
+                variant={mode === 'work' ? 'default' : 'ghost'}
+                size="sm"
+                onClick={() => handleModeChange('work')}
+                className="rounded-l-none"
+              >
+                Work
+              </Button>
+            </div>
+          </div>
         </div>
 
         {isLoading && (
@@ -679,29 +732,35 @@ export function TrainingChat({
               <PromptInput onSubmit={handleSubmit}>
                 <PromptInputBody className="items-end gap-2">
                   <PromptInputTools>
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="video/*"
-                      onChange={handleVideoSelect}
-                      className="hidden"
-                      id="video-upload"
-                    />
-                    <PromptInputActionMenu>
-                      <PromptInputActionMenuTrigger />
-                      <PromptInputActionMenuContent>
-                        <PromptInputActionAddAttachments />
-                        <PromptInputActionMenuItem
-                          onSelect={(e) => {
-                            e.preventDefault();
-                            document.getElementById('video-upload')?.click();
-                          }}
-                        >
-                          <Video className="mr-2 size-4" />
-                          Upload Video
-                        </PromptInputActionMenuItem>
-                      </PromptInputActionMenuContent>
-                    </PromptInputActionMenu>
+                    {mode === 'training' && (
+                      <>
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="video/*"
+                          onChange={handleVideoSelect}
+                          className="hidden"
+                          id="video-upload"
+                        />
+                        <PromptInputActionMenu>
+                          <PromptInputActionMenuTrigger />
+                          <PromptInputActionMenuContent>
+                            <PromptInputActionAddAttachments />
+                            <PromptInputActionMenuItem
+                              onSelect={(e) => {
+                                e.preventDefault();
+                                document
+                                  .getElementById('video-upload')
+                                  ?.click();
+                              }}
+                            >
+                              <Video className="mr-2 size-4" />
+                              Upload Video
+                            </PromptInputActionMenuItem>
+                          </PromptInputActionMenuContent>
+                        </PromptInputActionMenu>
+                      </>
+                    )}
                   </PromptInputTools>
                   <PromptInputTextarea
                     className="px-3"

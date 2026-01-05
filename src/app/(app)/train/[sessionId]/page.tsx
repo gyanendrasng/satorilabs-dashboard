@@ -16,6 +16,7 @@ interface ChatMessage {
 interface TrainingSession {
   id: string;
   title: string;
+  mode?: 'training' | 'work';
   lastMessageAt?: string | null;
   createdAt?: string;
   updatedAt?: string;

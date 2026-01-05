@@ -81,7 +81,9 @@ export async function POST(request: Request) {
           console.error('Error sending to RunPod:', error);
         });
     } else {
-      console.warn('RUNPOD_CAPTION_URL not configured, skipping RunPod notification');
+      console.warn(
+        'RUNPOD_CAPTION_URL not configured, skipping RunPod notification'
+      );
     }
 
     // Return immediately without waiting for RunPod
