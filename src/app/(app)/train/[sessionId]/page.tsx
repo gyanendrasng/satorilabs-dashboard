@@ -4,7 +4,21 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import { TrainingChat } from '@/components/training/TrainingChat';
 import { Button } from '@/components/ui/button';
-import { CircleDot, Square, Loader2 } from 'lucide-react';
+import {
+  Square,
+  Loader2,
+  Play,
+  Pause,
+  Monitor,
+  Eye,
+  EyeOff,
+  RotateCcw,
+  ZoomIn,
+  ZoomOut,
+  AlertCircle,
+  Clock,
+  Activity,
+} from 'lucide-react';
 
 interface ChatMessage {
   id: string;
@@ -46,6 +60,10 @@ export default function TrainingSessionPage() {
   const [session, setSession] = useState<TrainingSession | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // UI state
+  const [showVmScreen, setShowVmScreen] = useState(true);
+  const [screenZoom, setScreenZoom] = useState(100);
 
   // ----------------------------
   // Guacamole connection
@@ -940,12 +958,10 @@ export default function TrainingSessionPage() {
 
   if (isLoading) {
     return (
-      <div className="container mx-auto py-6">
-        <div className="flex items-center justify-center h-[600px]">
-          <div className="flex flex-col items-center gap-4">
-            <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-            <p className="text-muted-foreground">Loading training session...</p>
-          </div>
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <Loader2 className="h-8 w-8 animate-spin text-cyan-400" />
+          <p className="text-slate-400">Loading training session...</p>
         </div>
       </div>
     );
@@ -953,32 +969,69 @@ export default function TrainingSessionPage() {
 
   if (error) {
     return (
-      <div className="container mx-auto py-6">
-        <div className="flex items-center justify-center h-[600px]">
-          <div className="flex flex-col items-center gap-4 text-center">
-            <div className="text-destructive text-xl font-semibold">
-              {error}
-            </div>
-            <button
-              onClick={handleBack}
-              className="text-sm text-primary underline underline-offset-4"
-            >
-              Return to training sessions
-            </button>
-          </div>
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4 text-center">
+          <div className="text-red-400 text-xl font-semibold">{error}</div>
+          <button
+            onClick={handleBack}
+            className="text-sm text-cyan-400 underline underline-offset-4 hover:text-cyan-300"
+          >
+            Return to training sessions
+          </button>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="container mx-auto py-6">
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Left: Chat Interface */}
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-slate-100 p-6">
+      {/* Header */}
+      <div className="max-w-7xl mx-auto mb-8">
+        <div className="flex items-center justify-between mb-2">
+          <div>
+            <h1 className="text-4xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent mb-1">
+              {session?.title || 'Training Session'}
+            </h1>
+            <p className="text-slate-400 text-sm">
+              AI Agent Training Interface
+            </p>
+          </div>
+          <div className="flex gap-3">
+            {!isRecording ? (
+              <button
+                onClick={startRecording}
+                className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 rounded-lg font-medium transition-all flex items-center gap-2 shadow-lg shadow-emerald-900/50"
+              >
+                <Play className="w-4 h-4" />
+                Start Recording
+              </button>
+            ) : (
+              <button
+                onClick={stopRecording}
+                className="px-5 py-2.5 bg-red-600 hover:bg-red-700 rounded-lg font-medium transition-all flex items-center gap-2 shadow-lg shadow-red-900/50"
+              >
+                <Square className="w-4 h-4" />
+                Stop Recording
+              </button>
+            )}
+            <button
+              onClick={handleBack}
+              className="px-5 py-2.5 bg-slate-700 hover:bg-slate-600 rounded-lg font-medium transition-all flex items-center gap-2"
+            >
+              <Pause className="w-4 h-4" />
+              Back
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="max-w-7xl mx-auto grid grid-cols-12 gap-6">
+        {/* Chat Interface */}
         <div
-          className={`flex flex-col rounded-lg border ${
-            isRecording ? 'hidden' : ''
-          }`}
+          className={`${
+            isRecording ? 'hidden' : 'col-span-4'
+          } bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl flex flex-col h-[calc(100vh-220px)] overflow-hidden`}
         >
           <TrainingChat
             session={session}
@@ -987,72 +1040,298 @@ export default function TrainingSessionPage() {
           />
         </div>
 
-        {/* Right: VM Screen */}
+        {/* VM Screen Section */}
         <div
-          className={`flex flex-col rounded-lg border ${
-            isRecording ? 'col-span-2' : ''
-          }`}
+          className={`${
+            isRecording ? 'col-span-12' : 'col-span-8'
+          } bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl overflow-hidden flex flex-col h-[calc(100vh-220px)]`}
           ref={vmContainerRef}
         >
-          <div className="px-4 py-3 border-b flex items-center justify-between gap-4">
-            <div>
-              <h2 className="text-lg font-semibold">VM Screen</h2>
-              <p className="text-muted-foreground text-sm">{status}</p>
+          {/* Screen Header */}
+          <div className="flex items-center justify-between p-4 border-b border-slate-700 bg-slate-800/70">
+            <div className="flex items-center gap-3">
+              <Monitor className="w-5 h-5 text-cyan-400" />
+              <div>
+                <h2 className="font-semibold text-lg">Agent Screen View</h2>
+                <p className="text-xs text-slate-400">{status}</p>
+              </div>
             </div>
+
+            {/* Screen Controls */}
             <div className="flex items-center gap-2">
-              {!isRecording ? (
-                <Button
-                  size="sm"
-                  onClick={startRecording}
-                  aria-label="Start recording"
+              <div className="flex items-center gap-1 bg-slate-900/50 rounded-lg p-1">
+                <button
+                  onClick={() => setScreenZoom(Math.max(50, screenZoom - 10))}
+                  className="p-2 hover:bg-slate-700 rounded transition-colors"
+                  title="Zoom Out"
                 >
-                  <CircleDot className="size-4" />
-                  <span className="hidden sm:inline ml-2">Record</span>
-                </Button>
-              ) : (
-                <Button
-                  size="sm"
-                  variant="destructive"
-                  onClick={stopRecording}
-                  aria-label="Stop recording"
+                  <ZoomOut className="w-4 h-4" />
+                </button>
+                <span className="px-3 text-sm font-medium">{screenZoom}%</span>
+                <button
+                  onClick={() => setScreenZoom(Math.min(150, screenZoom + 10))}
+                  className="p-2 hover:bg-slate-700 rounded transition-colors"
+                  title="Zoom In"
                 >
-                  <Square className="size-4" />
-                  <span className="hidden sm:inline ml-2">Stop</span>
-                </Button>
-              )}
-              {downloadUrl ? (
+                  <ZoomIn className="w-4 h-4" />
+                </button>
+              </div>
+
+              <button
+                className="p-2 hover:bg-slate-700 rounded-lg transition-colors"
+                title="Reset View"
+                onClick={() => setScreenZoom(100)}
+              >
+                <RotateCcw className="w-4 h-4" />
+              </button>
+
+              <button
+                onClick={() => setShowVmScreen(!showVmScreen)}
+                className={`p-2 rounded-lg transition-colors ${
+                  showVmScreen
+                    ? 'bg-cyan-600 hover:bg-cyan-700'
+                    : 'hover:bg-slate-700'
+                }`}
+                title={showVmScreen ? 'Hide Screen' : 'Show Screen'}
+              >
+                {showVmScreen ? (
+                  <Eye className="w-4 h-4" />
+                ) : (
+                  <EyeOff className="w-4 h-4" />
+                )}
+              </button>
+
+              {downloadUrl && (
                 <a
                   href={downloadUrl}
                   download={`training-recording-${new Date().toISOString()}.webm`}
-                  className="text-sm text-primary underline underline-offset-4"
+                  className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 rounded-lg text-sm font-medium transition-all"
                 >
                   Download
                 </a>
-              ) : null}
+              )}
             </div>
           </div>
-          <div className="flex-1">
-            {!guacBase ? (
-              <div className="flex h-[600px] items-center justify-center text-red-600">
-                Missing NEXT_PUBLIC_GUAC_BASE_URL
-              </div>
-            ) : iframeSrc ? (
-              <iframe
-                ref={iframeRef}
-                src={iframeSrc}
-                width="100%"
-                height={isRecording ? 800 : 600}
-                style={{ border: 'none' }}
-                allow="display-capture; fullscreen; microphone; camera; clipboard-write"
-                allowFullScreen
-              />
-            ) : (
+
+          {/* Screen Display Area */}
+          {showVmScreen && (
+            <div className="flex-1 bg-slate-900 overflow-auto">
               <div
-                className="w-full bg-gray-50 border-t rounded-b flex items-center justify-center text-gray-500"
-                style={{ height: isRecording ? '800px' : '600px' }}
+                className="bg-slate-800 rounded-lg overflow-hidden shadow-2xl mx-auto transition-transform"
+                style={{
+                  transform: `scale(${screenZoom / 100})`,
+                  transformOrigin: 'top center',
+                }}
               >
-                Waiting for connection...
+                {!guacBase ? (
+                  <div className="flex h-[600px] items-center justify-center text-red-400">
+                    Missing NEXT_PUBLIC_GUAC_BASE_URL
+                  </div>
+                ) : iframeSrc ? (
+                  <iframe
+                    ref={iframeRef}
+                    src={iframeSrc}
+                    width="100%"
+                    height={isRecording ? 700 : 550}
+                    style={{ border: 'none' }}
+                    allow="display-capture; fullscreen; microphone; camera; clipboard-write"
+                    allowFullScreen
+                  />
+                ) : (
+                  <div
+                    className="w-full bg-slate-800 flex items-center justify-center text-slate-500"
+                    style={{ height: isRecording ? '700px' : '550px' }}
+                  >
+                    <div className="flex flex-col items-center gap-3">
+                      <Loader2 className="w-6 h-6 animate-spin text-cyan-400" />
+                      <span>Waiting for connection...</span>
+                    </div>
+                  </div>
+                )}
               </div>
+
+              {/* Agent Activity Indicator */}
+              <div className="mt-4 flex items-center justify-center gap-3 text-sm text-slate-400">
+                <div className="flex items-center gap-2">
+                  <div
+                    className={`w-2 h-2 rounded-full ${
+                      isRecording
+                        ? 'bg-red-500 animate-pulse'
+                        : 'bg-cyan-500 animate-pulse'
+                    }`}
+                  ></div>
+                  <span>
+                    {isRecording
+                      ? 'Recording in progress...'
+                      : 'Agent is monitoring'}
+                  </span>
+                </div>
+                <span className="text-slate-600">|</span>
+                <span>Session: {sessionId?.slice(0, 8)}...</span>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Bottom Panels */}
+      <div className="max-w-7xl mx-auto mt-6 grid grid-cols-12 gap-6">
+        {/* Connection Status Panel */}
+        <div className={`col-span-6 backdrop-blur rounded-xl border p-5 shadow-xl ${
+          status === 'Ready'
+            ? 'bg-emerald-900/20 border-emerald-700/50'
+            : status.includes('Error')
+              ? 'bg-red-900/20 border-red-700/50'
+              : 'bg-amber-900/20 border-amber-700/50'
+        }`}>
+          <h2 className={`text-lg font-semibold mb-4 flex items-center gap-2 ${
+            status === 'Ready'
+              ? 'text-emerald-300'
+              : status.includes('Error')
+                ? 'text-red-300'
+                : 'text-amber-300'
+          }`}>
+            <AlertCircle className="w-5 h-5" />
+            Connection Status
+          </h2>
+
+          <div className="bg-slate-800/50 rounded-lg p-4 border border-slate-700">
+            <div className="flex items-center justify-between mb-3">
+              <span className="text-sm font-medium">Guacamole Server</span>
+              <span className={`px-2 py-0.5 text-xs rounded-full ${
+                status === 'Ready'
+                  ? 'bg-emerald-600'
+                  : status.includes('Error')
+                    ? 'bg-red-600'
+                    : 'bg-amber-600'
+              }`}>
+                {status === 'Ready' ? 'Connected' : status.includes('Error') ? 'Error' : 'Connecting'}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mb-3">{status}</p>
+            {status.includes('Error') && (
+              <button
+                onClick={() => window.location.reload()}
+                className="w-full px-3 py-2 bg-cyan-600 hover:bg-cyan-700 rounded-md text-sm font-medium transition-all"
+              >
+                Retry Connection
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Session Details */}
+        <div className="col-span-3 bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 p-5 shadow-xl">
+          <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <Clock className="w-5 h-5 text-cyan-400" />
+            Session Details
+          </h2>
+          <div className="space-y-3">
+            <div className="flex justify-between text-sm">
+              <span className="text-slate-400">Session ID:</span>
+              <span className="font-mono text-cyan-400">{sessionId?.slice(0, 8)}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-slate-400">Mode:</span>
+              <span className="font-mono text-cyan-400">{session?.mode || 'training'}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-slate-400">Title:</span>
+              <span className="text-slate-200 truncate max-w-[120px]">{session?.title || 'Untitled'}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-slate-400">Messages:</span>
+              <span className="text-emerald-400">{session?.messages?.length || 0}</span>
+            </div>
+            <div className="flex justify-between text-sm">
+              <span className="text-slate-400">Recording:</span>
+              <span className={isRecording ? 'text-red-400' : 'text-slate-400'}>
+                {isRecording ? 'Active' : 'Inactive'}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Activity Panel */}
+        <div className="col-span-3 bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 p-5 shadow-xl">
+          <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <Activity className="w-5 h-5 text-cyan-400" />
+            Activity
+          </h2>
+          <div className="space-y-3 text-sm">
+            <div>
+              <span className="text-slate-400 block mb-1">VM Controls:</span>
+              <div className="space-y-1">
+                <div className="font-mono text-xs bg-slate-900/50 px-2 py-1.5 rounded border border-slate-700 flex items-center justify-between">
+                  <span>Zoom</span>
+                  <span className="text-cyan-400">{screenZoom}%</span>
+                </div>
+                <div className="font-mono text-xs bg-slate-900/50 px-2 py-1.5 rounded border border-slate-700 flex items-center justify-between">
+                  <span>Display</span>
+                  <span className={showVmScreen ? 'text-emerald-400' : 'text-slate-400'}>
+                    {showVmScreen ? 'Visible' : 'Hidden'}
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div>
+              <span className="text-slate-400 block mb-1">Quick Actions:</span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setScreenZoom(100)}
+                  className="flex-1 px-2 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs transition-all"
+                >
+                  Reset Zoom
+                </button>
+                <button
+                  onClick={() => setShowVmScreen(!showVmScreen)}
+                  className="flex-1 px-2 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs transition-all"
+                >
+                  {showVmScreen ? 'Hide' : 'Show'} VM
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Bottom Status Bar */}
+      <div className="max-w-7xl mx-auto mt-6 mb-6">
+        <div className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 px-6 py-3 flex items-center justify-between text-sm shadow-xl">
+          <div className="flex items-center gap-6">
+            <div className="flex items-center gap-2">
+              <div
+                className={`w-2 h-2 rounded-full animate-pulse ${
+                  status === 'Ready' ? 'bg-emerald-500' : 'bg-amber-500'
+                }`}
+              ></div>
+              <span className="text-slate-300">
+                {status === 'Ready' ? 'System Active' : status}
+              </span>
+            </div>
+            <div className="text-slate-400">
+              Last Updated:{' '}
+              <span className="text-slate-200">Just now</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-4 text-slate-400">
+            <span>
+              Session:{' '}
+              <span className="text-cyan-400 font-mono">
+                {sessionId?.slice(0, 8)}
+              </span>
+            </span>
+            <span>
+              Messages:{' '}
+              <span className="text-emerald-400 font-semibold">
+                {session?.messages?.length || 0}
+              </span>
+            </span>
+            {isRecording && (
+              <span className="flex items-center gap-2">
+                <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></div>
+                <span className="text-red-400 font-semibold">Recording</span>
+              </span>
             )}
           </div>
         </div>

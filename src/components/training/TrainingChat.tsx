@@ -546,18 +546,18 @@ export function TrainingChat({
 
   if (!session) {
     return (
-      <div className="flex items-center justify-center h-full text-muted-foreground">
+      <div className="flex items-center justify-center h-full text-slate-400">
         Select a training session or create a new one to begin
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full bg-slate-800/30">
       {/* Header */}
-      <div className="px-4 py-3 border-b">
+      <div className="px-4 py-3 border-b border-slate-700">
         <div className="flex items-center gap-3">
-          <Button variant="ghost" size="sm" onClick={onBack}>
+          <Button variant="ghost" size="sm" onClick={onBack} className="text-slate-300 hover:text-white hover:bg-slate-700">
             <ArrowLeft className="h-4 w-4" />
           </Button>
 
@@ -567,7 +567,7 @@ export function TrainingChat({
                 <Input
                   value={editedTitle}
                   onChange={(e) => setEditedTitle(e.target.value)}
-                  className="h-8"
+                  className="h-8 bg-slate-900/50 border-slate-600 text-slate-100"
                   autoFocus
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') handleTitleSave();
@@ -577,7 +577,7 @@ export function TrainingChat({
                     }
                   }}
                 />
-                <Button size="sm" variant="ghost" onClick={handleTitleSave}>
+                <Button size="sm" variant="ghost" onClick={handleTitleSave} className="text-slate-300 hover:text-white hover:bg-slate-700">
                   <Check className="h-4 w-4" />
                 </Button>
                 <Button
@@ -587,17 +587,19 @@ export function TrainingChat({
                     setEditedTitle(session.title);
                     setIsEditingTitle(false);
                   }}
+                  className="text-slate-300 hover:text-white hover:bg-slate-700"
                 >
                   <X className="h-4 w-4" />
                 </Button>
               </div>
             ) : (
               <div className="flex items-center gap-2">
-                <h2 className="text-lg font-semibold">{session.title}</h2>
+                <h2 className="text-lg font-semibold text-slate-100">{session.title}</h2>
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => setIsEditingTitle(true)}
+                  className="text-slate-300 hover:text-white hover:bg-slate-700"
                 >
                   <Edit2 className="h-4 w-4" />
                 </Button>
@@ -607,13 +609,13 @@ export function TrainingChat({
 
           {/* Mode Selector */}
           <div className="flex items-center gap-2">
-            <span className="text-sm font-medium">Mode:</span>
-            <div className="flex rounded-md border">
+            <span className="text-sm font-medium text-slate-400">Mode:</span>
+            <div className="flex rounded-md border border-slate-600">
               <Button
                 variant={mode === 'training' ? 'default' : 'ghost'}
                 size="sm"
                 onClick={() => handleModeChange('training')}
-                className="rounded-r-none border-r"
+                className={`rounded-r-none border-r border-slate-600 ${mode === 'training' ? 'bg-cyan-600 hover:bg-cyan-700' : 'text-slate-300 hover:text-white hover:bg-slate-700'}`}
               >
                 Training
               </Button>
@@ -621,7 +623,7 @@ export function TrainingChat({
                 variant={mode === 'work' ? 'default' : 'ghost'}
                 size="sm"
                 onClick={() => handleModeChange('work')}
-                className="rounded-l-none"
+                className={`rounded-l-none ${mode === 'work' ? 'bg-cyan-600 hover:bg-cyan-700' : 'text-slate-300 hover:text-white hover:bg-slate-700'}`}
               >
                 Work
               </Button>
@@ -630,7 +632,7 @@ export function TrainingChat({
         </div>
 
         {isLoading && (
-          <p className="text-xs text-muted-foreground mt-1">
+          <p className="text-xs text-cyan-400 mt-1">
             Generating response...
           </p>
         )}
@@ -640,10 +642,10 @@ export function TrainingChat({
       <div className="flex-1 overflow-hidden">
         <PromptInputProvider>
           <div className="flex flex-col h-full">
-            <Conversation>
+            <Conversation className="bg-transparent">
               {messages.length === 0 ? (
-                <ConversationEmptyState title="Start your training session">
-                  <p className="text-muted-foreground text-sm">
+                <ConversationEmptyState title="Start your training session" className="text-slate-100">
+                  <p className="text-slate-400 text-sm">
                     Ask questions and get guidance for your training workflow.
                   </p>
                 </ConversationEmptyState>
@@ -658,7 +660,7 @@ export function TrainingChat({
                       <MessageContent>
                         {m.content ||
                           (m.role === 'assistant' && isLoading ? (
-                            <span className="text-muted-foreground italic">
+                            <span className="text-slate-400 italic">
                               Thinking...
                             </span>
                           ) : (
@@ -668,7 +670,7 @@ export function TrainingChat({
                     </Message>
                   ))}
                   {error && (
-                    <div className="px-4 py-2 bg-red-50 dark:bg-red-900/10 border border-red-200 dark:border-red-800 rounded-md text-red-600 dark:text-red-400 text-sm">
+                    <div className="px-4 py-2 bg-red-900/30 border border-red-700/50 rounded-md text-red-300 text-sm">
                       <strong>Error:</strong> {error}
                     </div>
                   )}
@@ -677,13 +679,13 @@ export function TrainingChat({
               <ConversationScrollButton />
             </Conversation>
 
-            <div className="border-t p-2">
+            <div className="border-t border-slate-700 p-2">
               {/* Video upload progress */}
               {isUploadingVideo && (
-                <div className="mb-2 p-3 bg-muted rounded-lg">
+                <div className="mb-2 p-3 bg-slate-900/50 rounded-lg border border-slate-700">
                   <div className="flex items-center gap-2 mb-2">
-                    <Upload className="size-4 animate-pulse" />
-                    <span className="text-sm font-medium">
+                    <Upload className="size-4 animate-pulse text-cyan-400" />
+                    <span className="text-sm font-medium text-slate-200">
                       Uploading video...
                     </span>
                     <Button
@@ -694,13 +696,13 @@ export function TrainingChat({
                         setError('Upload cancelled');
                         setIsUploadingVideo(false);
                       }}
-                      className="ml-auto h-6 w-6 p-0"
+                      className="ml-auto h-6 w-6 p-0 text-slate-400 hover:text-white hover:bg-slate-700"
                     >
                       <XIcon className="size-3" />
                     </Button>
                   </div>
                   <Progress value={uploadProgress} className="h-2" />
-                  <p className="text-xs text-muted-foreground mt-1">
+                  <p className="text-xs text-slate-400 mt-1">
                     {uploadProgress.toFixed(0)}% complete
                   </p>
                 </div>
@@ -708,20 +710,20 @@ export function TrainingChat({
 
               {/* Selected video preview */}
               {selectedVideo && !isUploadingVideo && (
-                <div className="mb-2 p-3 bg-muted rounded-lg">
+                <div className="mb-2 p-3 bg-slate-900/50 rounded-lg border border-slate-700">
                   <div className="flex items-center gap-2">
-                    <Video className="size-4" />
-                    <span className="text-sm font-medium truncate">
+                    <Video className="size-4 text-cyan-400" />
+                    <span className="text-sm font-medium truncate text-slate-200">
                       {selectedVideo.name}
                     </span>
-                    <span className="text-xs text-muted-foreground">
+                    <span className="text-xs text-slate-400">
                       ({(selectedVideo.size / (1024 * 1024)).toFixed(1)} MB)
                     </span>
                     <Button
                       size="sm"
                       variant="ghost"
                       onClick={clearVideo}
-                      className="ml-auto h-6 w-6 p-0"
+                      className="ml-auto h-6 w-6 p-0 text-slate-400 hover:text-white hover:bg-slate-700"
                     >
                       <XIcon className="size-3" />
                     </Button>
@@ -729,7 +731,7 @@ export function TrainingChat({
                 </div>
               )}
 
-              <PromptInput onSubmit={handleSubmit}>
+              <PromptInput onSubmit={handleSubmit} className="[&_[data-slot=input-group]]:bg-slate-900/50 [&_[data-slot=input-group]]:border-slate-700">
                 <PromptInputBody className="items-end gap-2">
                   <PromptInputTools>
                     {mode === 'training' && (
@@ -743,7 +745,7 @@ export function TrainingChat({
                           id="video-upload"
                         />
                         <PromptInputActionMenu>
-                          <PromptInputActionMenuTrigger />
+                          <PromptInputActionMenuTrigger className="text-slate-400 hover:text-white hover:bg-slate-700" />
                           <PromptInputActionMenuContent>
                             <PromptInputActionAddAttachments />
                             <PromptInputActionMenuItem
@@ -763,11 +765,11 @@ export function TrainingChat({
                     )}
                   </PromptInputTools>
                   <PromptInputTextarea
-                    className="px-3"
+                    className="px-3 bg-transparent text-slate-100 placeholder:text-slate-500"
                     placeholder="Type a message..."
                     disabled={isLoading}
                   />
-                  <PromptInputSubmit disabled={isLoading || isUploadingVideo}>
+                  <PromptInputSubmit disabled={isLoading || isUploadingVideo} className="bg-cyan-600 hover:bg-cyan-700 text-white">
                     <SendHorizontalIcon className="size-4" />
                   </PromptInputSubmit>
                 </PromptInputBody>
