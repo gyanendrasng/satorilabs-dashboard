@@ -98,3 +98,68 @@ model ChatMessage {
 
   @@map("chat_message")
 }
+
+// Purchase Order - Sales Order - Loading Slip Item Models
+
+model PurchaseOrder {
+  id           String       @id @default(cuid())
+  poNumber     String       @unique
+  customerName String
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  salesOrders SalesOrder[]
+
+  @@map("purchase_order")
+}
+
+model SalesOrder {
+  id              String          @id @default(cuid())
+  soNumber        String
+  purchaseOrderId String
+  vehicleNumber   String?
+  transportId     String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  items         LoadingSlipItem[]
+
+  @@map("sales_order")
+}
+
+model LoadingSlipItem {
+  id           String     @id @default(cuid())
+  salesOrderId String
+  lsNumber     String
+  material     String
+
+  // Aman fields (read-only, populated via API later)
+  materialDescription    String?
+  orderQuantity          Int?
+  orderWeight            Decimal?
+  grnNumber              String?
+  hrjInvoiceNumber       String?
+  outboundDeliveryNumber String?
+
+  // User input fields (editable via forms)
+  plantInvoiceNumber   String?
+  plantInvoiceDate     DateTime?
+  invoiceQuantity      Int?
+  invoiceWeight        Decimal?
+  receivedQuantity     Int?
+  receivedWeight       Decimal?
+  lrNumber             String?
+  lrDate               DateTime?
+  vehicleNumber        String?
+  deliveryStatus       String?
+  accountPayableStatus String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([lsNumber, material])
+  @@map("loading_slip_item")
+}

@@ -39,7 +39,9 @@ import {
   Upload,
   X as XIcon,
   Settings,
+  Package,
 } from 'lucide-react';
+import { SOManagementDialog } from '@/components/orders/SOManagementDialog';
 
 interface ChatMessage {
   id: string;
@@ -77,6 +79,7 @@ export function TrainingChat({
   const [mode, setMode] = useState<'training' | 'work'>(
     session?.mode === 'work' ? 'work' : 'training'
   );
+  const [soDialogOpen, setSODialogOpen] = useState(false);
   const pollingRef = useRef<boolean>(false);
 
   // Update mode in database when changed
@@ -769,6 +772,15 @@ export function TrainingChat({
                     placeholder="Type a message..."
                     disabled={isLoading}
                   />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setSODialogOpen(true)}
+                    title="Manage Sales Orders"
+                    className="text-slate-400 hover:text-white hover:bg-slate-700"
+                  >
+                    <Package className="size-4" />
+                  </Button>
                   <PromptInputSubmit disabled={isLoading || isUploadingVideo} className="bg-cyan-600 hover:bg-cyan-700 text-white">
                     <SendHorizontalIcon className="size-4" />
                   </PromptInputSubmit>
@@ -778,6 +790,12 @@ export function TrainingChat({
           </div>
         </PromptInputProvider>
       </div>
+
+      {/* SO Management Dialog */}
+      <SOManagementDialog
+        open={soDialogOpen}
+        onOpenChange={setSODialogOpen}
+      />
     </div>
   );
 }
