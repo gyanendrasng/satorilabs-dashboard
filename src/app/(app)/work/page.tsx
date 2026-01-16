@@ -282,7 +282,7 @@ export default function WorkPage() {
     const allLSCompleted = so.items.every((ls) => ls.status === 'completed');
     const soCompleted = so.status === 'completed';
     const invoiceCreated = so.invoice && so.invoice.status === 'created';
-    const noShipmentYet = so.invoice && !so.invoice.lrNumber;
+    const noShipmentYet = !so.lrNumber;
     return allLSCompleted && soCompleted && invoiceCreated && noShipmentYet;
   };
 
@@ -347,9 +347,9 @@ export default function WorkPage() {
     setSelectedSO(so);
     setSelectedInvoice(so.invoice);
     setShipmentForm({
-      lrNumber: so.invoice.lrNumber || '',
-      lrDate: so.invoice.lrDate ? so.invoice.lrDate.split('T')[0] : '',
-      vehicleNumber: so.invoice.vehicleNumber || '',
+      lrNumber: so.lrNumber || '',
+      lrDate: so.lrDate ? so.lrDate.split('T')[0] : '',
+      vehicleNumber: so.vehicleNumber || '',
       shipmentType: so.invoice.shipmentType || '',
       plantCode: so.invoice.plantCode || '',
       notes: so.invoice.notes || '',
@@ -874,11 +874,11 @@ export default function WorkPage() {
                                                 Provide Shipment Details
                                               </button>
                                             )}
-                                            {so.invoice.lrNumber && (
+                                            {so.lrNumber && (
                                               <div className="mt-2 pt-2 border-t border-purple-700/50 text-xs text-slate-400">
-                                                <p>LR: {so.invoice.lrNumber}</p>
-                                                {so.invoice.vehicleNumber && (
-                                                  <p>Vehicle: {so.invoice.vehicleNumber}</p>
+                                                <p>LR: {so.lrNumber}</p>
+                                                {so.vehicleNumber && (
+                                                  <p>Vehicle: {so.vehicleNumber}</p>
                                                 )}
                                               </div>
                                             )}
