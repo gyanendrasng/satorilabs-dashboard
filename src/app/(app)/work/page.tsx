@@ -755,7 +755,7 @@ export default function WorkPage() {
                                           <span className="font-semibold text-base">
                                             {so.soNumber}
                                           </span>
-                                          {getStatusBadge(so.status, so.requiresInput)}
+                                          {getStatusBadge(so.status, so.requiresInput && so.items.length > 0 && so.items.every(item => item.status === 'completed'))}
                                           <span className="text-xs text-slate-400">
                                             {lsNumbers.length} LS - {so.items.length} Items
                                           </span>
