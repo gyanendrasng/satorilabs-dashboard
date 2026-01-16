@@ -4,6 +4,7 @@ import { prisma } from '@/lib/prisma';
 
 // User-editable fields only (LR/Vehicle fields moved to SalesOrder level)
 const ALLOWED_FIELDS = [
+  'status',
   'plantInvoiceNumber',
   'plantInvoiceDate',
   'invoiceQuantity',

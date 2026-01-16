@@ -763,7 +763,7 @@ export default function WorkPage() {
                                         <p className="text-xs text-slate-400 mt-0.5">Sales Order</p>
                                       </div>
                                     </div>
-                                    {so.requiresInput && (
+                                    {so.requiresInput && so.items.length > 0 && so.items.every(item => item.status === 'completed') && (
                                       <button
                                         onClick={(e) => {
                                           e.stopPropagation();
