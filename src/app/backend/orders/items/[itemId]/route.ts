@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
 
-// User-editable fields only
+// User-editable fields only (LR/Vehicle fields moved to SalesOrder level)
 const ALLOWED_FIELDS = [
   'plantInvoiceNumber',
   'plantInvoiceDate',
@@ -10,9 +10,6 @@ const ALLOWED_FIELDS = [
   'invoiceWeight',
   'receivedQuantity',
   'receivedWeight',
-  'lrNumber',
-  'lrDate',
-  'vehicleNumber',
   'deliveryStatus',
   'accountPayableStatus',
 ];
@@ -39,7 +36,7 @@ export async function PATCH(
     for (const field of ALLOWED_FIELDS) {
       if (field in body) {
         // Handle date fields
-        if ((field === 'plantInvoiceDate' || field === 'lrDate') && body[field]) {
+        if (field === 'plantInvoiceDate' && body[field]) {
           updateData[field] = new Date(body[field]);
         } else {
           updateData[field] = body[field];

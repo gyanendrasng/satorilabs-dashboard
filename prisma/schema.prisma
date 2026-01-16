@@ -102,11 +102,13 @@ model ChatMessage {
 // Purchase Order - Sales Order - Loading Slip Item Models
 
 model PurchaseOrder {
-  id           String       @id @default(cuid())
-  poNumber     String       @unique
+  id           String   @id @default(cuid())
+  poNumber     String   @unique
   customerName String
-  createdAt    DateTime     @default(now())
-  updatedAt    DateTime     @updatedAt
+  status       String   @default("in-progress") // pending, in-progress, completed
+  stage        Int      @default(1) // 1-6 workflow stages
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   salesOrders SalesOrder[]
 
@@ -114,46 +116,54 @@ model PurchaseOrder {
 }
 
 model SalesOrder {
-  id              String          @id @default(cuid())
-  soNumber        String
-  purchaseOrderId String
-  vehicleNumber   String?
-  transportId     String?
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id                  String   @id @default(cuid())
+  soNumber            String
+  purchaseOrderId     String
+  vehicleNumber       String?
+  transportId         String?
+  driverMobile        String?
+  containerNumber     String?
+  sealNumber          String?
+  weight              Decimal?
+  containerType       String?
+  deliveryLocations   String?
+  specialInstructions String?
+  lrNumber            String?  // Lorry Receipt Number (Stage 5 - User Input)
+  lrDate              DateTime? // Lorry Receipt Date (Stage 5 - User Input)
+  status              String   @default("pending") // pending, pending-input, in-progress, completed
+  requiresInput       Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
   purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   items         LoadingSlipItem[]
+  invoice       Invoice?
 
   @@map("sales_order")
 }
 
 model LoadingSlipItem {
-  id           String     @id @default(cuid())
+  id           String @id @default(cuid())
   salesOrderId String
   lsNumber     String
   material     String
+  status       String @default("pending") // pending, in-progress, completed
 
   // Aman fields (read-only, populated via API later)
-  materialDescription    String?
-  orderQuantity          Int?
-  orderWeight            Decimal?
-  grnNumber              String?
-  hrjInvoiceNumber       String?
-  outboundDeliveryNumber String?
+  materialDescription String?
+  orderQuantity       Int?
+  orderWeight         Decimal?
+  grnNumber           String? // GRN Number (from Aman Stage 4)
 
   // User input fields (editable via forms)
-  plantInvoiceNumber   String?
-  plantInvoiceDate     DateTime?
-  invoiceQuantity      Int?
-  invoiceWeight        Decimal?
-  receivedQuantity     Int?
-  receivedWeight       Decimal?
-  lrNumber             String?
-  lrDate               DateTime?
-  vehicleNumber        String?
-  deliveryStatus       String?
-  accountPayableStatus String?
+  plantInvoiceNumber   String?   // Stage 3 - Plant Invoice Number
+  plantInvoiceDate     DateTime? // Stage 3 - Plant Invoice Date
+  invoiceQuantity      Int?      // Stage 3 - Invoice Quantity
+  invoiceWeight        Decimal?  // Stage 3 - Invoice Weight
+  receivedQuantity     Int?      // Stage 5 - Received Quantity
+  receivedWeight       Decimal?  // Stage 5 - Received Weight
+  deliveryStatus       String?   // Stage 5 - Delivery Status
+  accountPayableStatus String?   // Stage 5 - Account Payable Status
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -162,4 +172,25 @@ model LoadingSlipItem {
 
   @@unique([lsNumber, material])
   @@map("loading_slip_item")
+}
+
+model Invoice {
+  id            String   @id @default(cuid())
+  salesOrderId  String   @unique // ONE-TO-ONE with SO
+  invoiceNumber String   // HRJ Invoice Number (from Aman Stage 4)
+  obdNumber     String?  // Outbound Delivery Number (from Aman Stage 4)
+  amount        Decimal?
+  status        String   @default("pending") // pending, created, shipped
+
+  // Shipment details (Stage 5 - User Input)
+  shipmentType String?
+  plantCode    String?
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@map("invoice")
 }

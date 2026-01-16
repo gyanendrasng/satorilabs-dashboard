@@ -6,16 +6,16 @@ interface ProcessingDataItem {
   lsNumber: string;
   material: string;
   grnNumber?: string;
-  hrjInvoiceNumber?: string;
-  outboundDeliveryNumber?: string;
 }
 
 interface ProcessingDataPayload {
   soNumber: string;
+  hrjInvoiceNumber?: string; // Now at SO/Invoice level
+  outboundDeliveryNumber?: string; // Now at SO/Invoice level
   items: ProcessingDataItem[];
 }
 
-// POST - Aman API 2: Add post-processing data (GRN, HRJ Invoice, Outbound Delivery)
+// POST - Aman API 2: Add post-processing data (GRN per item, HRJ Invoice/OBD at SO level)
 export async function POST(request: Request) {
   try {
     // Validate API key
@@ -25,7 +25,7 @@ export async function POST(request: Request) {
     }
 
     const body: ProcessingDataPayload = await request.json();
-    const { soNumber, items } = body;
+    const { soNumber, hrjInvoiceNumber, outboundDeliveryNumber, items } = body;
 
     if (!soNumber) {
       return NextResponse.json(
@@ -44,6 +44,7 @@ export async function POST(request: Request) {
     // Find the Sales Order by soNumber to verify it exists
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
+      include: { invoice: true },
     });
 
     if (!salesOrder) {
@@ -63,7 +64,7 @@ export async function POST(request: Request) {
       }
     }
 
-    // Update items
+    // Update items with GRN Number only
     const results = [];
     const notFound = [];
 
@@ -83,7 +84,7 @@ export async function POST(request: Request) {
         continue;
       }
 
-      // Update with processing data
+      // Update with GRN Number only
       const updated = await prisma.loadingSlipItem.update({
         where: {
           lsNumber_material: {
@@ -93,18 +94,43 @@ export async function POST(request: Request) {
         },
         data: {
           grnNumber: item.grnNumber ?? existingItem.grnNumber,
-          hrjInvoiceNumber: item.hrjInvoiceNumber ?? existingItem.hrjInvoiceNumber,
-          outboundDeliveryNumber: item.outboundDeliveryNumber ?? existingItem.outboundDeliveryNumber,
         },
       });
 
       results.push(updated);
     }
 
+    // Create or Update Invoice if HRJ Invoice Number is provided
+    let invoice = null;
+    if (hrjInvoiceNumber) {
+      if (salesOrder.invoice) {
+        // Update existing Invoice
+        invoice = await prisma.invoice.update({
+          where: { id: salesOrder.invoice.id },
+          data: {
+            invoiceNumber: hrjInvoiceNumber,
+            obdNumber: outboundDeliveryNumber ?? salesOrder.invoice.obdNumber,
+            status: 'created',
+          },
+        });
+      } else {
+        // Create new Invoice
+        invoice = await prisma.invoice.create({
+          data: {
+            salesOrderId: salesOrder.id,
+            invoiceNumber: hrjInvoiceNumber,
+            obdNumber: outboundDeliveryNumber,
+            status: 'created',
+          },
+        });
+      }
+    }
+
     return NextResponse.json({
       success: true,
       message: `${results.length} item(s) updated`,
       items: results,
+      invoice: invoice,
       ...(notFound.length > 0 && {
         notFound: {
           count: notFound.length,

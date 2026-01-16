@@ -29,6 +29,7 @@ export async function GET(request: Request) {
                 lsNumber: 'asc',
               },
             },
+            invoice: true,
           },
         },
       },

@@ -17,7 +17,7 @@ export async function PATCH(
     }
 
     const { soId } = await params;
-    const { soNumber, vehicleNumber, transportId } = await request.json();
+    const body = await request.json();
 
     // Verify SO exists
     const existingSO = await prisma.salesOrder.findUnique({
@@ -34,9 +34,20 @@ export async function PATCH(
     const salesOrder = await prisma.salesOrder.update({
       where: { id: soId },
       data: {
-        ...(soNumber !== undefined && { soNumber }),
-        ...(vehicleNumber !== undefined && { vehicleNumber: vehicleNumber || null }),
-        ...(transportId !== undefined && { transportId: transportId || null }),
+        ...(body.soNumber !== undefined && { soNumber: body.soNumber }),
+        ...(body.vehicleNumber !== undefined && { vehicleNumber: body.vehicleNumber || null }),
+        ...(body.transportId !== undefined && { transportId: body.transportId || null }),
+        ...(body.driverMobile !== undefined && { driverMobile: body.driverMobile || null }),
+        ...(body.containerNumber !== undefined && { containerNumber: body.containerNumber || null }),
+        ...(body.sealNumber !== undefined && { sealNumber: body.sealNumber || null }),
+        ...(body.weight !== undefined && { weight: body.weight || null }),
+        ...(body.containerType !== undefined && { containerType: body.containerType || null }),
+        ...(body.deliveryLocations !== undefined && { deliveryLocations: body.deliveryLocations || null }),
+        ...(body.specialInstructions !== undefined && { specialInstructions: body.specialInstructions || null }),
+        ...(body.lrNumber !== undefined && { lrNumber: body.lrNumber || null }),
+        ...(body.lrDate !== undefined && { lrDate: body.lrDate ? new Date(body.lrDate) : null }),
+        ...(body.status !== undefined && { status: body.status }),
+        ...(body.requiresInput !== undefined && { requiresInput: body.requiresInput }),
       },
     });
 
@@ -76,6 +87,7 @@ export async function GET(
         items: {
           orderBy: { lsNumber: 'asc' },
         },
+        invoice: true,
       },
     });
 

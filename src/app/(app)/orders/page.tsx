@@ -172,9 +172,6 @@ export default function OrdersPage() {
           invoiceWeight: editingItem.invoiceWeight,
           receivedQuantity: editingItem.receivedQuantity,
           receivedWeight: editingItem.receivedWeight,
-          lrNumber: editingItem.lrNumber,
-          lrDate: editingItem.lrDate,
-          vehicleNumber: editingItem.vehicleNumber,
           deliveryStatus: editingItem.deliveryStatus,
           accountPayableStatus: editingItem.accountPayableStatus,
         }),
@@ -493,47 +490,6 @@ export default function OrdersPage() {
                 />
               </div>
               <div>
-                <label className="text-sm font-medium">LR Number</label>
-                <Input
-                  value={editingItem.lrNumber || ''}
-                  onChange={(e) =>
-                    setEditingItem({
-                      ...editingItem,
-                      lrNumber: e.target.value || null,
-                    })
-                  }
-                />
-              </div>
-              <div>
-                <label className="text-sm font-medium">LR Date</label>
-                <Input
-                  type="date"
-                  value={
-                    editingItem.lrDate
-                      ? new Date(editingItem.lrDate).toISOString().split('T')[0]
-                      : ''
-                  }
-                  onChange={(e) =>
-                    setEditingItem({
-                      ...editingItem,
-                      lrDate: e.target.value || null,
-                    })
-                  }
-                />
-              </div>
-              <div>
-                <label className="text-sm font-medium">Vehicle Number</label>
-                <Input
-                  value={editingItem.vehicleNumber || ''}
-                  onChange={(e) =>
-                    setEditingItem({
-                      ...editingItem,
-                      vehicleNumber: e.target.value || null,
-                    })
-                  }
-                />
-              </div>
-              <div>
                 <label className="text-sm font-medium">Delivery Status</label>
                 <Select
                   value={editingItem.deliveryStatus || ''}
@@ -628,6 +584,11 @@ function SOSection({
             {so.vehicleNumber && (
               <span className="text-sm text-muted-foreground">
                 | Vehicle: {so.vehicleNumber}
+              </span>
+            )}
+            {so.lrNumber && (
+              <span className="text-sm text-muted-foreground">
+                | LR: {so.lrNumber}
               </span>
             )}
           </div>

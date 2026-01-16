@@ -17,7 +17,19 @@ export async function POST(
     }
 
     const { poId } = await params;
-    const { soNumber, vehicleNumber, transportId } = await request.json();
+    const body = await request.json();
+    const {
+      soNumber,
+      vehicleNumber,
+      transportId,
+      driverMobile,
+      containerNumber,
+      sealNumber,
+      weight,
+      containerType,
+      deliveryLocations,
+      specialInstructions,
+    } = body;
 
     if (!soNumber) {
       return NextResponse.json(
@@ -53,6 +65,13 @@ export async function POST(
         soNumber,
         vehicleNumber: vehicleNumber || null,
         transportId: transportId || null,
+        driverMobile: driverMobile || null,
+        containerNumber: containerNumber || null,
+        sealNumber: sealNumber || null,
+        weight: weight || null,
+        containerType: containerType || null,
+        deliveryLocations: deliveryLocations || null,
+        specialInstructions: specialInstructions || null,
       },
     });
 
