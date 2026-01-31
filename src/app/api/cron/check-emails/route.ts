@@ -5,9 +5,7 @@ import { checkForReplies } from '@/lib/email-reply-checker';
  * GET /api/cron/check-emails
  *
  * Cron endpoint to check for email replies and process them.
- * Should be called every 5-10 minutes by Vercel Cron or external scheduler.
- *
- * Optional: Pass CRON_SECRET in Authorization header for security
+ * Runs every 5 minutes via Vercel Cron.
  */
 export async function GET(request: Request) {
   try {
@@ -24,14 +22,13 @@ export async function GET(request: Request) {
 
     const result = await checkForReplies();
 
-    console.log(
-      `[Cron] Email check complete. Processed: ${result.processed}, Errors: ${result.errors.length}`
-    );
+    console.log(`[Cron] Email check complete. Processed: ${result.processed}, Errors: ${result.errors.length}`);
 
     return NextResponse.json({
       success: true,
       processed: result.processed,
       errors: result.errors,
+      logs: result.logs,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {

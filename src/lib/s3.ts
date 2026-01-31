@@ -200,3 +200,27 @@ export async function generateSignedUrl(
 
   return await getSignedUrl(client, command, { expiresIn });
 }
+
+// Download an object from S3
+export async function downloadFromS3(key: string): Promise<Buffer> {
+  const client = getS3Client();
+  const bucket = process.env.S3_BUCKET;
+
+  if (!bucket) {
+    throw new Error('S3_BUCKET environment variable is not set');
+  }
+
+  const command = new GetObjectCommand({
+    Bucket: bucket,
+    Key: key,
+  });
+
+  const response = await client.send(command);
+  const byteArray = await response.Body?.transformToByteArray();
+
+  if (!byteArray) {
+    throw new Error(`Failed to download ${key}`);
+  }
+
+  return Buffer.from(byteArray);
+}

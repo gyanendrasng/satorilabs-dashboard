@@ -1,15 +1,27 @@
 import { prisma } from './prisma';
+import { downloadFromS3 } from './s3';
 
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 
 /**
- * Check if all LoadingSlipItems for a SalesOrder have invoice data,
- * and trigger ZLOAD3 if they do.
+ * Check if all LoadingSlipItems for a SalesOrder have replies with PDFs,
+ * and send batch request to Aman's auto_gui2 backend if they do.
  */
-export async function checkAndTriggerZLOAD3(
+export async function checkAndSendBatchToAman(
   salesOrderId: string
-): Promise<boolean> {
-  // Get the sales order with all its loading slip items
+): Promise<{ success: boolean; logs: string[] }> {
+  const logs: string[] = [];
+
+  const log = (message: string) => {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}`;
+    console.log(logMessage);
+    logs.push(logMessage);
+  };
+
+  log(`[BatchSender] Checking if all replies received for SO ID: ${salesOrderId}`);
+
+  // Get the sales order with all its loading slip items and emails
   const salesOrder = await prisma.salesOrder.findUnique({
     where: { id: salesOrderId },
     include: {
@@ -23,65 +35,83 @@ export async function checkAndTriggerZLOAD3(
   });
 
   if (!salesOrder) {
-    console.error(`Sales order not found: ${salesOrderId}`);
-    return false;
+    log(`[BatchSender] Sales order not found: ${salesOrderId}`);
+    return { success: false, logs };
   }
 
-  // Check if all items have invoice data
-  const allItemsHaveInvoice = salesOrder.items.every(
-    (item) =>
-      item.plantInvoiceNumber &&
-      item.plantInvoiceDate &&
-      item.invoiceQuantity !== null
+  // Log status of each item's emails
+  log(`[BatchSender] SO ${salesOrder.soNumber} has ${salesOrder.items.length} items:`);
+  for (const item of salesOrder.items) {
+    const repliedEmail = item.emails.find((e) => e.status === 'replied' && e.replyPdfUrl);
+    const status = repliedEmail ? `replied (PDF: ${repliedEmail.replyPdfUrl})` : 'waiting';
+    log(`  - LS ${item.lsNumber}: ${status}`);
+  }
+
+  // Check if ALL items have at least one email with status 'replied' and replyPdfUrl
+  const allReplied = salesOrder.items.every((item) =>
+    item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
   );
 
-  if (!allItemsHaveInvoice) {
-    console.log(
-      `Not all items for SO ${salesOrder.soNumber} have invoice data yet`
+  if (!allReplied) {
+    const repliedCount = salesOrder.items.filter((item) =>
+      item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
+    ).length;
+    log(
+      `[BatchSender] Not ready yet for SO ${salesOrder.soNumber}: ${repliedCount}/${salesOrder.items.length} items have replies`
     );
-    return false;
+    return { success: false, logs };
   }
 
-  // Check if all emails are processed
-  const allEmailsProcessed = salesOrder.items.every((item) =>
-    item.emails.every((email) => email.status === 'processed')
+  log(`[BatchSender] All ${salesOrder.items.length} items have replies for SO ${salesOrder.soNumber}. Sending batch to auto_gui2...`);
+
+  // Get FIRST reply PDF only (from first item with a replied email)
+  const firstItem = salesOrder.items.find((item) =>
+    item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
   );
 
-  if (!allEmailsProcessed) {
-    console.log(
-      `Not all emails for SO ${salesOrder.soNumber} are processed yet`
-    );
-    return false;
+  if (!firstItem) {
+    log(`[BatchSender] No item with reply PDF found for SO ${salesOrder.soNumber}`);
+    return { success: false, logs };
   }
 
-  // Aggregate data for ZLOAD3
-  const loadedQty = salesOrder.items.reduce(
-    (sum, item) => sum + (item.invoiceQuantity || 0),
-    0
+  const firstEmail = firstItem.emails.find(
+    (e) => e.status === 'replied' && e.replyPdfUrl
   );
 
-  // Use first item's invoice details (or could concatenate if different)
-  const firstItemWithInvoice = salesOrder.items.find(
-    (item) => item.plantInvoiceNumber
-  );
-  const invoiceNumber = firstItemWithInvoice?.plantInvoiceNumber || '';
-  const invoiceDate = firstItemWithInvoice?.plantInvoiceDate
-    ? formatDate(firstItemWithInvoice.plantInvoiceDate)
-    : '';
-
-  // Build instruction for ZLOAD3
-  const instruction = `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZLOAD3 for Sales order number ${salesOrder.soNumber}. Loaded quantity is ${loadedQty}, invoice number is ${invoiceNumber} and invoice date is ${invoiceDate}`;
+  if (!firstEmail || !firstEmail.replyPdfUrl) {
+    log(`[BatchSender] No reply PDF URL found for SO ${salesOrder.soNumber}`);
+    return { success: false, logs };
+  }
 
   try {
-    // Send request to auto_gui2
+    // Download the first PDF from R2
+    log(`[BatchSender] Downloading PDF from R2: ${firstEmail.replyPdfUrl}`);
+    const pdfBuffer = await downloadFromS3(firstEmail.replyPdfUrl);
+    log(`[BatchSender] Downloaded PDF: ${pdfBuffer.length} bytes`);
+
+    const attachment = {
+      filename: `${firstItem.lsNumber}.pdf`,
+      content_base64: pdfBuffer.toString('base64'),
+    };
+
+    // Build instruction with all LS numbers
+    const lsNumbers = salesOrder.items.map((i) => i.lsNumber).join(', ');
+    const instruction = `Run the SAP transaction ZLOAD3 for Sales Order ${salesOrder.soNumber}. Loading slips: ${lsNumbers}. Extract invoice data from the attached PDF.`;
+
+    log(`[BatchSender] Sending to auto_gui2:`);
+    log(`  - Instruction: ${instruction}`);
+    log(`  - Attachment: ${attachment.filename} (${pdfBuffer.length} bytes)`);
+
+    // Send to existing /chat endpoint with SINGLE PDF
     const response = await fetch(`http://${AUTO_GUI_HOST}:8000/chat`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         instruction,
         transaction_code: 'ZLOAD3',
+        attachments: [attachment],
+        extraction_context:
+          'Extract the sales order number, loaded quantity, invoice number, and invoice date',
       }),
     });
 
@@ -89,40 +119,44 @@ export async function checkAndTriggerZLOAD3(
       throw new Error(`auto_gui2 request failed: ${response.statusText}`);
     }
 
-    console.log(
-      `ZLOAD3 triggered for SO ${salesOrder.soNumber}: ${instruction}`
-    );
+    const responseData = await response.json();
+    log(`[BatchSender] auto_gui2 response for SO ${salesOrder.soNumber}: ${JSON.stringify(responseData)}`);
 
-    // Update sales order status/stage
+    // Mark all emails with status 'replied' as 'processed'
+    let processedCount = 0;
+    for (const item of salesOrder.items) {
+      for (const email of item.emails) {
+        if (email.status === 'replied') {
+          await prisma.email.update({
+            where: { id: email.id },
+            data: { status: 'processed' },
+          });
+          processedCount++;
+        }
+      }
+    }
+    log(`[BatchSender] Marked ${processedCount} emails as 'processed' for SO ${salesOrder.soNumber}`);
+
+    // Update SalesOrder status to completed
     await prisma.salesOrder.update({
       where: { id: salesOrderId },
-      data: {
-        status: 'completed',
-      },
+      data: { status: 'completed' },
     });
+    log(`[BatchSender] SO ${salesOrder.soNumber} marked as 'completed'`);
 
     // Update purchase order stage if needed
     await updatePurchaseOrderStage(salesOrder.purchaseOrderId);
 
-    return true;
+    log(`[BatchSender] Successfully processed SO ${salesOrder.soNumber} with ${salesOrder.items.length} LS items`);
+    return { success: true, logs };
   } catch (error) {
-    console.error(
-      `Failed to trigger ZLOAD3 for SO ${salesOrder.soNumber}:`,
-      error
+    log(
+      `[BatchSender] Failed to send batch to auto_gui2 for SO ${salesOrder.soNumber}: ${
+        error instanceof Error ? error.message : String(error)
+      }`
     );
-    return false;
+    return { success: false, logs };
   }
-}
-
-/**
- * Format date as DD.MM.YYYY for SAP
- */
-function formatDate(date: Date): string {
-  const d = new Date(date);
-  const day = String(d.getDate()).padStart(2, '0');
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const year = d.getFullYear();
-  return `${day}.${month}.${year}`;
 }
 
 /**

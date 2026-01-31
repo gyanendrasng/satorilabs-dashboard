@@ -186,6 +186,7 @@ model Email {
   status            String    @default("sent") // sent, replied, processed
   sentAt            DateTime  @default(now())
   repliedAt         DateTime?
+  replyPdfUrl       String?   // R2 key for the reply PDF attachment
 
   loadingSlipItem LoadingSlipItem @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
 
