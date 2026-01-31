@@ -85,10 +85,10 @@ export async function POST(
     // Fire-and-forget: Call Aman's auto_gui2 API in background
     axios
       .post(`http://${AUTO_GUI_HOST}:8000/chat`, {
-        instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3 for Sales order number ${soNumber}.`,
-        transaction_code: 'ZLOAD3',
+        instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}.`,
+        transaction_code: 'ZLOAD3-A',
       })
-      .then(() => console.log(`[sales-orders] auto_gui2 ZLOAD3 triggered for SO ${soNumber}`))
+      .then(() => console.log(`[sales-orders] auto_gui2 ZLOAD3-A triggered for SO ${soNumber}`))
       .catch((err) => console.error(`[sales-orders] auto_gui2 error:`, err.message));
 
     return NextResponse.json({ salesOrder });

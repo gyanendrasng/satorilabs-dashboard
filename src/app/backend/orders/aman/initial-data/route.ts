@@ -7,7 +7,7 @@ import { uploadToS3 } from '@/lib/s3';
 /**
  * POST /backend/orders/aman/initial-data
  *
- * Receives LS files (XLS/PDF) from Aman (auto_gui2) after executing ZLOAD3.
+ * Receives LS files (XLS/PDF) from Aman (auto_gui2) after executing ZLOAD3-A.
  * For each file received:
  * 1. Reads SO number from CurrentSO singleton (or uses provided soNumber)
  * 2. Uploads file to R2: ls-files/{soNumber}/{filename}

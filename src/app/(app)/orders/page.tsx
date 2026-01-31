@@ -207,14 +207,14 @@ export default function OrdersPage() {
     setTriggeringAman((prev) => new Set(prev).add(soNumber));
 
     try {
-      const instruction = `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZLOAD3 for Sales order number ${soNumber}`;
+      const instruction = `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}`;
 
       const res = await fetch(`${amanUrl}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           instruction,
-          transaction_code: 'ZLOAD3',
+          transaction_code: 'ZLOAD3-A',
         }),
       });
 
@@ -222,7 +222,7 @@ export default function OrdersPage() {
         throw new Error(`Aman API error: ${res.statusText}`);
       }
 
-      alert(`ZLOAD3 triggered for SO ${soNumber}. Aman will download LS PDFs and send them back.`);
+      alert(`ZLOAD3-A triggered for SO ${soNumber}. Aman will download LS PDFs and send them back.`);
     } catch (err) {
       alert(`Failed to trigger Aman: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
@@ -651,14 +651,14 @@ function SOSection({
               onTriggerAman(so.soNumber);
             }}
             disabled={isTriggering}
-            title="Trigger ZLOAD3 in SAP"
+            title="Trigger ZLOAD3-A in SAP"
           >
             {isTriggering ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : (
               <Play className="w-4 h-4" />
             )}
-            <span className="ml-1">ZLOAD3</span>
+            <span className="ml-1">ZLOAD3-A</span>
           </Button>
         </div>
       </div>

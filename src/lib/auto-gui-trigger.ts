@@ -96,7 +96,7 @@ export async function checkAndSendBatchToAman(
 
     // Build instruction with all LS numbers
     const lsNumbers = salesOrder.items.map((i) => i.lsNumber).join(', ');
-    const instruction = `Run the SAP transaction ZLOAD3 for Sales Order ${salesOrder.soNumber}. Loading slips: ${lsNumbers}. Extract invoice data from the attached PDF.`;
+    const instruction = `Run the SAP transaction ZLOAD3-A for Sales Order ${salesOrder.soNumber}. Loading slips: ${lsNumbers}. Extract invoice data from the attached PDF.`;
 
     log(`[BatchSender] Sending to auto_gui2:`);
     log(`  - Instruction: ${instruction}`);
@@ -108,7 +108,7 @@ export async function checkAndSendBatchToAman(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         instruction,
-        transaction_code: 'ZLOAD3',
+        transaction_code: 'ZLOAD3-A',
         attachments: [attachment],
         extraction_context:
           'Extract the sales order number, loaded quantity, invoice number, and invoice date',
