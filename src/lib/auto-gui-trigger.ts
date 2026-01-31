@@ -94,9 +94,8 @@ export async function checkAndSendBatchToAman(
       content_base64: pdfBuffer.toString('base64'),
     };
 
-    // Build instruction with all LS numbers
-    const lsNumbers = salesOrder.items.map((i) => i.lsNumber).join(', ');
-    const instruction = `Run the SAP transaction ZLOAD3 for Sales Order ${salesOrder.soNumber}. Loading slips: ${lsNumbers}. Extract invoice data from the attached PDF.`;
+    // Build instruction
+    const instruction = `VPN is connected, SAP is logged in. Just execute ZLOAD3 for the sales order ${salesOrder.soNumber}`;
 
     log(`[BatchSender] Sending to auto_gui2:`);
     log(`  - Instruction: ${instruction}`);
@@ -111,7 +110,7 @@ export async function checkAndSendBatchToAman(
         transaction_code: 'ZLOAD3',
         attachments: [attachment],
         extraction_context:
-          'Extract the sales order number, loaded quantity, invoice number, and invoice date',
+          'Extract the loaded quantity, invoice number, and invoice date',
       }),
     });
 
