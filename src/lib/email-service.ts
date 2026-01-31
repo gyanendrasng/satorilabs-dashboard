@@ -9,14 +9,15 @@ interface VehicleDetails {
 }
 
 /**
- * Send Loading Slip PDF email to plant
+ * Send Loading Slip file email to plant
  */
 export async function sendLSEmail(
   loadingSlipItemId: string,
   soNumber: string,
   lsNumber: string,
-  lsPdfBuffer: Buffer,
-  vehicleDetails: VehicleDetails
+  fileBuffer: Buffer,
+  vehicleDetails: VehicleDetails,
+  originalFilename?: string
 ): Promise<{ messageId: string; threadId: string }> {
   const plantEmail = process.env.PLANT_EMAIL;
   if (!plantEmail) {
@@ -48,10 +49,20 @@ export async function sendLSEmail(
 
   const body = bodyLines.join('\n');
 
+  // Determine filename and mime type
+  const filename = originalFilename || `LS_${lsNumber}.pdf`;
+  const isXls = /\.xls$/i.test(filename);
+  const isXlsx = /\.xlsx$/i.test(filename);
+  const mimeType = isXls
+    ? 'application/vnd.ms-excel'
+    : isXlsx
+      ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      : 'application/pdf';
+
   const { messageId, threadId } = await sendEmail(plantEmail, subject, body, {
-    filename: `LS_${lsNumber}.pdf`,
-    content: lsPdfBuffer,
-    mimeType: 'application/pdf',
+    filename,
+    content: fileBuffer,
+    mimeType,
   });
 
   // Create Email record in database

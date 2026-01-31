@@ -154,6 +154,7 @@ model LoadingSlipItem {
   orderQuantity       Int?
   orderWeight         Decimal?
   grnNumber           String? // GRN Number (from Aman Stage 4)
+  fileUrl             String? // R2 key for the LS file (XLS/PDF)
 
   // User input fields (editable via forms)
   plantInvoiceNumber   String?   // Stage 3 - Plant Invoice Number
@@ -189,6 +190,13 @@ model Email {
   loadingSlipItem LoadingSlipItem @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
 
   @@map("email")
+}
+
+// Singleton table to track current SO being processed by Aman
+model CurrentSO {
+  soNumber String @id
+
+  @@map("current_so")
 }
 
 model Invoice {

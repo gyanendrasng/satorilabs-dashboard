@@ -78,6 +78,10 @@ export async function POST(
       },
     });
 
+    // Save current SO number to singleton table for Aman to reference
+    await prisma.currentSO.deleteMany();
+    await prisma.currentSO.create({ data: { soNumber } });
+
     // Fire-and-forget: Call Aman's auto_gui2 API in background
     axios
       .post(`http://${AUTO_GUI_HOST}:8000/chat`, {
