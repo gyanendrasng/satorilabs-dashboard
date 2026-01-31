@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { validateAmanApiKey } from '@/lib/aman-auth';
 import { sendLSEmail } from '@/lib/email-service';
 import { uploadToS3 } from '@/lib/s3';
 
@@ -26,12 +25,6 @@ import { uploadToS3 } from '@/lib/s3';
  */
 export async function POST(request: Request) {
   try {
-    // Validate API key
-    const authResult = validateAmanApiKey(request);
-    if (!authResult.valid) {
-      return authResult.error;
-    }
-
     const formData = await request.formData();
     let soNumber = formData.get('soNumber') as string | null;
 

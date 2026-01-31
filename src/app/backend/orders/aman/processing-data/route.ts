@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { validateAmanApiKey } from '@/lib/aman-auth';
 
 interface ProcessingDataItem {
   lsNumber: string;
@@ -18,12 +17,6 @@ interface ProcessingDataPayload {
 // POST - Aman API 2: Add post-processing data (GRN per item, HRJ Invoice/OBD at SO level)
 export async function POST(request: Request) {
   try {
-    // Validate API key
-    const authResult = validateAmanApiKey(request);
-    if (!authResult.valid) {
-      return authResult.error;
-    }
-
     const body: ProcessingDataPayload = await request.json();
     const { soNumber, hrjInvoiceNumber, outboundDeliveryNumber, items } = body;
 

@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { validateAmanApiKey } from '@/lib/aman-auth';
 
 // User-editable fields only (LR/Vehicle fields moved to SalesOrder level)
 const ALLOWED_FIELDS = [
@@ -22,13 +21,11 @@ export async function PATCH(
   { params }: { params: Promise<{ itemId: string }> }
 ) {
   try {
-    // Check API key first, then fall back to session auth
-    const apiKeyResult = validateAmanApiKey(request);
     const session = await auth.api.getSession({
       headers: request.headers,
     });
 
-    if (!apiKeyResult.valid && !session) {
+    if (!session) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
