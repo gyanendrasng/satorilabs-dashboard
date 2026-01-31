@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import axios from 'axios';
+
+const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || '20.244.42.146';
 
 // POST - Add a sales order to a purchase order
 export async function POST(
@@ -74,6 +77,15 @@ export async function POST(
         specialInstructions: specialInstructions || null,
       },
     });
+
+    // Fire-and-forget: Call Aman's auto_gui2 API in background
+    axios
+      .post(`http://${AUTO_GUI_HOST}:8000/chat`, {
+        instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3 for Sales order number ${soNumber}.`,
+        transaction_code: 'ZLOAD3',
+      })
+      .then(() => console.log(`[sales-orders] auto_gui2 ZLOAD3 triggered for SO ${soNumber}`))
+      .catch((err) => console.error(`[sales-orders] auto_gui2 error:`, err.message));
 
     return NextResponse.json({ salesOrder });
   } catch (error) {
