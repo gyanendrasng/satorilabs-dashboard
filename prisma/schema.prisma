@@ -169,9 +169,26 @@ model LoadingSlipItem {
   updatedAt DateTime @updatedAt
 
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  emails     Email[]
 
   @@unique([lsNumber, material])
   @@map("loading_slip_item")
+}
+
+model Email {
+  id                String    @id @default(cuid())
+  loadingSlipItemId String
+  gmailMessageId    String    @unique // Gmail message ID for reply tracking
+  gmailThreadId     String             // Thread ID to find replies
+  recipientEmail    String
+  subject           String
+  status            String    @default("sent") // sent, replied, processed
+  sentAt            DateTime  @default(now())
+  repliedAt         DateTime?
+
+  loadingSlipItem LoadingSlipItem @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
+
+  @@map("email")
 }
 
 model Invoice {

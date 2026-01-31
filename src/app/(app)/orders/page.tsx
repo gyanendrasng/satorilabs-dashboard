@@ -31,7 +31,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Input } from '@/components/ui/input';
-import { ChevronDown, ChevronRight, Plus, Pencil } from 'lucide-react';
+import { ChevronDown, ChevronRight, Plus, Pencil, Play, Loader2 } from 'lucide-react';
 import {
   PurchaseOrder,
   SalesOrder,
@@ -67,6 +67,9 @@ export default function OrdersPage() {
     transportId: '',
   });
   const [editingItem, setEditingItem] = useState<LoadingSlipItem | null>(null);
+
+  // Aman trigger state
+  const [triggeringAman, setTriggeringAman] = useState<Set<string>>(new Set());
 
   const fetchOrders = useCallback(async () => {
     try {
@@ -194,6 +197,43 @@ export default function OrdersPage() {
     setSODialogOpen(true);
   };
 
+  const triggerAman = async (soNumber: string) => {
+    const amanUrl = process.env.NEXT_PUBLIC_AMAN_API_URL;
+    if (!amanUrl) {
+      alert('Aman API URL not configured');
+      return;
+    }
+
+    setTriggeringAman((prev) => new Set(prev).add(soNumber));
+
+    try {
+      const instruction = `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZLOAD3 for Sales order number ${soNumber}`;
+
+      const res = await fetch(`${amanUrl}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          instruction,
+          transaction_code: 'ZLOAD3',
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Aman API error: ${res.statusText}`);
+      }
+
+      alert(`ZLOAD3 triggered for SO ${soNumber}. Aman will download LS PDFs and send them back.`);
+    } catch (err) {
+      alert(`Failed to trigger Aman: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setTriggeringAman((prev) => {
+        const next = new Set(prev);
+        next.delete(soNumber);
+        return next;
+      });
+    }
+  };
+
   const openEditItemDialog = (item: LoadingSlipItem) => {
     setEditingItem({ ...item });
     setItemDialogOpen(true);
@@ -292,6 +332,8 @@ export default function OrdersPage() {
                             expandedLSs={expandedLSs}
                             onToggleLS={toggleLS}
                             onEditItem={openEditItemDialog}
+                            onTriggerAman={triggerAman}
+                            isTriggering={triggeringAman.has(so.soNumber)}
                           />
                         ))}
                       </div>
@@ -559,6 +601,8 @@ function SOSection({
   expandedLSs,
   onToggleLS,
   onEditItem,
+  onTriggerAman,
+  isTriggering,
 }: {
   so: SalesOrder;
   expanded: boolean;
@@ -566,15 +610,17 @@ function SOSection({
   expandedLSs: Set<string>;
   onToggleLS: (key: string) => void;
   onEditItem: (item: LoadingSlipItem) => void;
+  onTriggerAman: (soNumber: string) => void;
+  isTriggering: boolean;
 }) {
   const itemsByLS = groupItemsByLsNumber(so.items);
   const lsNumbers = Array.from(itemsByLS.keys()).sort();
 
   return (
     <Collapsible open={expanded} onOpenChange={onToggle}>
-      <CollapsibleTrigger asChild>
-        <div className="flex items-center justify-between p-3 rounded-lg bg-muted/30 hover:bg-muted/50 cursor-pointer transition-colors">
-          <div className="flex items-center gap-2">
+      <div className="flex items-center justify-between p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
+        <CollapsibleTrigger asChild>
+          <div className="flex items-center gap-2 cursor-pointer flex-1">
             {expanded ? (
               <ChevronDown className="w-4 h-4" />
             ) : (
@@ -592,11 +638,30 @@ function SOSection({
               </span>
             )}
           </div>
+        </CollapsibleTrigger>
+        <div className="flex items-center gap-2">
           <span className="text-sm text-muted-foreground">
             {lsNumbers.length} LS, {so.items.length} items
           </span>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={(e) => {
+              e.stopPropagation();
+              onTriggerAman(so.soNumber);
+            }}
+            disabled={isTriggering}
+            title="Trigger ZLOAD3 in SAP"
+          >
+            {isTriggering ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Play className="w-4 h-4" />
+            )}
+            <span className="ml-1">ZLOAD3</span>
+          </Button>
         </div>
-      </CollapsibleTrigger>
+      </div>
       <CollapsibleContent>
         <div className="mt-2 pl-4 space-y-2">
           {lsNumbers.length === 0 ? (
