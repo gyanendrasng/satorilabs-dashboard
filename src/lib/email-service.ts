@@ -21,8 +21,11 @@ export async function sendLSEmail(
 ): Promise<{ messageId: string; threadId: string }> {
   const plantEmail = process.env.PLANT_EMAIL;
   if (!plantEmail) {
+    console.error('[Email] PLANT_EMAIL environment variable not configured');
     throw new Error('PLANT_EMAIL environment variable not configured');
   }
+
+  console.log(`[Email] Preparing to send LS ${lsNumber} for SO ${soNumber} to ${plantEmail}`);
 
   const subject = `Loading Slip ${lsNumber} - SO ${soNumber}`;
 
@@ -59,25 +62,34 @@ export async function sendLSEmail(
       ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       : 'application/pdf';
 
-  const { messageId, threadId } = await sendEmail(plantEmail, subject, body, {
-    filename,
-    content: fileBuffer,
-    mimeType,
-  });
+  try {
+    const { messageId, threadId } = await sendEmail(plantEmail, subject, body, {
+      filename,
+      content: fileBuffer,
+      mimeType,
+    });
 
-  // Create Email record in database
-  await prisma.email.create({
-    data: {
-      loadingSlipItemId,
-      gmailMessageId: messageId,
-      gmailThreadId: threadId,
-      recipientEmail: plantEmail,
-      subject,
-      status: 'sent',
-    },
-  });
+    console.log(`[Email] Successfully sent LS ${lsNumber} for SO ${soNumber} - messageId: ${messageId}, threadId: ${threadId}`);
 
-  return { messageId, threadId };
+    // Create Email record in database
+    await prisma.email.create({
+      data: {
+        loadingSlipItemId,
+        gmailMessageId: messageId,
+        gmailThreadId: threadId,
+        recipientEmail: plantEmail,
+        subject,
+        status: 'sent',
+      },
+    });
+
+    console.log(`[Email] Created email record for LS ${lsNumber}`);
+
+    return { messageId, threadId };
+  } catch (error) {
+    console.error(`[Email] Failed to send LS ${lsNumber} for SO ${soNumber}:`, error instanceof Error ? error.message : error);
+    throw error;
+  }
 }
 
 /**
