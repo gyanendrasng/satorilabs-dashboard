@@ -95,7 +95,7 @@ export async function checkAndSendBatchToAman(
     };
 
     // Build instruction
-    const instruction = `VPN is connected, SAP is logged in. Just execute ZLOAD3 for the sales order ${salesOrder.soNumber}`;
+    const instruction = `VPN is connected, SAP is logged in. Just execute ZLOAD3-B for the sales order ${salesOrder.soNumber}`;
 
     log(`[BatchSender] Sending to auto_gui2:`);
     log(`  - Instruction: ${instruction}`);
@@ -107,7 +107,7 @@ export async function checkAndSendBatchToAman(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         instruction,
-        transaction_code: 'ZLOAD3',
+        transaction_code: 'ZLOAD3-B',
         attachments: [attachment],
         extraction_context:
           'Extract the loaded quantity, invoice number, and invoice date',
