@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import Hls from 'hls.js';
 import { WorkChat } from '@/components/work/WorkChat';
 import {
   Monitor,
@@ -45,13 +46,6 @@ interface WorkSession {
   updatedAt?: string;
   messages: ChatMessage[];
 }
-
-type CreateConnectionResponse = {
-  token: string;
-  connection: { identifier?: string; id?: string } | string;
-  created?: boolean;
-  error?: string;
-};
 
 export default function WorkPage() {
   // Active tab state
@@ -146,16 +140,8 @@ export default function WorkPage() {
   const [showVmScreen, setShowVmScreen] = useState(true);
   const [screenZoom, setScreenZoom] = useState(100);
 
-  // Guacamole connection
-  const [status, setStatus] = useState<string>('Initializing...');
-  const [token, setToken] = useState<string | null>(null);
-  const [connectionId, setConnectionId] = useState<string | null>(null);
-  const connectionIdRef = useRef<string | null>(null);
-  const createdRef = useRef<boolean>(false);
-
-  const guacBase = useMemo(() => {
-    return process.env.NEXT_PUBLIC_GUAC_BASE_URL?.replace(/\/$/, '') || '';
-  }, []);
+  // HLS video ref
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   // Fetch orders
   const fetchOrders = useCallback(async () => {
@@ -198,59 +184,35 @@ export default function WorkPage() {
     fetchOrders();
   }, [fetchOrders]);
 
-  // Initialize Guacamole connection
+  // Initialize HLS video stream
   useEffect(() => {
-    let cancelled = false;
+    const video = videoRef.current;
+    if (!video) return;
 
-    async function initConnection() {
-      try {
-        setStatus('Creating connection...');
-        const resp = await fetch('/backend/guacamole/create-connection', {
-          method: 'POST',
-        });
-        const data: CreateConnectionResponse = await resp.json();
+    const hlsUrl = 'https://app.satorilabs.tech/hls/stream/index.m3u8';
+    let hls: Hls | null = null;
 
-        if (!resp.ok || data.error) {
-          throw new Error(data.error || resp.statusText);
-        }
-
-        if (cancelled) return;
-
-        setToken(data.token);
-        const id =
-          typeof data.connection === 'string'
-            ? data.connection
-            : data.connection.identifier || data.connection.id || null;
-        setConnectionId(id);
-        connectionIdRef.current = id;
-        createdRef.current = Boolean(data.created);
-        setStatus('Ready');
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        setStatus(`Error: ${message}`);
-      }
+    if (Hls.isSupported()) {
+      hls = new Hls();
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.play().catch(() => {});
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      // Safari native HLS support
+      video.src = hlsUrl;
+      video.addEventListener('loadedmetadata', () => {
+        video.play().catch(() => {});
+      });
     }
 
-    initConnection();
-
     return () => {
-      cancelled = true;
-      if (createdRef.current && connectionIdRef.current) {
-        fetch('/backend/guacamole/delete-connection', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ identifier: connectionIdRef.current }),
-        }).catch(() => {});
+      if (hls) {
+        hls.destroy();
       }
     };
-  }, []);
-
-  const iframeSrc =
-    token && connectionId
-      ? `${guacBase}/#/client/${encodeURIComponent(
-          connectionId
-        )}?token=${encodeURIComponent(token)}`
-      : null;
+  }, [showVmScreen, activeTab]);
 
   const handleUpdateTitle = (sessionId: string, newTitle: string) => {
     if (chat && chat.id === sessionId) {
@@ -932,7 +894,7 @@ export default function WorkPage() {
                 <Monitor className="w-5 h-5 text-cyan-400" />
                 <div>
                   <h2 className="font-semibold text-lg">Agent Screen View</h2>
-                  <p className="text-xs text-slate-400">{status}</p>
+                  <p className="text-xs text-slate-400">Live HLS Stream</p>
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -978,30 +940,13 @@ export default function WorkPage() {
                     maxWidth: '1400px',
                   }}
                 >
-                  {!guacBase ? (
-                    <div className="flex h-[600px] items-center justify-center text-red-400">
-                      Missing NEXT_PUBLIC_GUAC_BASE_URL
-                    </div>
-                  ) : iframeSrc ? (
-                    <iframe
-                      src={iframeSrc}
-                      width="100%"
-                      height={650}
-                      style={{ border: 'none' }}
-                      allow="display-capture; fullscreen; microphone; camera; clipboard-write"
-                      allowFullScreen
-                    />
-                  ) : (
-                    <div
-                      className="w-full bg-slate-800 flex items-center justify-center text-slate-500"
-                      style={{ height: '650px' }}
-                    >
-                      <div className="flex flex-col items-center gap-3">
-                        <Loader2 className="w-6 h-6 animate-spin text-cyan-400" />
-                        <span>Waiting for connection...</span>
-                      </div>
-                    </div>
-                  )}
+                  <video
+                    ref={videoRef}
+                    autoPlay
+                    muted
+                    playsInline
+                    style={{ width: '100%', height: '650px', objectFit: 'contain', background: '#0f172a' }}
+                  />
                 </div>
 
                 <div className="mt-4 flex items-center justify-center gap-3 text-sm text-slate-400">
