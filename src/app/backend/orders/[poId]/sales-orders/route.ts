@@ -82,14 +82,23 @@ export async function POST(
     await prisma.currentSO.deleteMany();
     await prisma.currentSO.create({ data: { soNumber } });
 
-    // Fire-and-forget: Call Aman's auto_gui2 API in background
+    // Stage 1: ZSO-VISIBILITY (check material availability → sends dispatch status to /visibility-data webhook)
+    axios
+      .post(`http://${AUTO_GUI_HOST}:8000/chat`, {
+        instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
+        transaction_code: 'ZSO-VISIBILITY',
+      })
+      .then(() => console.log(`[sales-orders] auto_gui2 ZSO-VISIBILITY triggered for SO ${soNumber}`))
+      .catch((err) => console.error(`[sales-orders] auto_gui2 ZSO-VISIBILITY error:`, err.message));
+
+    // Stage 2: ZLOAD3-A (LS print out → sends LS files to /initial-data webhook)
     axios
       .post(`http://${AUTO_GUI_HOST}:8000/chat`, {
         instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}.`,
         transaction_code: 'ZLOAD3-A',
       })
       .then(() => console.log(`[sales-orders] auto_gui2 ZLOAD3-A triggered for SO ${soNumber}`))
-      .catch((err) => console.error(`[sales-orders] auto_gui2 error:`, err.message));
+      .catch((err) => console.error(`[sales-orders] auto_gui2 ZLOAD3-A error:`, err.message));
 
     return NextResponse.json({ salesOrder });
   } catch (error) {

@@ -1,5 +1,5 @@
 import { prisma } from './prisma';
-import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail } from './gmail';
+import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, listMessages, getMessageSubject } from './gmail';
 import {
   checkAndSendBatchToAman,
   handleBranchReply,
@@ -11,6 +11,7 @@ import { uploadToS3 } from './s3';
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8080';
 const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
+const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
 /**
  * Check for email replies and process them
@@ -237,9 +238,13 @@ export async function checkWorkflowTimers(): Promise<{
 
   for (const email of timerEmails) {
     const soNumber = email.loadingSlipItem.salesOrder.soNumber;
-    const materials: string[] = email.relatedMaterials
+    const storedMaterials = email.relatedMaterials
       ? JSON.parse(email.relatedMaterials)
       : [];
+    // Extract string codes for /email/reminder API (accepts string[])
+    const materialCodes: string[] = storedMaterials.map((m: any) =>
+      typeof m === 'string' ? m : m.material_code || ''
+    );
 
     try {
       log(`[TimerCheck] Processing timer for SO ${soNumber}`);
@@ -257,7 +262,7 @@ export async function checkWorkflowTimers(): Promise<{
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             sales_order: soNumber,
-            materials,
+            materials: materialCodes,
             original_days: originalDays > 0 ? originalDays : 7,
           }),
         }
@@ -319,4 +324,142 @@ export async function checkWorkflowTimers(): Promise<{
 
   log(`[TimerCheck] Complete. Reminders sent: ${reminders_sent}, Errors: ${errors.length}`);
   return { reminders_sent, errors, logs };
+}
+
+/**
+ * Check for new incoming emails (not replies) from branch.
+ * Extracts SO number from body, triggers ZSO-VISIBILITY on auto_gui2.
+ */
+export async function checkForNewEmails(): Promise<{
+  triggered: number;
+  errors: string[];
+  logs: string[];
+}> {
+  const errors: string[] = [];
+  const logs: string[] = [];
+  let triggered = 0;
+
+  const log = (message: string) => {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}`;
+    console.log(logMessage);
+    logs.push(logMessage);
+  };
+
+  if (!BRANCH_EMAIL) {
+    log('[NewEmail] BRANCH_EMAIL not configured, skipping');
+    return { triggered: 0, errors: [], logs };
+  }
+
+  try {
+    // Search for recent emails from branch with subject "NEW ORDER" (last 1 day, unread)
+    const messages = await listMessages(
+      `from:${BRANCH_EMAIL} subject:"NEW ORDER" newer_than:1d is:unread`,
+      10
+    );
+
+    log(`[NewEmail] Found ${messages.length} recent unread messages from ${BRANCH_EMAIL}`);
+
+    if (messages.length === 0) {
+      return { triggered: 0, errors: [], logs };
+    }
+
+    // Get all tracked thread IDs from our DB
+    const trackedEmails = await prisma.email.findMany({
+      select: { gmailThreadId: true, gmailMessageId: true },
+    });
+    const trackedThreadIds = new Set(trackedEmails.map((e) => e.gmailThreadId));
+    const trackedMessageIds = new Set(trackedEmails.map((e) => e.gmailMessageId));
+
+    for (const msg of messages) {
+      // Skip if this message or thread is already tracked
+      if (trackedMessageIds.has(msg.id) || trackedThreadIds.has(msg.threadId)) {
+        log(`[NewEmail] Skipping message ${msg.id} — already tracked (thread: ${msg.threadId})`);
+        continue;
+      }
+
+      try {
+        // Get the email body — should just contain SO number
+        const body = await getMessageBody(msg.id);
+        if (!body) {
+          log(`[NewEmail] Empty body for message ${msg.id}, skipping`);
+          continue;
+        }
+
+        // Extract SO number — trim whitespace, strip HTML tags, get the number
+        const stripped = body.replace(/<[^>]*>/g, '').trim();
+        const soMatch = stripped.match(/\d{7,}/); // SO numbers are 7+ digits
+        if (!soMatch) {
+          log(`[NewEmail] No SO number found in message ${msg.id}: "${stripped.substring(0, 50)}"`);
+          continue;
+        }
+
+        const soNumber = soMatch[0].trim();
+        log(`[NewEmail] Extracted SO number: ${soNumber} from message ${msg.id}`);
+
+        // Trigger ZSO-VISIBILITY on auto_gui2
+        const response = await fetch(
+          `http://${AUTO_GUI_HOST}:8000/chat`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
+              transaction_code: 'ZSO-VISIBILITY',
+            }),
+          }
+        );
+
+        if (!response.ok) {
+          log(`[NewEmail] ZSO-VISIBILITY trigger failed for SO ${soNumber}: ${response.statusText}`);
+          errors.push(`ZSO-VISIBILITY failed for SO ${soNumber}`);
+          continue;
+        }
+
+        log(`[NewEmail] ZSO-VISIBILITY triggered for SO ${soNumber}`);
+
+        // Create PO + SO in DB so it shows on dashboard
+        let salesOrder = await prisma.salesOrder.findFirst({ where: { soNumber } });
+        if (!salesOrder) {
+          const subject = await getMessageSubject(msg.id);
+          const purchaseOrder = await prisma.purchaseOrder.create({
+            data: {
+              poNumber: `AUTO-${soNumber}`,
+              customerName: subject || `Branch Order ${soNumber}`,
+              status: 'in-progress',
+              stage: 1,
+            },
+          });
+          salesOrder = await prisma.salesOrder.create({
+            data: {
+              purchaseOrderId: purchaseOrder.id,
+              soNumber,
+              status: 'pending',
+            },
+          });
+          log(`[NewEmail] Created PO ${purchaseOrder.poNumber} + SO ${soNumber} in dashboard`);
+        }
+
+        // Save to CurrentSO so visibility-data endpoint knows which SO
+        await prisma.currentSO.deleteMany();
+        await prisma.currentSO.create({ data: { soNumber } });
+
+        triggered++;
+      } catch (error) {
+        const errorMsg = `Error processing message ${msg.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+        log(`[NewEmail] ${errorMsg}`);
+        errors.push(errorMsg);
+      }
+    }
+  } catch (error) {
+    const errorDetail = error instanceof Error ? `${error.message} ${error.stack?.split('\n')[1] || ''}` : String(error);
+    const errorMsg = `Error checking new emails: ${errorDetail}`;
+    log(`[NewEmail] ${errorMsg}`);
+    errors.push(errorMsg);
+  }
+
+  log(`[NewEmail] Complete. Triggered: ${triggered}, Errors: ${errors.length}`);
+  return { triggered, errors, logs };
 }

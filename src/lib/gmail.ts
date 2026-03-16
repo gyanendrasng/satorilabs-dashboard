@@ -176,6 +176,42 @@ export async function getMessageBody(messageId: string): Promise<string> {
 }
 
 /**
+ * List recent messages matching a query (e.g. newer_than:1d, from:branch@example.com)
+ */
+export async function listMessages(
+  query: string,
+  maxResults: number = 20
+): Promise<Array<{ id: string; threadId: string }>> {
+  const response = await gmail.users.messages.list({
+    userId: 'me',
+    q: query,
+    maxResults,
+  });
+
+  return (response.data.messages || []).map((m) => ({
+    id: m.id!,
+    threadId: m.threadId!,
+  }));
+}
+
+/**
+ * Get the subject of a Gmail message
+ */
+export async function getMessageSubject(messageId: string): Promise<string> {
+  const message = await gmail.users.messages.get({
+    userId: 'me',
+    id: messageId,
+    format: 'metadata',
+    metadataHeaders: ['Subject'],
+  });
+
+  const subjectHeader = message.data.payload?.headers?.find(
+    (h) => h.name?.toLowerCase() === 'subject'
+  );
+  return subjectHeader?.value || '';
+}
+
+/**
  * Get messages in a thread
  */
 export async function getThreadMessages(threadId: string) {

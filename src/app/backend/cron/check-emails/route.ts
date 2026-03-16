@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { checkForReplies, checkWorkflowTimers } from '@/lib/email-reply-checker';
+import { checkForReplies, checkWorkflowTimers, checkForNewEmails } from '@/lib/email-reply-checker';
 
 /**
  * GET /api/cron/check-emails
@@ -21,19 +21,21 @@ export async function GET(request: Request) {
 
     console.log('[Cron] Starting email reply check and timer check...');
 
-    // Run both checks
+    // Run all three checks
+    const newEmailResult = await checkForNewEmails();
     const replyResult = await checkForReplies();
     const timerResult = await checkWorkflowTimers();
 
-    const allLogs = [...replyResult.logs, ...timerResult.logs];
-    const allErrors = [...replyResult.errors, ...timerResult.errors];
+    const allLogs = [...newEmailResult.logs, ...replyResult.logs, ...timerResult.logs];
+    const allErrors = [...newEmailResult.errors, ...replyResult.errors, ...timerResult.errors];
 
     console.log(
-      `[Cron] Complete. Replies processed: ${replyResult.processed}, Reminders sent: ${timerResult.reminders_sent}, Errors: ${allErrors.length}`
+      `[Cron] Complete. New emails: ${newEmailResult.triggered}, Replies: ${replyResult.processed}, Reminders: ${timerResult.reminders_sent}, Errors: ${allErrors.length}`
     );
 
     return NextResponse.json({
       success: true,
+      new_emails_triggered: newEmailResult.triggered,
       processed: replyResult.processed,
       reminders_sent: timerResult.reminders_sent,
       errors: allErrors,

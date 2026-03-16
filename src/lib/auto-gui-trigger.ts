@@ -265,8 +265,27 @@ export async function handleBranchReply(
     }
 
     if (result.intent === 'release_all' || result.intent === 'release_part') {
-      // Trigger ZLOAD1 with the materials
-      const materials: MaterialItemPayload[] = result.materials || [];
+      // Get stored materials (with batch + quantity) from visibility-data
+      const storedMaterials: Array<{
+        material_code: string;
+        batch_number: string;
+        order_quantity: number;
+      }> = email.relatedMaterials ? JSON.parse(email.relatedMaterials) : [];
+
+      // Map LLM result materials to stored data (merge batch/qty from visibility-data)
+      const llmMaterials = result.materials || [];
+      const materials: MaterialItemPayload[] = llmMaterials.map((m: any) => {
+        // Try to find matching stored material for quantity
+        const stored = storedMaterials.find(
+          (s) => s.material_code === m.material_code || s.batch_number === m.batch
+        );
+        return {
+          material_code: m.material_code,
+          batch: m.batch || stored?.batch_number || '',
+          quantity: stored?.order_quantity || m.quantity || 0,
+        };
+      });
+
       log(`[BranchReply] Triggering ZLOAD1 for ${materials.length} materials`);
       await triggerZload1(soNumber, materials);
 
@@ -306,7 +325,20 @@ export async function handleBranchReply(
           status: 'sent',
           emailType: 'production_inquiry',
           workflowState: 'awaiting_production_reply',
-          relatedMaterials: JSON.stringify(result.missing_materials || []),
+          // Carry forward full materials data (with batch + qty) for ZLOAD1 later
+          // Filter stored materials to only include the missing ones
+          relatedMaterials: (() => {
+            const missingCodes: string[] = result.missing_materials || [];
+            const allStored = email.relatedMaterials ? JSON.parse(email.relatedMaterials) : [];
+            // If stored data has full objects, filter to missing ones
+            if (allStored.length > 0 && typeof allStored[0] === 'object') {
+              const filtered = allStored.filter((m: any) =>
+                missingCodes.some((code) => m.material_code === code || code.includes(m.material_code))
+              );
+              return JSON.stringify(filtered.length > 0 ? filtered : allStored);
+            }
+            return JSON.stringify(missingCodes);
+          })(),
         },
       });
 
@@ -358,9 +390,13 @@ export async function handleProductionReply(
     }
 
     const soNumber = email.loadingSlipItem.salesOrder.soNumber;
-    const materials: string[] = email.relatedMaterials
+    const storedMaterials = email.relatedMaterials
       ? JSON.parse(email.relatedMaterials)
       : [];
+    // Extract string codes for /email/* API (accepts string[])
+    const materialCodes: string[] = storedMaterials.map((m: any) =>
+      typeof m === 'string' ? m : m.material_code || ''
+    );
 
     log(`[ProductionReply] Parsing production reply for SO ${soNumber}`);
 
@@ -372,7 +408,7 @@ export async function handleProductionReply(
         body: JSON.stringify({
           production_reply_html: replyHtml,
           sales_order: soNumber,
-          materials,
+          materials: materialCodes,
         }),
       }
     );
@@ -440,9 +476,13 @@ export async function handleProductionConfirmation(
     }
 
     const soNumber = email.loadingSlipItem.salesOrder.soNumber;
-    const materials: string[] = email.relatedMaterials
+    const storedMaterials = email.relatedMaterials
       ? JSON.parse(email.relatedMaterials)
       : [];
+    // Extract string codes for /email/* API (accepts string[])
+    const materialCodes: string[] = storedMaterials.map((m: any) =>
+      typeof m === 'string' ? m : m.material_code || ''
+    );
 
     log(`[ProductionConfirmation] Classifying confirmation for SO ${soNumber}`);
 
@@ -454,7 +494,7 @@ export async function handleProductionConfirmation(
         body: JSON.stringify({
           reply_html: replyHtml,
           sales_order: soNumber,
-          materials,
+          materials: materialCodes,
           context: 'production_confirmation',
         }),
       }
@@ -469,12 +509,19 @@ export async function handleProductionConfirmation(
     }
 
     if (result.status === 'ready') {
-      // Trigger ZLOAD1
-      const materialItems: MaterialItemPayload[] = materials.map((m) => ({
-        material_code: m,
-        batch: '',
-        quantity: 0,
-      }));
+      // Trigger ZLOAD1 — storedMaterials has full objects with batch + quantity
+      const materialItems: MaterialItemPayload[] = storedMaterials.length > 0
+          && typeof storedMaterials[0] === 'object'
+        ? storedMaterials.map((m: any) => ({
+            material_code: m.material_code,
+            batch: m.batch_number || '',
+            quantity: m.order_quantity || 0,
+          }))
+        : materialCodes.map((m) => ({
+            material_code: m,
+            batch: '',
+            quantity: 0,
+          }));
       await triggerZload1(soNumber, materialItems);
 
       await prisma.email.update({
@@ -519,19 +566,25 @@ export async function handleProductionConfirmation(
 
 /**
  * Trigger ZLOAD1 transaction via auto_gui2 /chat endpoint
+ *
+ * ZLOAD1 expects per-material: material_code, batch, quantity (pick qty)
+ * It creates a loading slip and sends it back via send_data
  */
 async function triggerZload1(
   soNumber: string,
   materials: MaterialItemPayload[]
 ): Promise<void> {
   const materialsList = materials
-    .map((m) => `- ${m.material_code}${m.batch ? ` (batch: ${m.batch})` : ''}`)
+    .map(
+      (m) =>
+        `- Material: ${m.material_code}, Batch: ${m.batch || 'N/A'}, Quantity: ${m.quantity || 0}`
+    )
     .join('\n');
 
   const instruction = `VPN is connected, SAP is logged in. Execute ZLOAD1 for sales order ${soNumber}. Materials to dispatch:\n${materialsList}`;
 
   const response = await fetch(
-    `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`,
+    `http://${AUTO_GUI_HOST}:8000/chat`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
