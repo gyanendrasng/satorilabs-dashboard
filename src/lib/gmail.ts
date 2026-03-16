@@ -89,6 +89,93 @@ export async function sendEmail(
 }
 
 /**
+ * Send a plain text email (no attachments)
+ */
+export async function sendPlainEmail(
+  to: string,
+  subject: string,
+  body: string
+): Promise<{ messageId: string; threadId: string }> {
+  const mimeMessage = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    body,
+  ].join('\r\n');
+
+  const raw = Buffer.from(mimeMessage)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  const response = await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw },
+  });
+
+  if (!response.data.id || !response.data.threadId) {
+    throw new Error('Failed to send plain email: missing message or thread ID');
+  }
+
+  return {
+    messageId: response.data.id,
+    threadId: response.data.threadId,
+  };
+}
+
+/**
+ * Extract HTML or text body from a Gmail message
+ */
+export async function getMessageBody(messageId: string): Promise<string> {
+  const message = await gmail.users.messages.get({
+    userId: 'me',
+    id: messageId,
+  });
+
+  const payload = message.data.payload;
+  if (!payload) return '';
+
+  // Recursively search parts for text/html, fall back to text/plain
+  type GmailParts = NonNullable<typeof payload>['parts'];
+  function findBody(
+    parts: GmailParts,
+    mimeType: string
+  ): string | null {
+    if (!parts) return null;
+    for (const part of parts) {
+      if (part.mimeType === mimeType && part.body?.data) {
+        return Buffer.from(part.body.data, 'base64').toString('utf-8');
+      }
+      if (part.parts) {
+        const found = findBody(part.parts, mimeType);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  // Check if body is directly on payload (no parts)
+  if (payload.mimeType === 'text/html' && payload.body?.data) {
+    return Buffer.from(payload.body.data, 'base64').toString('utf-8');
+  }
+  if (payload.mimeType === 'text/plain' && payload.body?.data) {
+    return Buffer.from(payload.body.data, 'base64').toString('utf-8');
+  }
+
+  // Search parts: prefer HTML, fall back to plain text
+  const html = findBody(payload.parts, 'text/html');
+  if (html) return html;
+
+  const plain = findBody(payload.parts, 'text/plain');
+  if (plain) return plain;
+
+  return '';
+}
+
+/**
  * Get messages in a thread
  */
 export async function getThreadMessages(threadId: string) {

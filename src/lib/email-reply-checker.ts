@@ -1,7 +1,16 @@
 import { prisma } from './prisma';
-import { getThreadMessages, extractPdfAttachments } from './gmail';
-import { checkAndSendBatchToAman } from './auto-gui-trigger';
+import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail } from './gmail';
+import {
+  checkAndSendBatchToAman,
+  handleBranchReply,
+  handleProductionReply,
+  handleProductionConfirmation,
+} from './auto-gui-trigger';
 import { uploadToS3 } from './s3';
+
+const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
+const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8080';
+const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
 
 /**
  * Check for email replies and process them
@@ -83,6 +92,52 @@ export async function checkForReplies(): Promise<{
         continue;
       }
 
+      // Get reply HTML body for workflow classification
+      const replyBodyHtml = await getMessageBody(latestReply.id);
+
+      // Store replyHtml on the email record
+      await prisma.email.update({
+        where: { id: email.id },
+        data: { replyHtml: replyBodyHtml },
+      });
+
+      // Route based on emailType
+      const emailType = (email as any).emailType as string | null;
+
+      if (emailType === 'production_inquiry') {
+        // Production team replied to our inquiry — extract days
+        log(`[EmailChecker] Routing to handleProductionReply for SO ${soNumber}`);
+        const prodResult = await handleProductionReply(email.id, replyBodyHtml);
+        logs.push(...prodResult.logs);
+        processed++;
+        continue;
+      }
+
+      if (emailType === 'production_reminder') {
+        // Production team replied to our reminder — classify confirmation
+        log(`[EmailChecker] Routing to handleProductionConfirmation for SO ${soNumber}`);
+        const confResult = await handleProductionConfirmation(email.id, replyBodyHtml);
+        logs.push(...confResult.logs);
+        processed++;
+        continue;
+      }
+
+      // Default: null or 'ls_dispatch' — this is a branch reply
+      // First, try the new workflow classification
+      if (replyBodyHtml) {
+        log(`[EmailChecker] Routing to handleBranchReply for SO ${soNumber} / LS ${lsNumber}`);
+        // Fetch the original sent email body from Gmail
+        const originalEmailHtml = await getMessageBody(email.gmailMessageId);
+        const branchResult = await handleBranchReply(
+          email.id,
+          replyBodyHtml,
+          originalEmailHtml,
+          email.loadingSlipItem.salesOrderId
+        );
+        logs.push(...branchResult.logs);
+      }
+
+      // Also continue with existing PDF flow (legacy ZLOAD3-B path)
       // Extract PDF attachments from the reply
       const attachments = await extractPdfAttachments(latestReply.id);
 
@@ -144,4 +199,124 @@ export async function checkForReplies(): Promise<{
   log(`[EmailChecker] Check complete. Processed: ${processed}, Errors: ${errors.length}`);
 
   return { processed, errors, logs };
+}
+
+/**
+ * Check for workflow timers that have elapsed and send reminders
+ */
+export async function checkWorkflowTimers(): Promise<{
+  reminders_sent: number;
+  errors: string[];
+  logs: string[];
+}> {
+  const errors: string[] = [];
+  const logs: string[] = [];
+  let reminders_sent = 0;
+
+  const log = (message: string) => {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}`;
+    console.log(logMessage);
+    logs.push(logMessage);
+  };
+
+  // Find emails where timer has elapsed
+  const timerEmails = await prisma.email.findMany({
+    where: {
+      workflowState: 'waiting_timer',
+      waitUntil: { lte: new Date() },
+    },
+    include: {
+      loadingSlipItem: {
+        include: { salesOrder: true },
+      },
+    },
+  });
+
+  log(`[TimerCheck] Found ${timerEmails.length} emails with elapsed timers`);
+
+  for (const email of timerEmails) {
+    const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+    const materials: string[] = email.relatedMaterials
+      ? JSON.parse(email.relatedMaterials)
+      : [];
+
+    try {
+      log(`[TimerCheck] Processing timer for SO ${soNumber}`);
+
+      // Calculate original days from when the email was sent to waitUntil
+      const sentTime = email.sentAt.getTime();
+      const waitTime = email.waitUntil!.getTime();
+      const originalDays = Math.round((waitTime - sentTime) / 86400000);
+
+      // Call /email/reminder on auto_gui2
+      const response = await fetch(
+        `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/reminder`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sales_order: soNumber,
+            materials,
+            original_days: originalDays > 0 ? originalDays : 7,
+          }),
+        }
+      );
+
+      const result = await response.json();
+
+      if (!result.success || !result.email_payload) {
+        log(`[TimerCheck] Reminder generation failed for SO ${soNumber}: ${result.error}`);
+        errors.push(`Reminder failed for SO ${soNumber}: ${result.error}`);
+        continue;
+      }
+
+      if (!PRODUCTION_EMAIL) {
+        log(`[TimerCheck] PRODUCTION_EMAIL not configured`);
+        errors.push('PRODUCTION_EMAIL not configured');
+        continue;
+      }
+
+      // Send reminder to production
+      const sentResult = await sendPlainEmail(
+        PRODUCTION_EMAIL,
+        result.email_payload.subject,
+        result.email_payload.body
+      );
+
+      log(`[TimerCheck] Reminder sent to ${PRODUCTION_EMAIL} for SO ${soNumber}`);
+
+      // Create new Email record for the reminder
+      await prisma.email.create({
+        data: {
+          loadingSlipItemId: email.loadingSlipItemId,
+          gmailMessageId: sentResult.messageId,
+          gmailThreadId: sentResult.threadId,
+          recipientEmail: PRODUCTION_EMAIL,
+          subject: result.email_payload.subject,
+          status: 'sent',
+          emailType: 'production_reminder',
+          workflowState: 'awaiting_confirmation',
+          relatedMaterials: email.relatedMaterials,
+        },
+      });
+
+      // Mark the original timer email as completed
+      await prisma.email.update({
+        where: { id: email.id },
+        data: { workflowState: 'completed' },
+      });
+
+      reminders_sent++;
+    } catch (error) {
+      const errorMsg = `Timer processing error for SO ${soNumber}: ${
+        error instanceof Error ? error.message : String(error)
+      }`;
+      log(`[TimerCheck] ${errorMsg}`);
+      errors.push(errorMsg);
+    }
+  }
+
+  log(`[TimerCheck] Complete. Reminders sent: ${reminders_sent}, Errors: ${errors.length}`);
+  return { reminders_sent, errors, logs };
 }

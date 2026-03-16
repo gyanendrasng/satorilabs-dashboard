@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server';
-import { checkForReplies } from '@/lib/email-reply-checker';
+import { checkForReplies, checkWorkflowTimers } from '@/lib/email-reply-checker';
 
 /**
  * GET /api/cron/check-emails
  *
  * Cron endpoint to check for email replies and process them.
+ * Also checks workflow timers for pending reminders.
  * Runs every 5 minutes via Vercel Cron.
  */
 export async function GET(request: Request) {
@@ -18,17 +19,25 @@ export async function GET(request: Request) {
       }
     }
 
-    console.log('[Cron] Starting email reply check...');
+    console.log('[Cron] Starting email reply check and timer check...');
 
-    const result = await checkForReplies();
+    // Run both checks
+    const replyResult = await checkForReplies();
+    const timerResult = await checkWorkflowTimers();
 
-    console.log(`[Cron] Email check complete. Processed: ${result.processed}, Errors: ${result.errors.length}`);
+    const allLogs = [...replyResult.logs, ...timerResult.logs];
+    const allErrors = [...replyResult.errors, ...timerResult.errors];
+
+    console.log(
+      `[Cron] Complete. Replies processed: ${replyResult.processed}, Reminders sent: ${timerResult.reminders_sent}, Errors: ${allErrors.length}`
+    );
 
     return NextResponse.json({
       success: true,
-      processed: result.processed,
-      errors: result.errors,
-      logs: result.logs,
+      processed: replyResult.processed,
+      reminders_sent: timerResult.reminders_sent,
+      errors: allErrors,
+      logs: allLogs,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {

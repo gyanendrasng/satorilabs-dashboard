@@ -21,7 +21,7 @@ export function SignInForm() {
   const [loading, setLoading] = useState(false);
   const router = useRouter();
   const searchParams = useSearchParams();
-  const callbackUrl = searchParams.get('callbackUrl') || '/dashboard';
+  const callbackUrl = searchParams.get('callbackUrl') || '/work';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
