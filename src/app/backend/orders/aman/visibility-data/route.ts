@@ -75,6 +75,7 @@ export async function POST(request: Request) {
     // Extract SO number from filename: strip .json extension and leading spaces
     // auto_gui2's send_to_endpoint adds a space prefix to the filename (e.g., " 3260206.json")
     let soNumber = file.name.replace(/\.json$/i, '').trim();
+    console.log(`[VisibilityData] Step 1: Extracted SO number="${soNumber}" from filename="${file.name}"`);
     if (!soNumber) {
       const currentSO = await prisma.currentSO.findFirst();
       if (!currentSO) {
@@ -87,17 +88,20 @@ export async function POST(request: Request) {
     }
 
     // Find the sales order
+    console.log(`[VisibilityData] Step 2: Looking up SO ${soNumber} in DB...`);
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
       include: { items: true },
     });
 
     if (!salesOrder) {
+      console.error(`[VisibilityData] Step 2 FAILED: SO ${soNumber} not found in DB`);
       return NextResponse.json(
         { error: `Sales order not found: ${soNumber}` },
         { status: 404 }
       );
     }
+    console.log(`[VisibilityData] Step 2: Found SO ${soNumber} (id=${salesOrder.id}, items=${salesOrder.items.length})`);
 
     if (!BRANCH_EMAIL) {
       return NextResponse.json(
@@ -121,6 +125,7 @@ export async function POST(request: Request) {
     }
 
     // Send dispatch status email to branch
+    console.log(`[VisibilityData] Step 3: Sending email to ${BRANCH_EMAIL}...`);
     const subject = `Dispatch Status - Sales Order ${soNumber}`;
     const { messageId, threadId } = await sendPlainEmail(
       BRANCH_EMAIL,
@@ -136,6 +141,7 @@ export async function POST(request: Request) {
     const materialsJson = JSON.stringify(materials);
 
     // Create Email record for tracking branch reply
+    console.log(`[VisibilityData] Step 4: Creating Email record...`);
     await prisma.email.create({
       data: {
         loadingSlipItemId: loadingSlipItem.id,
