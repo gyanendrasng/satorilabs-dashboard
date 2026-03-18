@@ -127,14 +127,26 @@ export async function POST(request: Request) {
     // Send dispatch status email to branch
     console.log(`[VisibilityData] Step 3: Sending email to ${BRANCH_EMAIL}...`);
     const subject = `Dispatch Status - Sales Order ${soNumber}`;
-    const { messageId, threadId } = await sendPlainEmail(
-      BRANCH_EMAIL,
-      subject,
-      email_body
-    );
+    let messageId: string;
+    let threadId: string;
+    try {
+      const result = await sendPlainEmail(
+        BRANCH_EMAIL,
+        subject,
+        email_body
+      );
+      messageId = result.messageId;
+      threadId = result.threadId;
+    } catch (emailErr) {
+      console.error(`[VisibilityData] Step 3 FAILED: sendPlainEmail threw:`, emailErr);
+      return NextResponse.json(
+        { error: 'Failed to send dispatch email', details: emailErr instanceof Error ? emailErr.message : String(emailErr) },
+        { status: 500 }
+      );
+    }
 
     console.log(
-      `[VisibilityData] Sent dispatch email to ${BRANCH_EMAIL} for SO ${soNumber} - messageId: ${messageId}`
+      `[VisibilityData] Step 3: Sent dispatch email to ${BRANCH_EMAIL} for SO ${soNumber} - messageId: ${messageId}`
     );
 
     // Store full materials array (with batch + quantity) for ZLOAD1 later
