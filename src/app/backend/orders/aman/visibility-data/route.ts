@@ -11,6 +11,8 @@ interface VisibilityMaterial {
 }
 
 interface VisibilityPayload {
+  so_number?: string;
+  soNumber?: string;
   email_body: string;
   materials: VisibilityMaterial[];
 }
@@ -18,43 +20,34 @@ interface VisibilityPayload {
 /**
  * POST /backend/orders/aman/visibility-data
  *
- * Receives ZSO-VISIBILITY response from Aman (auto_gui2) as multipart/form-data.
- * Expects a `file` field containing a `.json` file named `{soNumber}.json`.
- * The JSON file must contain `email_body` (string) and `materials` (array).
+ * Receives ZSO-VISIBILITY response from Aman (auto_gui2) as application/json.
+ * JSON body must contain `email_body` (string), `materials` (array),
+ * and optionally `so_number` or `soNumber`. Falls back to CurrentSO singleton.
  *
- * 1. Extracts SO number from the uploaded filename (strips .json extension and leading spaces)
+ * 1. Reads SO number from payload or CurrentSO singleton
  * 2. Sends email_body to BRANCH_EMAIL
  * 3. Stores materials (with batch + quantity) on the Email record for later use in ZLOAD1
  * 4. Creates Email record with emailType='ls_dispatch' for tracking branch reply
  */
 export async function POST(request: Request) {
   try {
-    const formData = await request.formData();
-    const file = formData.get('file') as File | null;
-    if (!file) {
-      return NextResponse.json(
-        { error: 'No file received. Expected multipart/form-data with a "file" field.' },
-        { status: 400 }
-      );
-    }
-
-    const fileText = await file.text();
-    console.log(`[VisibilityData] File "${file.name}" (${fileText.length} chars):`, fileText.slice(0, 500));
+    const rawText = await request.text();
+    console.log(`[VisibilityData] Raw body (${rawText.length} chars):`, rawText.slice(0, 500));
 
     let body: VisibilityPayload;
     try {
-      body = JSON.parse(fileText);
+      body = JSON.parse(rawText);
     } catch {
-      console.error(`[VisibilityData] JSON parse failed. File contents:`, fileText);
+      console.error(`[VisibilityData] JSON parse failed. Full body:`, rawText);
       return NextResponse.json(
-        { error: 'Invalid JSON in uploaded file', receivedPreview: fileText.slice(0, 200) },
+        { error: 'Invalid JSON in request body', receivedPreview: rawText.slice(0, 200) },
         { status: 400 }
       );
     }
 
     console.log(`[VisibilityData] Parsed payload keys:`, Object.keys(body));
-    console.log(`[VisibilityData] materials=${body.materials?.length}, email_body length=${body.email_body?.length}`);
-    console.log(`[VisibilityData] Full file contents:`, fileText);
+    console.log(`[VisibilityData] so_number=${body.so_number}, soNumber=${body.soNumber}, materials=${body.materials?.length}, email_body length=${body.email_body?.length}`);
+    console.log(`[VisibilityData] Full body contents:`, rawText);
 
     const { email_body, materials } = body;
 
@@ -72,19 +65,19 @@ export async function POST(request: Request) {
       );
     }
 
-    // Extract SO number from filename: strip .json extension and leading spaces
-    // auto_gui2's send_to_endpoint adds a space prefix to the filename (e.g., " 3260206.json")
-    let soNumber = file.name.replace(/\.json$/i, '').trim();
-    console.log(`[VisibilityData] Step 1: Extracted SO number="${soNumber}" from filename="${file.name}"`);
+    // SO lookup priority: so_number → soNumber → CurrentSO singleton
+    let soNumber = body.so_number || body.soNumber;
+    console.log(`[VisibilityData] Step 1: SO number from body="${soNumber}"`);
     if (!soNumber) {
       const currentSO = await prisma.currentSO.findFirst();
       if (!currentSO) {
         return NextResponse.json(
-          { error: 'Could not determine SO number from filename and no CurrentSO set' },
+          { error: 'No current SO number set and soNumber not provided' },
           { status: 404 }
         );
       }
       soNumber = currentSO.soNumber;
+      console.log(`[VisibilityData] Step 1: Fell back to CurrentSO="${soNumber}"`);
     }
 
     // Find the sales order
