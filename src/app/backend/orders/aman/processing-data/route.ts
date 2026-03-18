@@ -1,40 +1,44 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 
-interface ProcessingDataItem {
-  lsNumber: string;
-  material: string;
-  grnNumber?: string;
+interface SAPResultRow {
+  sales_order: string;
+  material_doc: string;
+  delivery_no: string;
+  invoice_no: string;
+  status?: string;
 }
 
-interface ProcessingDataPayload {
-  soNumber: string;
-  hrjInvoiceNumber?: string; // Now at SO/Invoice level
-  outboundDeliveryNumber?: string; // Now at SO/Invoice level
-  items: ProcessingDataItem[];
-}
-
-// POST - Aman API 2: Add post-processing data (GRN per item, HRJ Invoice/OBD at SO level)
+// POST - Aman API 2: Accept flat array of SAP ZSO_AUTO results from auto_gui2
 export async function POST(request: Request) {
   try {
-    const body: ProcessingDataPayload = await request.json();
-    const { soNumber, hrjInvoiceNumber, outboundDeliveryNumber, items } = body;
+    const body = await request.json();
+
+    // Accept flat array directly
+    const rows: SAPResultRow[] = Array.isArray(body) ? body : body.items ?? body.data;
+
+    if (!rows || !Array.isArray(rows) || rows.length === 0) {
+      return NextResponse.json(
+        { error: 'Expected a JSON array of {sales_order, material_doc, delivery_no, invoice_no} objects' },
+        { status: 400 }
+      );
+    }
+
+    // Extract soNumber from first row; fallback to CurrentSO singleton
+    let soNumber = rows[0]?.sales_order;
+    if (!soNumber) {
+      const currentSO = await prisma.currentSO.findFirst();
+      soNumber = currentSO?.soNumber ?? null;
+    }
 
     if (!soNumber) {
       return NextResponse.json(
-        { error: 'soNumber is required' },
+        { error: 'Could not determine soNumber from payload or CurrentSO' },
         { status: 400 }
       );
     }
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return NextResponse.json(
-        { error: 'items array is required and must not be empty' },
-        { status: 400 }
-      );
-    }
-
-    // Find the Sales Order by soNumber to verify it exists
+    // Find the Sales Order
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
       include: { invoice: true },
@@ -47,89 +51,38 @@ export async function POST(request: Request) {
       );
     }
 
-    // Validate all items have required fields
-    for (const item of items) {
-      if (!item.lsNumber || !item.material) {
-        return NextResponse.json(
-          { error: 'Each item must have lsNumber and material to identify the record' },
-          { status: 400 }
-        );
-      }
-    }
+    // Extract SO-level fields (same across all rows)
+    const invoiceNo = rows[0]?.invoice_no;
+    const deliveryNo = rows[0]?.delivery_no;
 
-    // Update items with GRN Number only
-    const results = [];
-    const notFound = [];
-
-    for (const item of items) {
-      // Find existing item
-      const existingItem = await prisma.loadingSlipItem.findUnique({
-        where: {
-          lsNumber_material: {
-            lsNumber: item.lsNumber,
-            material: item.material,
-          },
-        },
-      });
-
-      if (!existingItem) {
-        notFound.push({ lsNumber: item.lsNumber, material: item.material });
-        continue;
-      }
-
-      // Update with GRN Number only
-      const updated = await prisma.loadingSlipItem.update({
-        where: {
-          lsNumber_material: {
-            lsNumber: item.lsNumber,
-            material: item.material,
-          },
-        },
+    // Create or update Invoice
+    let invoice;
+    if (salesOrder.invoice) {
+      invoice = await prisma.invoice.update({
+        where: { id: salesOrder.invoice.id },
         data: {
-          grnNumber: item.grnNumber ?? existingItem.grnNumber,
+          ...(invoiceNo && { invoiceNumber: invoiceNo }),
+          ...(deliveryNo && { obdNumber: deliveryNo }),
+          sapResults: JSON.stringify(rows),
+          status: 'created',
         },
       });
-
-      results.push(updated);
-    }
-
-    // Create or Update Invoice if HRJ Invoice Number is provided
-    let invoice = null;
-    if (hrjInvoiceNumber) {
-      if (salesOrder.invoice) {
-        // Update existing Invoice
-        invoice = await prisma.invoice.update({
-          where: { id: salesOrder.invoice.id },
-          data: {
-            invoiceNumber: hrjInvoiceNumber,
-            obdNumber: outboundDeliveryNumber ?? salesOrder.invoice.obdNumber,
-            status: 'created',
-          },
-        });
-      } else {
-        // Create new Invoice
-        invoice = await prisma.invoice.create({
-          data: {
-            salesOrderId: salesOrder.id,
-            invoiceNumber: hrjInvoiceNumber,
-            obdNumber: outboundDeliveryNumber,
-            status: 'created',
-          },
-        });
-      }
+    } else {
+      invoice = await prisma.invoice.create({
+        data: {
+          salesOrderId: salesOrder.id,
+          invoiceNumber: invoiceNo || 'PENDING',
+          obdNumber: deliveryNo,
+          sapResults: JSON.stringify(rows),
+          status: 'created',
+        },
+      });
     }
 
     return NextResponse.json({
       success: true,
-      message: `${results.length} item(s) updated`,
-      items: results,
-      invoice: invoice,
-      ...(notFound.length > 0 && {
-        notFound: {
-          count: notFound.length,
-          items: notFound,
-        },
-      }),
+      message: `Invoice ${invoice.invoiceNumber} saved with ${rows.length} SAP result row(s)`,
+      invoice,
     });
   } catch (error) {
     console.error('[Aman API 2 - Processing Data] Error:', error);

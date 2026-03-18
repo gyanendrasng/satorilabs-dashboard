@@ -212,6 +212,7 @@ model Invoice {
   salesOrderId  String   @unique // ONE-TO-ONE with SO
   invoiceNumber String   // HRJ Invoice Number (from Aman Stage 4)
   obdNumber     String?  // Outbound Delivery Number (from Aman Stage 4)
+  sapResults    String?  // JSON: raw ZSO_AUTO results [{sales_order, material_doc, delivery_no, invoice_no}]
   amount        Decimal?
   status        String   @default("pending") // pending, created, shipped
 
