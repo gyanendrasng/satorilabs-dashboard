@@ -359,21 +359,29 @@ export async function checkForNewEmails(): Promise<{
       return { triggered: 0, errors: [], logs };
     }
 
-    // Get all tracked thread IDs from our DB
-    const trackedEmails = await prisma.email.findMany({
-      select: { gmailThreadId: true, gmailMessageId: true },
+    // Get already-processed message IDs from ProcessedEmail table
+    const processedEmails = await prisma.processedEmail.findMany({
+      select: { gmailMessageId: true, gmailThreadId: true },
     });
-    const trackedThreadIds = new Set(trackedEmails.map((e) => e.gmailThreadId));
-    const trackedMessageIds = new Set(trackedEmails.map((e) => e.gmailMessageId));
+    const processedMessageIds = new Set(processedEmails.map((e) => e.gmailMessageId));
+    const processedThreadIds = new Set(processedEmails.map((e) => e.gmailThreadId));
 
     for (const msg of messages) {
-      // Skip if this message or thread is already tracked
-      if (trackedMessageIds.has(msg.id) || trackedThreadIds.has(msg.threadId)) {
-        log(`[NewEmail] Skipping message ${msg.id} — already tracked (thread: ${msg.threadId})`);
+      // Skip if already processed
+      if (processedMessageIds.has(msg.id) || processedThreadIds.has(msg.threadId)) {
+        log(`[NewEmail] Skipping message ${msg.id} — already processed (thread: ${msg.threadId})`);
         continue;
       }
 
       try {
+        // Track this email immediately so it won't be reprocessed even if later steps fail
+        await prisma.processedEmail.create({
+          data: {
+            gmailMessageId: msg.id,
+            gmailThreadId: msg.threadId,
+          },
+        });
+
         // Get the email body — should just contain SO number
         const body = await getMessageBody(msg.id);
         if (!body) {
@@ -392,26 +400,11 @@ export async function checkForNewEmails(): Promise<{
         const soNumber = soMatch[0].trim();
         log(`[NewEmail] Extracted SO number: ${soNumber} from message ${msg.id}`);
 
-        // Trigger ZSO-VISIBILITY on auto_gui2
-        const response = await fetch(
-          `http://${AUTO_GUI_HOST}:8000/chat`,
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
-              transaction_code: 'ZSO-VISIBILITY',
-            }),
-          }
-        );
-
-        if (!response.ok) {
-          log(`[NewEmail] ZSO-VISIBILITY trigger failed for SO ${soNumber}: ${response.statusText}`);
-          errors.push(`ZSO-VISIBILITY failed for SO ${soNumber}`);
-          continue;
-        }
-
-        log(`[NewEmail] ZSO-VISIBILITY triggered for SO ${soNumber}`);
+        // Update the processed email record with the SO number
+        await prisma.processedEmail.update({
+          where: { gmailMessageId: msg.id },
+          data: { soNumber },
+        });
 
         // Create PO + SO in DB so it shows on dashboard
         let salesOrder = await prisma.salesOrder.findFirst({ where: { soNumber } });
@@ -438,6 +431,31 @@ export async function checkForNewEmails(): Promise<{
         // Save to CurrentSO so visibility-data endpoint knows which SO
         await prisma.currentSO.deleteMany();
         await prisma.currentSO.create({ data: { soNumber } });
+
+        // Trigger ZSO-VISIBILITY on auto_gui2
+        try {
+          const response = await fetch(
+            `http://${AUTO_GUI_HOST}:8000/chat`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
+                transaction_code: 'ZSO-VISIBILITY',
+              }),
+            }
+          );
+
+          if (!response.ok) {
+            log(`[NewEmail] ZSO-VISIBILITY trigger failed for SO ${soNumber}: ${response.statusText}`);
+            errors.push(`ZSO-VISIBILITY failed for SO ${soNumber}`);
+          } else {
+            log(`[NewEmail] ZSO-VISIBILITY triggered for SO ${soNumber}`);
+          }
+        } catch (fetchError) {
+          log(`[NewEmail] ZSO-VISIBILITY call failed for SO ${soNumber} (will not retry): ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`);
+          errors.push(`ZSO-VISIBILITY unreachable for SO ${soNumber}`);
+        }
 
         triggered++;
       } catch (error) {

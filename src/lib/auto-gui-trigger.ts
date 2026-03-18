@@ -583,6 +583,59 @@ async function triggerZsoVisibility(soNumber: string): Promise<void> {
 }
 
 /**
+ * Trigger VTO1N-B (Create Shipment) transaction via auto_gui2 /chat endpoint
+ *
+ * Called after user provides LR number, LR date, and vehicle number from the frontend.
+ * OBD number comes from the Invoice (set by processing-data).
+ */
+export async function triggerVto1n(
+  soNumber: string,
+  obdNumber: string,
+  lrNumber: string,
+  lrDate: Date,
+  vehicleNumber: string
+): Promise<void> {
+  // Format lrDate as DD.MM.YYYY (SAP format) using UTC methods
+  const dd = String(lrDate.getUTCDate()).padStart(2, '0');
+  const mm = String(lrDate.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = lrDate.getUTCFullYear();
+  const formattedDate = `${dd}.${mm}.${yyyy}`;
+
+  // Set invoice status to 'shipment-triggered' as a double-trigger guard
+  await prisma.invoice.updateMany({
+    where: { obdNumber, status: 'created' },
+    data: { status: 'shipment-triggered' },
+  });
+
+  try {
+    const response = await fetch(`http://${AUTO_GUI_HOST}:8000/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction VT01N. OBD number is ${obdNumber}, LR number is ${lrNumber}, LR date is ${formattedDate} and Vehicle number is ${vehicleNumber}`,
+        transaction_code: 'VTO1N-B',
+        extraction_context: 'Extract the OBD number, LR number, LR date and Vehicle number',
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`VTO1N-B trigger failed: ${response.status} ${response.statusText}`);
+    }
+
+    const result = await response.json();
+    console.log(`[VTO1N-B] Result for SO ${soNumber}: success=${result.success}`);
+  } catch (error) {
+    console.error(`[VTO1N-B] Failed for SO ${soNumber}:`, error);
+    // Reset invoice status back to 'created' on failure
+    await prisma.invoice.updateMany({
+      where: { obdNumber, status: 'shipment-triggered' },
+      data: { status: 'created' },
+    });
+    throw error;
+  }
+}
+
+/**
  * Trigger ZLOAD1 transaction via auto_gui2 /chat endpoint
  *
  * ZLOAD1 expects per-material: material_code, batch, quantity (pick qty)

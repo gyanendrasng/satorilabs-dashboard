@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
+import { triggerVto1n } from '@/lib/auto-gui-trigger';
 
 // PATCH - Update a sales order
 export async function PATCH(
@@ -49,9 +50,32 @@ export async function PATCH(
         ...(body.status !== undefined && { status: body.status }),
         ...(body.requiresInput !== undefined && { requiresInput: body.requiresInput }),
       },
+      include: { invoice: true },
     });
 
-    return NextResponse.json({ salesOrder });
+    // Trigger VTO1N-B if all shipment fields are present and invoice is ready
+    let vto1nTriggered = false;
+    if (
+      salesOrder.lrNumber &&
+      salesOrder.lrDate &&
+      salesOrder.vehicleNumber &&
+      salesOrder.invoice &&
+      salesOrder.invoice.status === 'created' &&
+      salesOrder.invoice.obdNumber
+    ) {
+      triggerVto1n(
+        salesOrder.soNumber,
+        salesOrder.invoice.obdNumber,
+        salesOrder.lrNumber,
+        salesOrder.lrDate,
+        salesOrder.vehicleNumber
+      ).catch((err) => {
+        console.error(`[VTO1N-B] Fire-and-forget error for SO ${salesOrder.soNumber}:`, err);
+      });
+      vto1nTriggered = true;
+    }
+
+    return NextResponse.json({ salesOrder, vto1nTriggered });
   } catch (error) {
     console.error('[/backend/orders/sales-orders/[soId]] PATCH Error:', error);
     return NextResponse.json(

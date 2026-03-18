@@ -200,6 +200,16 @@ model Email {
   @@map("email")
 }
 
+// Track incoming emails we've already processed (dedup for cron)
+model ProcessedEmail {
+  gmailMessageId String   @id
+  gmailThreadId  String
+  soNumber       String?
+  processedAt    DateTime @default(now())
+
+  @@map("processed_email")
+}
+
 // Singleton table to track current SO being processed by Aman
 model CurrentSO {
   soNumber String @id

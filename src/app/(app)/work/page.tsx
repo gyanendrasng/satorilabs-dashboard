@@ -245,7 +245,8 @@ export default function WorkPage() {
     const soCompleted = so.status === 'completed';
     const invoiceCreated = so.invoice && so.invoice.status === 'created';
     const noShipmentYet = !so.lrNumber;
-    return allLSCompleted && soCompleted && invoiceCreated && noShipmentYet;
+    const notAlreadyTriggered = !so.invoice || (so.invoice.status !== 'shipment-triggered' && so.invoice.status !== 'shipped');
+    return allLSCompleted && soCompleted && invoiceCreated && noShipmentYet && notAlreadyTriggered;
   };
 
   // Open modals
@@ -435,17 +436,31 @@ export default function WorkPage() {
   };
 
   const handleUpdateShipment = async () => {
-    if (!selectedInvoice) return;
+    if (!selectedSO || !selectedInvoice) return;
     try {
-      const res = await fetch(`/backend/orders/invoices/${selectedInvoice.id}`, {
+      // 1. PATCH SalesOrder with LR fields — this triggers VTO1N-B on the backend
+      const soRes = await fetch(`/backend/orders/sales-orders/${selectedSO.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          ...shipmentForm,
-          status: 'shipped',
+          lrNumber: shipmentForm.lrNumber,
+          lrDate: shipmentForm.lrDate,
+          vehicleNumber: shipmentForm.vehicleNumber,
         }),
       });
-      if (res.ok) {
+
+      // 2. PATCH Invoice with shipment metadata (no status override — VTO1N flow manages status)
+      const invRes = await fetch(`/backend/orders/invoices/${selectedInvoice.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          shipmentType: shipmentForm.shipmentType,
+          plantCode: shipmentForm.plantCode,
+          notes: shipmentForm.notes,
+        }),
+      });
+
+      if (soRes.ok && invRes.ok) {
         setShowInputModal(false);
         fetchOrders();
       }
@@ -471,6 +486,7 @@ export default function WorkPage() {
       pending: { bg: 'bg-slate-600', text: 'Pending', icon: Clock },
       created: { bg: 'bg-purple-600', text: 'Created', icon: FileText },
       shipped: { bg: 'bg-emerald-600', text: 'Shipped', icon: CheckCircle2 },
+      'shipment-triggered': { bg: 'bg-yellow-600', text: 'Creating Shipment', icon: Clock },
       'pending-input': { bg: 'bg-orange-600', text: 'Needs Input', icon: AlertCircle },
     };
 
