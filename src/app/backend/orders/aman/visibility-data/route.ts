@@ -28,7 +28,23 @@ interface VisibilityPayload {
  */
 export async function POST(request: Request) {
   try {
-    const body: VisibilityPayload = await request.json();
+    const rawText = await request.text();
+    console.log(`[VisibilityData] Raw body (${rawText.length} chars):`, rawText.slice(0, 500));
+
+    let body: VisibilityPayload;
+    try {
+      body = JSON.parse(rawText);
+    } catch (parseErr) {
+      console.error(`[VisibilityData] JSON parse failed. Full body:`, rawText);
+      return NextResponse.json(
+        { error: 'Invalid JSON in request body', receivedPreview: rawText.slice(0, 200) },
+        { status: 400 }
+      );
+    }
+
+    console.log(`[VisibilityData] Parsed payload keys:`, Object.keys(body));
+    console.log(`[VisibilityData] so_number=${body.so_number}, soNumber=${body.soNumber}, materials=${body.materials?.length}, email_body length=${body.email_body?.length}`);
+
     const { email_body, materials } = body;
 
     if (!email_body) {
