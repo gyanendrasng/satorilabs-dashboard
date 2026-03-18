@@ -509,20 +509,9 @@ export async function handleProductionConfirmation(
     }
 
     if (result.status === 'ready') {
-      // Trigger ZLOAD1 — storedMaterials has full objects with batch + quantity
-      const materialItems: MaterialItemPayload[] = storedMaterials.length > 0
-          && typeof storedMaterials[0] === 'object'
-        ? storedMaterials.map((m: any) => ({
-            material_code: m.material_code,
-            batch: m.batch_number || '',
-            quantity: m.order_quantity || 0,
-          }))
-        : materialCodes.map((m) => ({
-            material_code: m,
-            batch: '',
-            quantity: 0,
-          }));
-      await triggerZload1(soNumber, materialItems);
+      // Re-trigger ZSO-VISIBILITY to get fresh batch/material data
+      // Pipeline: ZSO-VISIBILITY → Zmatana → Policy Run → Email to Branch → Branch decides
+      await triggerZsoVisibility(soNumber);
 
       await prisma.email.update({
         where: { id: emailId },
@@ -534,7 +523,7 @@ export async function handleProductionConfirmation(
         },
       });
 
-      log(`[ProductionConfirmation] Materials ready, ZLOAD1 triggered`);
+      log(`[ProductionConfirmation] Materials ready, ZSO-VISIBILITY re-triggered for SO ${soNumber}`);
     } else if (result.status === 'wait_more') {
       const additionalDays = result.additional_days || 3;
       const waitUntil = new Date(Date.now() + additionalDays * 86400000);
@@ -562,6 +551,35 @@ export async function handleProductionConfirmation(
     );
     return { success: false, logs };
   }
+}
+
+/**
+ * Re-trigger ZSO-VISIBILITY so the pipeline re-checks fresh batch/material
+ * data in SAP after production confirms materials are available.
+ *
+ * Flow: ZSO-VISIBILITY → Zmatana → Policy Run → Email to Branch → Branch decides
+ */
+async function triggerZsoVisibility(soNumber: string): Promise<void> {
+  // Update CurrentSO singleton so visibility-data endpoint knows which SO
+  await prisma.currentSO.deleteMany();
+  await prisma.currentSO.create({ data: { soNumber } });
+
+  // Trigger ZSO-VISIBILITY on auto_gui2
+  const response = await fetch(`http://${AUTO_GUI_HOST}:8000/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
+      transaction_code: 'ZSO-VISIBILITY',
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`ZSO-VISIBILITY trigger failed: ${response.status} ${response.statusText}`);
+  }
+
+  const result = await response.json();
+  console.log(`[ZSO-VISIBILITY] Re-triggered for SO ${soNumber}: success=${result.success}`);
 }
 
 /**
