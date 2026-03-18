@@ -346,19 +346,14 @@ export async function checkForNewEmails(): Promise<{
     logs.push(logMessage);
   };
 
-  if (!BRANCH_EMAIL) {
-    log('[NewEmail] BRANCH_EMAIL not configured, skipping');
-    return { triggered: 0, errors: [], logs };
-  }
-
   try {
-    // Search for recent emails from branch with subject "NEW ORDER" (last 1 day, unread)
-    const messages = await listMessages(
-      `from:${BRANCH_EMAIL} subject:"NEW ORDER" newer_than:1d is:unread`,
-      10
-    );
+    // Search for recent emails with subject "NEW ORDER" (last 1 day, unread) from any sender
+    const query = BRANCH_EMAIL
+      ? `from:${BRANCH_EMAIL} subject:"NEW ORDER" newer_than:1d is:unread`
+      : `subject:"NEW ORDER" newer_than:1d is:unread`;
+    const messages = await listMessages(query, 10);
 
-    log(`[NewEmail] Found ${messages.length} recent unread messages from ${BRANCH_EMAIL}`);
+    log(`[NewEmail] Found ${messages.length} recent unread messages matching "NEW ORDER"`);
 
     if (messages.length === 0) {
       return { triggered: 0, errors: [], logs };
@@ -446,9 +441,10 @@ export async function checkForNewEmails(): Promise<{
 
         triggered++;
       } catch (error) {
+        const cause = error instanceof Error && (error as any).cause ? ` cause: ${String((error as any).cause)}` : '';
         const errorMsg = `Error processing message ${msg.id}: ${
           error instanceof Error ? error.message : String(error)
-        }`;
+        }${cause}`;
         log(`[NewEmail] ${errorMsg}`);
         errors.push(errorMsg);
       }
