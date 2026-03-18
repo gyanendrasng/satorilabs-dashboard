@@ -107,14 +107,24 @@ export async function POST(request: Request) {
     // (use first material as identifier, or create a placeholder)
     let loadingSlipItem = salesOrder.items[0];
     if (!loadingSlipItem) {
-      loadingSlipItem = await prisma.loadingSlipItem.create({
-        data: {
-          salesOrderId: salesOrder.id,
-          lsNumber: `DISPATCH-${soNumber}`,
-          material: materials[0]?.material_code || 'PENDING',
-          status: 'pending',
-        },
-      });
+      console.log(`[VisibilityData] Step 2b: No items on SO, creating LoadingSlipItem...`);
+      try {
+        loadingSlipItem = await prisma.loadingSlipItem.create({
+          data: {
+            salesOrderId: salesOrder.id,
+            lsNumber: `DISPATCH-${soNumber}`,
+            material: materials[0]?.material_code || 'PENDING',
+            status: 'pending',
+          },
+        });
+        console.log(`[VisibilityData] Step 2b: Created LoadingSlipItem id=${loadingSlipItem.id}`);
+      } catch (lsiErr) {
+        console.error(`[VisibilityData] Step 2b FAILED: LoadingSlipItem create threw:`, lsiErr);
+        return NextResponse.json(
+          { error: 'Failed to create LoadingSlipItem', details: lsiErr instanceof Error ? lsiErr.message : String(lsiErr) },
+          { status: 500 }
+        );
+      }
     }
 
     // Send dispatch status email to branch
@@ -174,11 +184,14 @@ export async function POST(request: Request) {
       materialsCount: materials.length,
     });
   } catch (error) {
-    console.error('[Aman API - Visibility Data] Error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    const errStack = error instanceof Error ? error.stack : undefined;
+    console.error(`[VisibilityData] UNHANDLED ERROR: ${errMsg}`);
+    console.error(`[VisibilityData] Stack:`, errStack || error);
     return NextResponse.json(
       {
         error: 'Internal server error',
-        details: error instanceof Error ? error.message : String(error),
+        details: errMsg,
       },
       { status: 500 }
     );
