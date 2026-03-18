@@ -15,7 +15,8 @@ import { uploadToS3 } from '@/lib/s3';
  * 5. Creates Email record for tracking
  *
  * Expected: multipart/form-data with:
- * - soNumber: string (optional - will read from CurrentSO if not provided)
+ * - so_number: string (preferred - SAP sales order number from auto_gui2)
+ * - soNumber: string (legacy fallback - will read from CurrentSO if neither provided)
  * - file: File (single LS file, filename is the LS number e.g., "1001234.xls")
  * OR
  * - files: File[] (multiple LS files)
@@ -26,9 +27,10 @@ import { uploadToS3 } from '@/lib/s3';
 export async function POST(request: Request) {
   try {
     const formData = await request.formData();
-    let soNumber = formData.get('soNumber') as string | null;
 
-    // If soNumber not provided, read from CurrentSO singleton
+    // SO lookup priority: so_number → soNumber → CurrentSO singleton
+    let soNumber = (formData.get('so_number') as string | null) || (formData.get('soNumber') as string | null);
+
     if (!soNumber) {
       const currentSO = await prisma.currentSO.findFirst();
       if (!currentSO) {
@@ -213,6 +215,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      so_number: soNumber,
       soNumber,
       processed: results.length,
       results,

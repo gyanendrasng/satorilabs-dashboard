@@ -14,7 +14,7 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
 
-    // Accept flat array directly
+    // Accept flat array directly, or wrapped object with so_number
     const rows: SAPResultRow[] = Array.isArray(body) ? body : body.items ?? body.data;
 
     if (!rows || !Array.isArray(rows) || rows.length === 0) {
@@ -24,11 +24,14 @@ export async function POST(request: Request) {
       );
     }
 
-    // Extract soNumber from first row; fallback to CurrentSO singleton
-    let soNumber = rows[0]?.sales_order;
+    // SO lookup priority: body.so_number → rows[0].sales_order → CurrentSO singleton
+    let soNumber = body.so_number as string | undefined;
+    if (!soNumber) {
+      soNumber = rows[0]?.sales_order;
+    }
     if (!soNumber) {
       const currentSO = await prisma.currentSO.findFirst();
-      soNumber = currentSO?.soNumber ?? null;
+      soNumber = currentSO?.soNumber ?? undefined;
     }
 
     if (!soNumber) {
@@ -81,6 +84,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      so_number: soNumber,
       message: `Invoice ${invoice.invoiceNumber} saved with ${rows.length} SAP result row(s)`,
       invoice,
     });

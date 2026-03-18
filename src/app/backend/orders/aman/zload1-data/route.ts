@@ -10,9 +10,10 @@ import { uploadToS3 } from '@/lib/s3';
  * does NOT email to plant. Emailing is handled by /initial-data (ZLOAD3-A, Stage 2).
  *
  * Expected: multipart/form-data with:
+ * - so_number: string (preferred - SAP sales order number from auto_gui2)
  * - file: File (single LS file, filename is the LS number e.g., "1234567890.PDF")
  *
- * SO number is read from the CurrentSO singleton.
+ * SO lookup priority: so_number form field → CurrentSO singleton.
  */
 export async function POST(request: Request) {
   try {
@@ -36,15 +37,18 @@ export async function POST(request: Request) {
       );
     }
 
-    // Read SO number from CurrentSO singleton
-    const currentSO = await prisma.currentSO.findFirst();
-    if (!currentSO) {
-      return NextResponse.json(
-        { error: 'No current SO number set' },
-        { status: 404 }
-      );
+    // SO lookup priority: so_number form field → CurrentSO singleton
+    let soNumber = formData.get('so_number') as string | null;
+    if (!soNumber) {
+      const currentSO = await prisma.currentSO.findFirst();
+      if (!currentSO) {
+        return NextResponse.json(
+          { error: 'No current SO number set and so_number not provided' },
+          { status: 404 }
+        );
+      }
+      soNumber = currentSO.soNumber;
     }
-    const soNumber = currentSO.soNumber;
 
     // Find the sales order
     const salesOrder = await prisma.salesOrder.findFirst({
@@ -95,6 +99,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      so_number: soNumber,
       soNumber,
       lsNumber,
       fileUrl: s3Key,

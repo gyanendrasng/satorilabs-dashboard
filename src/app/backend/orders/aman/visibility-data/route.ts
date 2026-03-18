@@ -11,6 +11,7 @@ interface VisibilityMaterial {
 }
 
 interface VisibilityPayload {
+  so_number?: string;
   soNumber?: string;
   email_body: string;
   materials: VisibilityMaterial[];
@@ -29,7 +30,6 @@ export async function POST(request: Request) {
   try {
     const body: VisibilityPayload = await request.json();
     const { email_body, materials } = body;
-    let { soNumber } = body;
 
     if (!email_body) {
       return NextResponse.json(
@@ -45,7 +45,8 @@ export async function POST(request: Request) {
       );
     }
 
-    // If soNumber not provided, read from CurrentSO singleton
+    // SO lookup priority: so_number → soNumber → CurrentSO singleton
+    let soNumber = body.so_number || body.soNumber;
     if (!soNumber) {
       const currentSO = await prisma.currentSO.findFirst();
       if (!currentSO) {
@@ -127,6 +128,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json({
       success: true,
+      so_number: soNumber,
       soNumber,
       emailSent: true,
       messageId,
