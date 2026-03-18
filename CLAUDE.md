@@ -62,6 +62,11 @@ watch -n 60 'curl -s http://localhost:3000/backend/cron/check-emails'
 - `src/lib/email-service.ts` — Sends loading slip emails, creates Email records in DB
 - `src/lib/auto-gui-trigger.ts` — Handlers for branch reply, production reply, production confirmation workflows
 
+## Reset DB (clear all SO data)
+```bash
+npx prisma db push --schema prisma/schema.prisma && npx prisma generate --schema prisma/schema.prisma && npx prisma db execute --schema prisma/schema.prisma --stdin <<< "DELETE FROM email; DELETE FROM loading_slip_item; DELETE FROM invoice; DELETE FROM sales_order; DELETE FROM purchase_order; DELETE FROM processed_email; DELETE FROM current_so;"
+```
+
 ## Email Workflow States
 - `sent` → waiting for reply
 - `replied` → reply received (may have PDF)
