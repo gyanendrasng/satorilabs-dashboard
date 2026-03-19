@@ -354,8 +354,9 @@ export async function handleBranchReply(
 
     return { success: true, logs };
   } catch (error) {
+    const cause = error instanceof Error && (error as any).cause ? ` | cause: ${String((error as any).cause)}` : '';
     log(
-      `[BranchReply] Error: ${error instanceof Error ? error.message : String(error)}`
+      `[BranchReply] Error: ${error instanceof Error ? error.message : String(error)}${cause} | endpoint: http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/branch-reply`
     );
     return { success: false, logs };
   }
