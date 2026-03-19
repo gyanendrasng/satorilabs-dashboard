@@ -3,7 +3,7 @@ import { downloadFromS3 } from './s3';
 import { sendPlainEmail } from './gmail';
 
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
-const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8080';
+const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
 
 /**

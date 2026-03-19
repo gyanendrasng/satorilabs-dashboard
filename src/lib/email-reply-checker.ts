@@ -9,7 +9,7 @@ import {
 import { uploadToS3 } from './s3';
 
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
-const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8080';
+const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
