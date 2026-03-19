@@ -111,6 +111,7 @@ export async function checkAndSendBatchToAman(
       body: JSON.stringify({
         instruction,
         transaction_code: 'ZLOAD3-B1',
+        so_number: salesOrder.soNumber,
         attachments: [attachment],
         extraction_context:
           'Extract the loaded quantity, invoice number, and invoice date',
@@ -571,6 +572,7 @@ async function triggerZsoVisibility(soNumber: string): Promise<void> {
     body: JSON.stringify({
       instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
       transaction_code: 'ZSO-VISIBILITY',
+      so_number: soNumber,
     }),
   });
 
@@ -614,6 +616,7 @@ export async function triggerVto1n(
       body: JSON.stringify({
         instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction VT01N. OBD number is ${obdNumber}, LR number is ${lrNumber}, LR date is ${formattedDate} and Vehicle number is ${vehicleNumber}`,
         transaction_code: 'VTO1N-B',
+        so_number: soNumber,
         extraction_context: 'Extract the OBD number, LR number, LR date and Vehicle number',
       }),
     });
