@@ -101,7 +101,20 @@ export async function POST(request: Request) {
       data: { status: 'ls_created' },
     });
 
-    // No email sent — that's /initial-data's job (ZLOAD3-A, Stage 2)
+    // Trigger ZLOAD3-A automatically (fire-and-forget)
+    const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
+    const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
+    fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}.`,
+        transaction_code: 'ZLOAD3-A',
+        so_number: soNumber,
+      }),
+    })
+      .then(() => console.log(`[ZLOAD1 Data] ZLOAD3-A triggered for SO ${soNumber}`))
+      .catch((err) => console.error(`[ZLOAD1 Data] ZLOAD3-A trigger failed for SO ${soNumber}:`, err.message));
 
     return NextResponse.json({
       success: true,
