@@ -168,6 +168,7 @@ export async function POST(request: Request) {
         emailType: 'ls_dispatch',
         workflowState: 'awaiting_reply',
         relatedMaterials: materialsJson,
+        sentBody: email_body,
       },
     });
 

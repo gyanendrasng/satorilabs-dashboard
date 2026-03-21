@@ -193,6 +193,7 @@ model Email {
   workflowState     String?   // 'awaiting_reply' | 'awaiting_production_reply' | 'waiting_timer' | 'awaiting_confirmation' | 'completed' | null
   waitUntil         DateTime? // When to send reminder (set after production replies with days)
   relatedMaterials  String?   // JSON string of missing material codes
+  sentBody          String?   // Plain text body of the sent email
   replyHtml         String?   // Reply body HTML (for forwarding to auto_gui2)
 
   loadingSlipItem LoadingSlipItem @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)

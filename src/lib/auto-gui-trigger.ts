@@ -666,6 +666,7 @@ async function triggerZload1(
       body: JSON.stringify({
         instruction,
         transaction_code: 'ZLOAD1',
+        so_number: soNumber,
       }),
     }
   );
