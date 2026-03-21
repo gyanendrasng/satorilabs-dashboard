@@ -129,7 +129,7 @@ export async function POST(request: Request) {
 
     // Send dispatch status email to branch (reply in original thread if possible)
     console.log(`[VisibilityData] Step 3: Sending email to ${BRANCH_EMAIL}...`);
-    const subject = `Re: Dispatch Status - Sales Order ${soNumber}`;
+    const subject = `Dispatch Status - Sales Order ${soNumber}`;
     let messageId: string;
     let threadId: string;
     try {
