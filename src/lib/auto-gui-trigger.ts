@@ -756,18 +756,26 @@ export async function handleVehicleDetailsReply(
     });
 
     const rawJson = completion.choices[0]?.message?.content;
-    if (!rawJson) {
+    let vehicleNumber = '';
+    let driverMobile = '';
+    let containerNumber = '';
+
+    if (rawJson) {
+      try {
+        const parsed = VehicleDetailsSchema.safeParse(JSON.parse(rawJson));
+        if (parsed.success) {
+          vehicleNumber = parsed.data.vehicleNumber;
+          driverMobile = parsed.data.driverMobile;
+          containerNumber = parsed.data.containerNumber;
+        } else {
+          log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
+        }
+      } catch (parseErr) {
+        log(`[VehicleDetails] JSON parse failed: ${parseErr instanceof Error ? parseErr.message : parseErr}`);
+      }
+    } else {
       log(`[VehicleDetails] OpenAI returned empty response`);
-      return { success: false, logs };
     }
-
-    const parsed = VehicleDetailsSchema.safeParse(JSON.parse(rawJson));
-    if (!parsed.success) {
-      log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
-      return { success: false, logs };
-    }
-
-    const { vehicleNumber, driverMobile, containerNumber } = parsed.data;
     log(`[VehicleDetails] Extracted: vehicle=${vehicleNumber}, driver=${driverMobile}, container=${containerNumber}`);
 
     // Check if all fields are present
