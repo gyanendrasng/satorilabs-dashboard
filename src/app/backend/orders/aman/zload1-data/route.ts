@@ -22,6 +22,14 @@ export async function POST(request: Request) {
   try {
     const formData = await request.formData();
     const file = formData.get('file') as File | null;
+    const soNumberField = formData.get('so_number') as string | null;
+
+    console.log(`[ZLOAD1 Data] Received callback — file: ${file?.name || 'none'}, size: ${file?.size || 0}, so_number: ${soNumberField || 'not provided'}`);
+
+    // Log all form data keys for debugging
+    const keys: string[] = [];
+    formData.forEach((_, key) => keys.push(key));
+    console.log(`[ZLOAD1 Data] Form data keys: ${keys.join(', ')}`);
 
     if (!file) {
       return NextResponse.json(
@@ -97,6 +105,8 @@ export async function POST(request: Request) {
         data: { fileUrl: s3Key },
       });
     }
+
+    console.log(`[ZLOAD1 Data] Stored LS file — SO: ${soNumber}, LS: ${lsNumber}, file: ${file.name}, s3Key: ${s3Key}, itemId: ${loadingSlipItem.id}`);
 
     // Update SO status to ls_created
     await prisma.salesOrder.update({
