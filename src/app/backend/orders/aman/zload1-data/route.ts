@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
+import { sendReplyEmail, sendPlainEmail, getMessageRfc822Id } from '@/lib/gmail';
+
+const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
 /**
  * POST /backend/orders/aman/zload1-data
@@ -53,7 +56,7 @@ export async function POST(request: Request) {
     // Find the sales order
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
-      select: { id: true, soNumber: true },
+      select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true },
     });
 
     if (!salesOrder) {
@@ -101,20 +104,57 @@ export async function POST(request: Request) {
       data: { status: 'ls_created' },
     });
 
-    // Trigger ZLOAD3-A automatically (fire-and-forget)
-    const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
-    const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
-    fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}.`,
-        transaction_code: 'ZLOAD3-A',
-        so_number: soNumber,
-      }),
-    })
-      .then(() => console.log(`[ZLOAD1 Data] ZLOAD3-A triggered for SO ${soNumber}`))
-      .catch((err) => console.error(`[ZLOAD1 Data] ZLOAD3-A trigger failed for SO ${soNumber}:`, err.message));
+    // Send email asking for vehicle details (reply in original thread)
+    if (BRANCH_EMAIL) {
+      const vehicleEmailBody = [
+        `Loading slip for Sales Order ${soNumber} has been created successfully.`,
+        '',
+        'Please reply with the following vehicle/transport details:',
+        '1. Vehicle Number (e.g., GJ12AB1234)',
+        '2. Driver Mobile Number (e.g., 9876543210)',
+        '3. Container Number',
+      ].join('\n');
+
+      const subject = `Vehicle Details Required - SO ${soNumber}`;
+
+      try {
+        let emailResult: { messageId: string; threadId: string };
+
+        if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
+          try {
+            const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
+            if (rfc822Id) {
+              console.log(`[ZLOAD1 Data] Replying in original thread ${salesOrder.originalThreadId} for vehicle details`);
+              emailResult = await sendReplyEmail(BRANCH_EMAIL, subject, vehicleEmailBody, salesOrder.originalThreadId, rfc822Id);
+            } else {
+              emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
+            }
+          } catch {
+            emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
+          }
+        } else {
+          emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
+        }
+
+        // Create Email record for tracking vehicle details reply
+        await prisma.email.create({
+          data: {
+            loadingSlipItemId: loadingSlipItem.id,
+            gmailMessageId: emailResult.messageId,
+            gmailThreadId: emailResult.threadId,
+            recipientEmail: BRANCH_EMAIL,
+            subject,
+            status: 'sent',
+            emailType: 'vehicle_details',
+            workflowState: 'awaiting_reply',
+          },
+        });
+
+        console.log(`[ZLOAD1 Data] Vehicle details email sent for SO ${soNumber} - messageId: ${emailResult.messageId}`);
+      } catch (emailErr) {
+        console.error(`[ZLOAD1 Data] Failed to send vehicle details email for SO ${soNumber}:`, emailErr instanceof Error ? emailErr.message : emailErr);
+      }
+    }
 
     return NextResponse.json({
       success: true,

@@ -5,6 +5,7 @@ import {
   handleBranchReply,
   handleProductionReply,
   handleProductionConfirmation,
+  handleVehicleDetailsReply,
 } from './auto-gui-trigger';
 import { uploadToS3 } from './s3';
 
@@ -122,6 +123,15 @@ export async function checkForReplies(): Promise<{
         log(`[EmailChecker] Routing to handleProductionConfirmation for SO ${soNumber}`);
         const confResult = await handleProductionConfirmation(email.id, replyBodyHtml);
         logs.push(...confResult.logs);
+        processed++;
+        continue;
+      }
+
+      if (emailType === 'vehicle_details') {
+        // Branch replied with vehicle details
+        log(`[EmailChecker] Routing to handleVehicleDetailsReply for SO ${soNumber}`);
+        const vdResult = await handleVehicleDetailsReply(email.id, replyBodyHtml || '', email.loadingSlipItem.salesOrderId);
+        logs.push(...vdResult.logs);
         processed++;
         continue;
       }

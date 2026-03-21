@@ -44,10 +44,6 @@ export async function sendLSEmail(
   if (vehicleDetails.containerNumber) {
     bodyLines.push(`- Container Number: ${vehicleDetails.containerNumber}`);
   }
-  if (vehicleDetails.transportId) {
-    bodyLines.push(`- Transport ID: ${vehicleDetails.transportId}`);
-  }
-
   bodyLines.push('', 'Please reply with the invoice PDF.');
 
   const body = bodyLines.join('\n');

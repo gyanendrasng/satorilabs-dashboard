@@ -1,10 +1,13 @@
 import { prisma } from './prisma';
 import { downloadFromS3 } from './s3';
-import { sendPlainEmail } from './gmail';
+import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from './gmail';
+import OpenAI from 'openai';
+import { z } from 'zod';
 
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
+const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
 /**
  * Check if all LoadingSlipItems for a SalesOrder have replies with PDFs,
@@ -686,4 +689,175 @@ async function triggerZload1(
 
   const result = await response.json();
   console.log(`[ZLOAD1] Result for SO ${soNumber}: success=${result.success}`);
+}
+
+/**
+ * Handle reply to vehicle details email.
+ * Uses OpenAI to extract vehicle number, driver mobile, container number.
+ * If all 3 present → save to SO + trigger ZLOAD3-A.
+ * If any missing → reply asking for complete details.
+ */
+export async function handleVehicleDetailsReply(
+  emailId: string,
+  replyHtml: string,
+  salesOrderId: string
+): Promise<{ success: boolean; logs: string[] }> {
+  const logs: string[] = [];
+  const log = (message: string) => {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}`;
+    console.log(logMessage);
+    logs.push(logMessage);
+  };
+
+  const email = await prisma.email.findUnique({
+    where: { id: emailId },
+    include: {
+      loadingSlipItem: {
+        include: { salesOrder: true },
+      },
+    },
+  });
+
+  if (!email) {
+    log(`[VehicleDetails] Email not found: ${emailId}`);
+    return { success: false, logs };
+  }
+
+  const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+  log(`[VehicleDetails] Extracting vehicle details from reply for SO ${soNumber}`);
+
+  // Strip HTML tags for cleaner text
+  const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+  // Extract fields using OpenAI
+  const VehicleDetailsSchema = z.object({
+    vehicleNumber: z.string().describe('Vehicle registration number, e.g. GJ12AB1234'),
+    driverMobile: z.string().describe('Driver mobile phone number, e.g. 9876543210'),
+    containerNumber: z.string().describe('Container/shipment number'),
+  });
+
+  try {
+    const openai = new OpenAI();
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.1,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: 'You extract vehicle/transport details from email replies. Return a JSON object with vehicleNumber, driverMobile, and containerNumber. If a field is not mentioned or unclear, set it to an empty string "".',
+        },
+        {
+          role: 'user',
+          content: `Extract vehicle details from this email reply:\n\n${replyText}`,
+        },
+      ],
+    });
+
+    const rawJson = completion.choices[0]?.message?.content;
+    if (!rawJson) {
+      log(`[VehicleDetails] OpenAI returned empty response`);
+      return { success: false, logs };
+    }
+
+    const parsed = VehicleDetailsSchema.safeParse(JSON.parse(rawJson));
+    if (!parsed.success) {
+      log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
+      return { success: false, logs };
+    }
+
+    const { vehicleNumber, driverMobile, containerNumber } = parsed.data;
+    log(`[VehicleDetails] Extracted: vehicle=${vehicleNumber}, driver=${driverMobile}, container=${containerNumber}`);
+
+    // Check if all fields are present
+    if (!vehicleNumber || !driverMobile || !containerNumber) {
+      log(`[VehicleDetails] Missing fields, asking for complete details`);
+
+      // Reply asking for complete details
+      const missingFields: string[] = [];
+      if (!vehicleNumber) missingFields.push('Vehicle Number');
+      if (!driverMobile) missingFields.push('Driver Mobile Number');
+      if (!containerNumber) missingFields.push('Container Number');
+
+      const replyBody = [
+        `Thank you for your reply regarding Sales Order ${soNumber}.`,
+        '',
+        `The following details are still missing: ${missingFields.join(', ')}`,
+        '',
+        'Please reply with the complete details:',
+        '1. Vehicle Number (e.g., GJ12AB1234)',
+        '2. Driver Mobile Number (e.g., 9876543210)',
+        '3. Container Number',
+      ].join('\n');
+
+      try {
+        const so = email.loadingSlipItem.salesOrder;
+        let replyResult: { messageId: string; threadId: string };
+
+        if (so.originalThreadId && so.originalMessageId) {
+          try {
+            const rfc822Id = await getMessageRfc822Id(so.originalMessageId);
+            if (rfc822Id) {
+              replyResult = await sendReplyEmail(BRANCH_EMAIL, `Re: Vehicle Details - SO ${soNumber}`, replyBody, so.originalThreadId, rfc822Id);
+            } else {
+              replyResult = await sendPlainEmail(BRANCH_EMAIL, `Vehicle Details Required - SO ${soNumber}`, replyBody);
+            }
+          } catch {
+            replyResult = await sendPlainEmail(BRANCH_EMAIL, `Vehicle Details Required - SO ${soNumber}`, replyBody);
+          }
+        } else {
+          replyResult = await sendPlainEmail(BRANCH_EMAIL, `Vehicle Details Required - SO ${soNumber}`, replyBody);
+        }
+
+        // Update email record to track the new message (keep status 'sent' for continued polling)
+        await prisma.email.update({
+          where: { id: emailId },
+          data: {
+            gmailMessageId: replyResult.messageId,
+            gmailThreadId: replyResult.threadId,
+            status: 'sent',
+          },
+        });
+
+        log(`[VehicleDetails] Sent follow-up asking for missing fields: ${missingFields.join(', ')}`);
+      } catch (sendErr) {
+        log(`[VehicleDetails] Failed to send follow-up: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
+      }
+
+      return { success: true, logs };
+    }
+
+    // All fields present — save to SalesOrder
+    await prisma.salesOrder.update({
+      where: { id: salesOrderId },
+      data: { vehicleNumber, driverMobile, containerNumber },
+    });
+    log(`[VehicleDetails] Saved vehicle details to SO ${soNumber}`);
+
+    // Mark email as completed
+    await prisma.email.update({
+      where: { id: emailId },
+      data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed' },
+    });
+
+    // Trigger ZLOAD3-A
+    log(`[VehicleDetails] Triggering ZLOAD3-A for SO ${soNumber}`);
+    fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}.`,
+        transaction_code: 'ZLOAD3-A',
+        so_number: soNumber,
+      }),
+    })
+      .then(() => log(`[VehicleDetails] ZLOAD3-A triggered for SO ${soNumber}`))
+      .catch((err) => log(`[VehicleDetails] ZLOAD3-A trigger failed: ${err.message}`));
+
+    return { success: true, logs };
+  } catch (error) {
+    log(`[VehicleDetails] Error: ${error instanceof Error ? error.message : error}`);
+    return { success: false, logs };
+  }
 }
