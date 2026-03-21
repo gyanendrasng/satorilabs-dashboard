@@ -137,18 +137,23 @@ export async function POST(request: Request) {
 
       if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
         // Reply in the same thread as the original NEW ORDER email
-        const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
-        if (rfc822Id) {
-          console.log(`[VisibilityData] Step 3: Replying in original thread ${salesOrder.originalThreadId}`);
-          result = await sendReplyEmail(
-            BRANCH_EMAIL,
-            subject,
-            email_body,
-            salesOrder.originalThreadId,
-            rfc822Id
-          );
-        } else {
-          console.log(`[VisibilityData] Step 3: Could not get RFC822 ID, sending new email`);
+        try {
+          const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
+          if (rfc822Id) {
+            console.log(`[VisibilityData] Step 3: Replying in original thread ${salesOrder.originalThreadId}`);
+            result = await sendReplyEmail(
+              BRANCH_EMAIL,
+              subject,
+              email_body,
+              salesOrder.originalThreadId,
+              rfc822Id
+            );
+          } else {
+            console.log(`[VisibilityData] Step 3: Could not get RFC822 ID, sending new email`);
+            result = await sendPlainEmail(BRANCH_EMAIL, subject, email_body);
+          }
+        } catch (replyErr) {
+          console.warn(`[VisibilityData] Step 3: Reply-in-thread failed, falling back to new email:`, replyErr instanceof Error ? replyErr.message : replyErr);
           result = await sendPlainEmail(BRANCH_EMAIL, subject, email_body);
         }
       } else {
