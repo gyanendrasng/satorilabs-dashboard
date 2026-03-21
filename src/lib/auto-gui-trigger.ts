@@ -287,6 +287,13 @@ export async function handleBranchReply(
         };
       });
 
+      // Update SO status to stock_approved
+      await prisma.salesOrder.update({
+        where: { id: email.loadingSlipItem.salesOrderId },
+        data: { status: 'stock_approved' },
+      });
+      log(`[BranchReply] SO ${soNumber} status updated to stock_approved`);
+
       log(`[BranchReply] Triggering ZLOAD1 for ${materials.length} materials`);
       await triggerZload1(soNumber, materials);
 

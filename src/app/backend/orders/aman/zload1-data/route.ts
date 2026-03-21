@@ -95,6 +95,12 @@ export async function POST(request: Request) {
       });
     }
 
+    // Update SO status to ls_created
+    await prisma.salesOrder.update({
+      where: { id: salesOrder.id },
+      data: { status: 'ls_created' },
+    });
+
     // No email sent — that's /initial-data's job (ZLOAD3-A, Stage 2)
 
     return NextResponse.json({
