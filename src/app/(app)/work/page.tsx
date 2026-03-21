@@ -27,6 +27,7 @@ import {
   MessageSquare,
   Layers,
   Bot,
+  Truck,
 } from 'lucide-react';
 import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, groupItemsByLsNumber } from '@/components/orders/types';
 
@@ -488,6 +489,8 @@ export default function WorkPage() {
       shipped: { bg: 'bg-emerald-600', text: 'Shipped', icon: CheckCircle2 },
       'shipment-triggered': { bg: 'bg-yellow-600', text: 'Creating Shipment', icon: Clock },
       'pending-input': { bg: 'bg-orange-600', text: 'Needs Input', icon: AlertCircle },
+      stock_approved: { bg: 'bg-teal-600', text: 'Stock Approved', icon: CheckCircle2 },
+      ls_created: { bg: 'bg-indigo-600', text: 'LS Created', icon: FileText },
     };
 
     const config = configs[status] || configs['pending'];
@@ -499,6 +502,30 @@ export default function WorkPage() {
         {config.text}
       </span>
     );
+  };
+
+  const [askingVehicle, setAskingVehicle] = useState<Set<string>>(new Set());
+
+  const askVehicleDetails = async (soId: string, soNumber: string) => {
+    setAskingVehicle((prev) => new Set(prev).add(soId));
+    try {
+      const res = await fetch(`/backend/orders/ask-vehicle-details`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ soNumber }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      alert(`Vehicle details email sent for SO ${soNumber}`);
+    } catch (err) {
+      alert(`Failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setAskingVehicle((prev) => {
+        const next = new Set(prev);
+        next.delete(soId);
+        return next;
+      });
+    }
   };
 
   // Calculate stats
@@ -741,18 +768,37 @@ export default function WorkPage() {
                                         <p className="text-xs text-slate-400 mt-0.5">Sales Order</p>
                                       </div>
                                     </div>
-                                    {so.requiresInput && so.items.length > 0 && so.items.every(item => item.status === 'completed') && (
-                                      <button
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          openSODetailsModal(so);
-                                        }}
-                                        className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 rounded text-sm flex items-center gap-1.5 ml-2"
-                                      >
-                                        <Edit className="w-3.5 h-3.5" />
-                                        Provide Input
-                                      </button>
-                                    )}
+                                    <div className="flex items-center gap-2 ml-2">
+                                      {so.status === 'ls_created' && (
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            askVehicleDetails(so.id, so.soNumber);
+                                          }}
+                                          disabled={askingVehicle.has(so.id)}
+                                          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded text-sm flex items-center gap-1.5"
+                                        >
+                                          {askingVehicle.has(so.id) ? (
+                                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                          ) : (
+                                            <Truck className="w-3.5 h-3.5" />
+                                          )}
+                                          Ask Vehicle Details
+                                        </button>
+                                      )}
+                                      {so.requiresInput && so.items.length > 0 && so.items.every(item => item.status === 'completed') && (
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            openSODetailsModal(so);
+                                          }}
+                                          className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 rounded text-sm flex items-center gap-1.5"
+                                        >
+                                          <Edit className="w-3.5 h-3.5" />
+                                          Provide Input
+                                        </button>
+                                      )}
+                                    </div>
                                   </div>
                                 </div>
 
