@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { sendPlainEmail } from '@/lib/gmail';
+import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from '@/lib/gmail';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
@@ -127,21 +127,39 @@ export async function POST(request: Request) {
       }
     }
 
-    // Send dispatch status email to branch
+    // Send dispatch status email to branch (reply in original thread if possible)
     console.log(`[VisibilityData] Step 3: Sending email to ${BRANCH_EMAIL}...`);
-    const subject = `Dispatch Status - Sales Order ${soNumber}`;
+    const subject = `Re: Dispatch Status - Sales Order ${soNumber}`;
     let messageId: string;
     let threadId: string;
     try {
-      const result = await sendPlainEmail(
-        BRANCH_EMAIL,
-        subject,
-        email_body
-      );
+      let result: { messageId: string; threadId: string };
+
+      if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
+        // Reply in the same thread as the original NEW ORDER email
+        const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
+        if (rfc822Id) {
+          console.log(`[VisibilityData] Step 3: Replying in original thread ${salesOrder.originalThreadId}`);
+          result = await sendReplyEmail(
+            BRANCH_EMAIL,
+            subject,
+            email_body,
+            salesOrder.originalThreadId,
+            rfc822Id
+          );
+        } else {
+          console.log(`[VisibilityData] Step 3: Could not get RFC822 ID, sending new email`);
+          result = await sendPlainEmail(BRANCH_EMAIL, subject, email_body);
+        }
+      } else {
+        console.log(`[VisibilityData] Step 3: No original thread info, sending new email`);
+        result = await sendPlainEmail(BRANCH_EMAIL, subject, email_body);
+      }
+
       messageId = result.messageId;
       threadId = result.threadId;
     } catch (emailErr) {
-      console.error(`[VisibilityData] Step 3 FAILED: sendPlainEmail threw:`, emailErr);
+      console.error(`[VisibilityData] Step 3 FAILED: send email threw:`, emailErr);
       return NextResponse.json(
         { error: 'Failed to send dispatch email', details: emailErr instanceof Error ? emailErr.message : String(emailErr) },
         { status: 500 }

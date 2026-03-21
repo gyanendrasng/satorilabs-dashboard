@@ -130,6 +130,8 @@ model SalesOrder {
   specialInstructions String?
   lrNumber            String?  // Lorry Receipt Number (Stage 5 - User Input)
   lrDate              DateTime? // Lorry Receipt Date (Stage 5 - User Input)
+  originalThreadId    String?  // Gmail thread ID of the original "NEW ORDER" email
+  originalMessageId   String?  // Gmail message ID of the original "NEW ORDER" email (for In-Reply-To)
   status              String   @default("pending") // pending, pending-input, in-progress, completed
   requiresInput       Boolean  @default(true)
   createdAt           DateTime @default(now())

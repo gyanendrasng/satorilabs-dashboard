@@ -127,6 +127,64 @@ export async function sendPlainEmail(
 }
 
 /**
+ * Get the RFC 822 Message-ID header from a Gmail message (needed for In-Reply-To)
+ */
+export async function getMessageRfc822Id(gmailMessageId: string): Promise<string | null> {
+  const message = await gmail.users.messages.get({
+    userId: 'me',
+    id: gmailMessageId,
+    format: 'metadata',
+    metadataHeaders: ['Message-ID'],
+  });
+  const header = message.data.payload?.headers?.find(
+    (h) => h.name?.toLowerCase() === 'message-id'
+  );
+  return header?.value || null;
+}
+
+/**
+ * Send a plain text email as a reply in an existing thread
+ */
+export async function sendReplyEmail(
+  to: string,
+  subject: string,
+  body: string,
+  threadId: string,
+  inReplyToRfc822Id: string
+): Promise<{ messageId: string; threadId: string }> {
+  const mimeMessage = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    `In-Reply-To: ${inReplyToRfc822Id}`,
+    `References: ${inReplyToRfc822Id}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    body,
+  ].join('\r\n');
+
+  const raw = Buffer.from(mimeMessage)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  const response = await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw, threadId },
+  });
+
+  if (!response.data.id || !response.data.threadId) {
+    throw new Error('Failed to send reply email: missing message or thread ID');
+  }
+
+  return {
+    messageId: response.data.id,
+    threadId: response.data.threadId,
+  };
+}
+
+/**
  * Extract HTML or text body from a Gmail message
  */
 export async function getMessageBody(messageId: string): Promise<string> {

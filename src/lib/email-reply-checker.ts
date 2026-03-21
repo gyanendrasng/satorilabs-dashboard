@@ -75,10 +75,13 @@ export async function checkForReplies(): Promise<{
       // Get all messages in the thread
       const messages = await getThreadMessages(email.gmailThreadId);
 
-      // Find reply messages (messages that are not the original)
-      const replyMessages = messages.filter(
-        (msg) => msg.id !== email.gmailMessageId
+      // Find reply messages (only messages AFTER our dispatch email in the thread)
+      const dispatchIdx = messages.findIndex(
+        (msg) => msg.id === email.gmailMessageId
       );
+      const replyMessages = dispatchIdx >= 0
+        ? messages.slice(dispatchIdx + 1)
+        : messages.filter((msg) => msg.id !== email.gmailMessageId);
 
       if (replyMessages.length === 0) {
         log(`[EmailChecker] No reply yet for SO ${soNumber} / LS ${lsNumber}`);
@@ -423,9 +426,20 @@ export async function checkForNewEmails(): Promise<{
               purchaseOrderId: purchaseOrder.id,
               soNumber,
               status: 'pending',
+              originalThreadId: msg.threadId,
+              originalMessageId: msg.id,
             },
           });
           log(`[NewEmail] Created PO ${purchaseOrder.poNumber} + SO ${soNumber} in dashboard`);
+        } else if (!salesOrder.originalThreadId) {
+          // SO already exists but missing thread info — backfill
+          await prisma.salesOrder.update({
+            where: { id: salesOrder.id },
+            data: {
+              originalThreadId: msg.threadId,
+              originalMessageId: msg.id,
+            },
+          });
         }
 
         // Save to CurrentSO so visibility-data endpoint knows which SO
