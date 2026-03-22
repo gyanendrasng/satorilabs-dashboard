@@ -103,30 +103,6 @@ export async function POST(request: Request) {
       );
     }
 
-    // Create a LoadingSlipItem to attach the Email record to
-    // (use first material as identifier, or create a placeholder)
-    let loadingSlipItem = salesOrder.items[0];
-    if (!loadingSlipItem) {
-      console.log(`[VisibilityData] Step 2b: No items on SO, creating LoadingSlipItem...`);
-      try {
-        loadingSlipItem = await prisma.loadingSlipItem.create({
-          data: {
-            salesOrderId: salesOrder.id,
-            lsNumber: `DISPATCH-${soNumber}`,
-            material: materials[0]?.material_code || 'PENDING',
-            status: 'pending',
-          },
-        });
-        console.log(`[VisibilityData] Step 2b: Created LoadingSlipItem id=${loadingSlipItem.id}`);
-      } catch (lsiErr) {
-        console.error(`[VisibilityData] Step 2b FAILED: LoadingSlipItem create threw:`, lsiErr);
-        return NextResponse.json(
-          { error: 'Failed to create LoadingSlipItem', details: lsiErr instanceof Error ? lsiErr.message : String(lsiErr) },
-          { status: 500 }
-        );
-      }
-    }
-
     // Send dispatch status email to branch (reply in original thread if possible)
     console.log(`[VisibilityData] Step 3: Sending email to ${BRANCH_EMAIL}...`);
     const subject = `Dispatch Status - Sales Order ${soNumber}`;
@@ -182,7 +158,7 @@ export async function POST(request: Request) {
     console.log(`[VisibilityData] Step 4: Creating Email record...`);
     await prisma.email.create({
       data: {
-        loadingSlipItemId: loadingSlipItem.id,
+        salesOrderId: salesOrder.id,
         gmailMessageId: messageId,
         gmailThreadId: threadId,
         recipientEmail: BRANCH_EMAIL,

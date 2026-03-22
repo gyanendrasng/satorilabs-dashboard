@@ -149,7 +149,7 @@ export async function POST(request: Request) {
         // Create Email record for tracking vehicle details reply
         await prisma.email.create({
           data: {
-            loadingSlipItemId: loadingSlipItem.id,
+            salesOrderId: salesOrder.id,
             gmailMessageId: emailResult.messageId,
             gmailThreadId: emailResult.threadId,
             recipientEmail: BRANCH_EMAIL,

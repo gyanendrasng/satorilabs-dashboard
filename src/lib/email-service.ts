@@ -13,6 +13,7 @@ interface VehicleDetails {
  */
 export async function sendLSEmail(
   loadingSlipItemId: string,
+  salesOrderId: string,
   soNumber: string,
   lsNumber: string,
   fileBuffer: Buffer,
@@ -70,6 +71,7 @@ export async function sendLSEmail(
     // Create Email record in database
     await prisma.email.create({
       data: {
+        salesOrderId,
         loadingSlipItemId,
         gmailMessageId: messageId,
         gmailThreadId: threadId,
@@ -124,6 +126,7 @@ export async function sendLSEmailsForOrder(
   for (const item of lsItems) {
     await sendLSEmail(
       item.loadingSlipItemId,
+      salesOrderId,
       salesOrder.soNumber,
       item.lsNumber,
       item.pdfBuffer,

@@ -38,11 +38,8 @@ export async function checkForReplies(): Promise<{
   const pendingEmails = await prisma.email.findMany({
     where: { status: 'sent' },
     include: {
-      loadingSlipItem: {
-        include: {
-          salesOrder: true,
-        },
-      },
+      salesOrder: true,
+      loadingSlipItem: true,
     },
   });
 
@@ -55,7 +52,7 @@ export async function checkForReplies(): Promise<{
 
   // Group by sales order for logging
   const emailsBySO = pendingEmails.reduce((acc, email) => {
-    const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+    const soNumber = email.salesOrder?.soNumber || 'unknown';
     if (!acc[soNumber]) acc[soNumber] = [];
     acc[soNumber].push(email);
     return acc;
@@ -67,8 +64,8 @@ export async function checkForReplies(): Promise<{
   }
 
   for (const email of pendingEmails) {
-    const soNumber = email.loadingSlipItem.salesOrder.soNumber;
-    const lsNumber = email.loadingSlipItem.lsNumber;
+    const soNumber = email.salesOrder?.soNumber || 'unknown';
+    const lsNumber = email.loadingSlipItem?.lsNumber || 'N/A';
 
     try {
       log(`[EmailChecker] Checking thread ${email.gmailThreadId} for SO ${soNumber} / LS ${lsNumber}`);
@@ -130,7 +127,7 @@ export async function checkForReplies(): Promise<{
       if (emailType === 'vehicle_details') {
         // Branch replied with vehicle details
         log(`[EmailChecker] Routing to handleVehicleDetailsReply for SO ${soNumber}`);
-        const vdResult = await handleVehicleDetailsReply(email.id, replyBodyHtml || '', email.loadingSlipItem.salesOrderId);
+        const vdResult = await handleVehicleDetailsReply(email.id, replyBodyHtml || '', email.salesOrderId!);
         logs.push(...vdResult.logs);
         processed++;
         continue;
@@ -146,7 +143,7 @@ export async function checkForReplies(): Promise<{
           email.id,
           replyBodyHtml,
           originalEmailHtml,
-          email.loadingSlipItem.salesOrderId
+          email.salesOrderId!
         );
         logs.push(...branchResult.logs);
       }
@@ -167,19 +164,20 @@ export async function checkForReplies(): Promise<{
         });
 
         // Check if all emails for this SO now have replies
-        const batchResult = await checkAndSendBatchToAman(email.loadingSlipItem.salesOrderId);
-        logs.push(...batchResult.logs);
+        if (email.salesOrderId) {
+          const batchResult = await checkAndSendBatchToAman(email.salesOrderId);
+          logs.push(...batchResult.logs);
+        }
         continue;
       }
 
       // Get the first PDF attachment (invoice)
       const invoicePdf = attachments[0];
-      const salesOrder = email.loadingSlipItem.salesOrder;
 
       log(`[EmailChecker] Found PDF attachment (${invoicePdf.filename}, ${invoicePdf.content.length} bytes) for SO ${soNumber} / LS ${lsNumber}`);
 
       // Store reply PDF to R2 instead of parsing immediately
-      const s3Key = `reply-pdfs/${salesOrder.soNumber}/${email.loadingSlipItem.lsNumber}.pdf`;
+      const s3Key = `reply-pdfs/${soNumber}/${lsNumber}.pdf`;
       await uploadToS3(s3Key, invoicePdf.content, 'application/pdf');
 
       log(`[EmailChecker] Uploaded PDF to R2: ${s3Key}`);
@@ -199,8 +197,10 @@ export async function checkForReplies(): Promise<{
       processed++;
 
       // Check if all emails for this SO now have replies
-      const batchResult = await checkAndSendBatchToAman(email.loadingSlipItem.salesOrderId);
-      logs.push(...batchResult.logs);
+      if (email.salesOrderId) {
+        const batchResult = await checkAndSendBatchToAman(email.salesOrderId);
+        logs.push(...batchResult.logs);
+      }
     } catch (error) {
       const errorMsg = `Error processing email ${email.id} (SO ${soNumber} / LS ${lsNumber}): ${
         error instanceof Error ? error.message : String(error)
@@ -241,16 +241,15 @@ export async function checkWorkflowTimers(): Promise<{
       waitUntil: { lte: new Date() },
     },
     include: {
-      loadingSlipItem: {
-        include: { salesOrder: true },
-      },
+      salesOrder: true,
+      loadingSlipItem: true,
     },
   });
 
   log(`[TimerCheck] Found ${timerEmails.length} emails with elapsed timers`);
 
   for (const email of timerEmails) {
-    const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+    const soNumber = email.salesOrder?.soNumber || 'unknown';
     const storedMaterials = email.relatedMaterials
       ? JSON.parse(email.relatedMaterials)
       : [];
@@ -307,6 +306,7 @@ export async function checkWorkflowTimers(): Promise<{
       // Create new Email record for the reminder
       await prisma.email.create({
         data: {
+          salesOrderId: email.salesOrderId,
           loadingSlipItemId: email.loadingSlipItemId,
           gmailMessageId: sentResult.messageId,
           gmailThreadId: sentResult.threadId,

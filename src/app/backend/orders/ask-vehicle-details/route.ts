@@ -25,23 +25,16 @@ export async function POST(request: Request) {
 
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
-      include: { items: true },
     });
 
     if (!salesOrder) {
       return NextResponse.json({ error: `Sales order not found: ${soNumber}` }, { status: 404 });
     }
 
-    // Need a LoadingSlipItem to attach the Email record to
-    const loadingSlipItem = salesOrder.items[0];
-    if (!loadingSlipItem) {
-      return NextResponse.json({ error: 'No LoadingSlipItem found for this SO' }, { status: 404 });
-    }
-
     // Check for existing vehicle_details email to prevent duplicates
     const existingEmail = await prisma.email.findFirst({
       where: {
-        loadingSlipItemId: loadingSlipItem.id,
+        salesOrderId: salesOrder.id,
         emailType: 'vehicle_details',
         status: 'sent',
       },
@@ -80,7 +73,7 @@ export async function POST(request: Request) {
 
     await prisma.email.create({
       data: {
-        loadingSlipItemId: loadingSlipItem.id,
+        salesOrderId: salesOrder.id,
         gmailMessageId: emailResult.messageId,
         gmailThreadId: emailResult.threadId,
         recipientEmail: BRANCH_EMAIL,

@@ -139,6 +139,7 @@ model SalesOrder {
 
   purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   items         LoadingSlipItem[]
+  emails        Email[]
   invoice       Invoice?
 
   @@map("sales_order")
@@ -180,7 +181,8 @@ model LoadingSlipItem {
 
 model Email {
   id                String    @id @default(cuid())
-  loadingSlipItemId String
+  salesOrderId      String?   // Direct link to SalesOrder
+  loadingSlipItemId String?   // Optional link to LoadingSlipItem (for LS-specific emails)
   gmailMessageId    String    @unique // Gmail message ID for reply tracking
   gmailThreadId     String             // Thread ID to find replies
   recipientEmail    String
@@ -198,7 +200,8 @@ model Email {
   sentBody          String?   // Plain text body of the sent email
   replyHtml         String?   // Reply body HTML (for forwarding to auto_gui2)
 
-  loadingSlipItem LoadingSlipItem @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
+  salesOrder      SalesOrder?      @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  loadingSlipItem LoadingSlipItem? @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
 
   @@map("email")
 }

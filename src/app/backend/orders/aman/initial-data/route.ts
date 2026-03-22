@@ -172,6 +172,7 @@ export async function POST(request: Request) {
         // Send email to plant
         const { messageId } = await sendLSEmail(
           loadingSlipItem.id,
+          salesOrder.id,
           salesOrder.soNumber,
           lsNumber,
           fileBuffer,

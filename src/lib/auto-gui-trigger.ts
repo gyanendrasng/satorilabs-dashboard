@@ -232,9 +232,8 @@ export async function handleBranchReply(
     const email = await prisma.email.findUnique({
       where: { id: emailId },
       include: {
-        loadingSlipItem: {
-          include: { salesOrder: true },
-        },
+        salesOrder: true,
+        loadingSlipItem: true,
       },
     });
 
@@ -243,7 +242,7 @@ export async function handleBranchReply(
       return { success: false, logs };
     }
 
-    const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+    const soNumber = email.salesOrder!.soNumber;
     log(`[BranchReply] Classifying branch reply for SO ${soNumber}`);
 
     // Call auto_gui2 /email/branch-reply
@@ -292,7 +291,7 @@ export async function handleBranchReply(
 
       // Update SO status to stock_approved
       await prisma.salesOrder.update({
-        where: { id: email.loadingSlipItem.salesOrderId },
+        where: { id: email.salesOrderId! },
         data: { status: 'stock_approved' },
       });
       log(`[BranchReply] SO ${soNumber} status updated to stock_approved`);
@@ -328,6 +327,7 @@ export async function handleBranchReply(
       // Create a new Email record for the production inquiry
       await prisma.email.create({
         data: {
+          salesOrderId: email.salesOrderId,
           loadingSlipItemId: email.loadingSlipItemId,
           gmailMessageId: sentResult.messageId,
           gmailThreadId: sentResult.threadId,
@@ -390,9 +390,8 @@ export async function handleProductionReply(
     const email = await prisma.email.findUnique({
       where: { id: emailId },
       include: {
-        loadingSlipItem: {
-          include: { salesOrder: true },
-        },
+        salesOrder: true,
+        loadingSlipItem: true,
       },
     });
 
@@ -401,7 +400,7 @@ export async function handleProductionReply(
       return { success: false, logs };
     }
 
-    const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+    const soNumber = email.salesOrder!.soNumber;
     const storedMaterials = email.relatedMaterials
       ? JSON.parse(email.relatedMaterials)
       : [];
@@ -476,9 +475,8 @@ export async function handleProductionConfirmation(
     const email = await prisma.email.findUnique({
       where: { id: emailId },
       include: {
-        loadingSlipItem: {
-          include: { salesOrder: true },
-        },
+        salesOrder: true,
+        loadingSlipItem: true,
       },
     });
 
@@ -487,7 +485,7 @@ export async function handleProductionConfirmation(
       return { success: false, logs };
     }
 
-    const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+    const soNumber = email.salesOrder!.soNumber;
     const storedMaterials = email.relatedMaterials
       ? JSON.parse(email.relatedMaterials)
       : [];
@@ -713,9 +711,8 @@ export async function handleVehicleDetailsReply(
   const email = await prisma.email.findUnique({
     where: { id: emailId },
     include: {
-      loadingSlipItem: {
-        include: { salesOrder: true },
-      },
+      salesOrder: true,
+      loadingSlipItem: true,
     },
   });
 
@@ -724,7 +721,7 @@ export async function handleVehicleDetailsReply(
     return { success: false, logs };
   }
 
-  const soNumber = email.loadingSlipItem.salesOrder.soNumber;
+  const soNumber = email.salesOrder!.soNumber;
   log(`[VehicleDetails] Extracting vehicle details from reply for SO ${soNumber}`);
 
   // Strip HTML tags for cleaner text
@@ -800,7 +797,7 @@ export async function handleVehicleDetailsReply(
       ].join('\n');
 
       try {
-        const so = email.loadingSlipItem.salesOrder;
+        const so = email.salesOrder!;
         let replyResult: { messageId: string; threadId: string };
 
         if (so.originalThreadId && so.originalMessageId) {
