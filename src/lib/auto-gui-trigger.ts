@@ -1,6 +1,7 @@
 import { prisma } from './prisma';
 import { downloadFromS3 } from './s3';
 import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from './gmail';
+import { sendLSEmail } from './email-service';
 import OpenAI from 'openai';
 import { z } from 'zod';
 
@@ -846,19 +847,33 @@ export async function handleVehicleDetailsReply(
       data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed' },
     });
 
-    // Trigger ZLOAD3-A
-    log(`[VehicleDetails] Triggering ZLOAD3-A for SO ${soNumber}`);
-    fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        instruction: `VPN is connected and SAP is logged in. Run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}.`,
-        transaction_code: 'ZLOAD3-A',
-        so_number: soNumber,
-      }),
-    })
-      .then(() => log(`[VehicleDetails] ZLOAD3-A triggered for SO ${soNumber}`))
-      .catch((err) => log(`[VehicleDetails] ZLOAD3-A trigger failed: ${err.message}`));
+    // Send stored LS PDF(s) directly to plant (skip ZLOAD3-A — file already in R2 from ZLOAD1)
+    const lsItems = await prisma.loadingSlipItem.findMany({
+      where: { salesOrderId, fileUrl: { not: null } },
+    });
+
+    if (lsItems.length === 0) {
+      log(`[VehicleDetails] No LS files found for SO ${soNumber}, skipping plant email`);
+    } else {
+      for (const item of lsItems) {
+        try {
+          const pdfBuffer = await downloadFromS3(item.fileUrl!);
+          const filename = item.fileUrl!.split('/').pop() || `${item.lsNumber}.pdf`;
+          await sendLSEmail(
+            item.id,
+            salesOrderId,
+            soNumber,
+            item.lsNumber,
+            pdfBuffer,
+            { vehicleNumber, driverMobile, containerNumber },
+            filename
+          );
+          log(`[VehicleDetails] Sent LS ${item.lsNumber} to plant for SO ${soNumber}`);
+        } catch (sendErr) {
+          log(`[VehicleDetails] Failed to send LS ${item.lsNumber} to plant: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
+        }
+      }
+    }
 
     return { success: true, logs };
   } catch (error) {
