@@ -78,6 +78,7 @@ export async function sendLSEmail(
         recipientEmail: plantEmail,
         subject,
         status: 'sent',
+        emailType: 'plant_ls',
       },
     });
 

@@ -133,9 +133,12 @@ export async function checkForReplies(): Promise<{
         continue;
       }
 
-      // Default: null or 'ls_dispatch' — this is a branch reply
-      // First, try the new workflow classification
-      if (replyBodyHtml) {
+      if (emailType === 'plant_ls') {
+        // Plant replied to LS email — only care about PDF attachment (invoice)
+        log(`[EmailChecker] Plant reply for SO ${soNumber} / LS ${lsNumber}`);
+        // Fall through to PDF extraction below (skip handleBranchReply)
+      } else if (replyBodyHtml) {
+        // Default: null or 'ls_dispatch' — this is a branch reply
         log(`[EmailChecker] Routing to handleBranchReply for SO ${soNumber} / LS ${lsNumber}`);
         // Fetch the original sent email body from Gmail
         const originalEmailHtml = await getMessageBody(email.gmailMessageId);
