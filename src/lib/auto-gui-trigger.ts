@@ -108,8 +108,8 @@ export async function checkAndSendBatchToAman(
     log(`  - Instruction: ${instruction}`);
     log(`  - Attachment: ${attachment.filename} (${pdfBuffer.length} bytes)`);
 
-    // Send to existing /chat endpoint with SINGLE PDF
-    const response = await fetch(`http://${AUTO_GUI_HOST}:8000/chat`, {
+    // Fire-and-forget: auto_gui2 will call back /backend/orders/aman/processing-data when done
+    fetch(`http://${AUTO_GUI_HOST}:8000/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -120,41 +120,15 @@ export async function checkAndSendBatchToAman(
         extraction_context:
           'Extract the loaded quantity, invoice number, and invoice date',
       }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`auto_gui2 request failed: ${response.statusText}`);
-    }
-
-    const responseData = await response.json();
-    log(`[BatchSender] auto_gui2 response for SO ${salesOrder.soNumber}: ${JSON.stringify(responseData)}`);
-
-    // Mark all emails with status 'replied' as 'processed'
-    let processedCount = 0;
-    for (const item of salesOrder.items) {
-      for (const email of item.emails) {
-        if (email.status === 'replied') {
-          await prisma.email.update({
-            where: { id: email.id },
-            data: { status: 'processed' },
-          });
-          processedCount++;
-        }
+    }).then((res) => {
+      if (!res.ok) {
+        console.error(`[BatchSender] auto_gui2 returned ${res.status} for SO ${salesOrder.soNumber}`);
       }
-    }
-    log(`[BatchSender] Marked ${processedCount} emails as 'processed' for SO ${salesOrder.soNumber}`);
-
-    // Update SalesOrder status to completed
-    await prisma.salesOrder.update({
-      where: { id: salesOrderId },
-      data: { status: 'completed' },
+    }).catch((err) => {
+      console.error(`[BatchSender] auto_gui2 unreachable for SO ${salesOrder.soNumber}: ${err instanceof Error ? err.message : String(err)}`);
     });
-    log(`[BatchSender] SO ${salesOrder.soNumber} marked as 'completed'`);
 
-    // Update purchase order stage if needed
-    await updatePurchaseOrderStage(salesOrder.purchaseOrderId);
-
-    log(`[BatchSender] Successfully processed SO ${salesOrder.soNumber} with ${salesOrder.items.length} LS items`);
+    log(`[BatchSender] Fired ZLOAD3-B1 to auto_gui2 for SO ${salesOrder.soNumber} (fire-and-forget — status updates will happen when /processing-data callback arrives)`);
     return { success: true, logs };
   } catch (error) {
     log(
@@ -169,7 +143,7 @@ export async function checkAndSendBatchToAman(
 /**
  * Update purchase order stage based on all sales orders status
  */
-async function updatePurchaseOrderStage(
+export async function updatePurchaseOrderStage(
   purchaseOrderId: string
 ): Promise<void> {
   const purchaseOrder = await prisma.purchaseOrder.findUnique({

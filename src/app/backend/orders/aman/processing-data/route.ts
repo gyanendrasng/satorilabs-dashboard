@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { updatePurchaseOrderStage } from '@/lib/auto-gui-trigger';
 
 interface SAPResultRow {
   sales_order: string;
@@ -41,10 +42,13 @@ export async function POST(request: Request) {
       );
     }
 
-    // Find the Sales Order
+    // Find the Sales Order with items and emails for status updates
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
-      include: { invoice: true },
+      include: {
+        invoice: true,
+        items: { include: { emails: true } },
+      },
     });
 
     if (!salesOrder) {
@@ -82,10 +86,39 @@ export async function POST(request: Request) {
       });
     }
 
+    // Mark all replied emails as processed
+    for (const item of salesOrder.items) {
+      for (const email of item.emails) {
+        if (email.status === 'replied') {
+          await prisma.email.update({
+            where: { id: email.id },
+            data: { status: 'processed' },
+          });
+        }
+      }
+    }
+
+    // Mark all LS items as completed
+    for (const item of salesOrder.items) {
+      await prisma.loadingSlipItem.update({
+        where: { id: item.id },
+        data: { status: 'completed' },
+      });
+    }
+
+    // Mark SO as completed
+    await prisma.salesOrder.update({
+      where: { id: salesOrder.id },
+      data: { status: 'completed' },
+    });
+
+    // Advance PO stage
+    await updatePurchaseOrderStage(salesOrder.purchaseOrderId);
+
     return NextResponse.json({
       success: true,
       so_number: soNumber,
-      message: `Invoice ${invoice.invoiceNumber} saved with ${rows.length} SAP result row(s)`,
+      message: `Invoice ${invoice.invoiceNumber} saved with ${rows.length} SAP result row(s). SO marked completed.`,
       invoice,
     });
   } catch (error) {
