@@ -71,42 +71,38 @@ export async function checkAndSendBatchToAman(
 
   log(`[BatchSender] All ${salesOrder.items.length} items have replies for SO ${salesOrder.soNumber}. Sending batch to auto_gui2...`);
 
-  // Get FIRST reply PDF only (from first item with a replied email)
-  const firstItem = salesOrder.items.find((item) =>
-    item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
-  );
-
-  if (!firstItem) {
-    log(`[BatchSender] No item with reply PDF found for SO ${salesOrder.soNumber}`);
-    return { success: false, logs };
-  }
-
-  const firstEmail = firstItem.emails.find(
-    (e) => e.status === 'replied' && e.replyPdfUrl
-  );
-
-  if (!firstEmail || !firstEmail.replyPdfUrl) {
-    log(`[BatchSender] No reply PDF URL found for SO ${salesOrder.soNumber}`);
-    return { success: false, logs };
-  }
+  // Collect ALL reply PDFs (one per LS item)
+  const attachments: Array<{ filename: string; content_base64: string }> = [];
 
   try {
-    // Download the first PDF from R2
-    log(`[BatchSender] Downloading PDF from R2: ${firstEmail.replyPdfUrl}`);
-    const pdfBuffer = await downloadFromS3(firstEmail.replyPdfUrl);
-    log(`[BatchSender] Downloaded PDF: ${pdfBuffer.length} bytes`);
-
-    const attachment = {
-      filename: `${firstItem.lsNumber}.pdf`,
-      content_base64: pdfBuffer.toString('base64'),
-    };
+    for (const item of salesOrder.items) {
+      const repliedEmail = item.emails.find(
+        (e) => e.status === 'replied' && e.replyPdfUrl
+      );
+      if (!repliedEmail || !repliedEmail.replyPdfUrl) {
+        log(`[BatchSender] Item LS ${item.lsNumber} missing replyPdfUrl despite allReplied check — aborting`);
+        return { success: false, logs };
+      }
+      log(`[BatchSender] Downloading PDF from R2 for LS ${item.lsNumber}: ${repliedEmail.replyPdfUrl}`);
+      const pdfBuffer = await downloadFromS3(repliedEmail.replyPdfUrl);
+      log(`[BatchSender] Downloaded PDF for LS ${item.lsNumber}: ${pdfBuffer.length} bytes`);
+      attachments.push({
+        filename: `${item.lsNumber}.pdf`,
+        content_base64: pdfBuffer.toString('base64'),
+      });
+    }
 
     // Build instruction
     const instruction = `VPN is connected, SAP is logged in. Just execute ZLOAD3-B1 for the sales order ${salesOrder.soNumber}`;
 
+    const totalBytes = attachments.reduce((sum, a) => sum + Buffer.from(a.content_base64, 'base64').length, 0);
     log(`[BatchSender] Sending to auto_gui2:`);
     log(`  - Instruction: ${instruction}`);
-    log(`  - Attachment: ${attachment.filename} (${pdfBuffer.length} bytes)`);
+    log(`  - Attachments: ${attachments.length} PDF(s), total ${totalBytes} bytes`);
+    for (const a of attachments) {
+      const bytes = Buffer.from(a.content_base64, 'base64').length;
+      log(`      • ${a.filename} (${bytes} bytes)`);
+    }
 
     // Fire-and-forget: auto_gui2 will call back /backend/orders/aman/processing-data when done
     fetch(`http://${AUTO_GUI_HOST}:8000/chat`, {
@@ -116,9 +112,9 @@ export async function checkAndSendBatchToAman(
         instruction,
         transaction_code: 'ZLOAD3-B1',
         so_number: salesOrder.soNumber,
-        attachments: [attachment],
+        attachments,
         extraction_context:
-          'Extract the loaded quantity, invoice number, and invoice date',
+          'For each file, extract the loaded quantity, invoice number, and invoice date',
       }),
     }).then((res) => {
       if (!res.ok) {
@@ -128,7 +124,7 @@ export async function checkAndSendBatchToAman(
       console.error(`[BatchSender] auto_gui2 unreachable for SO ${salesOrder.soNumber}: ${err instanceof Error ? err.message : String(err)}`);
     });
 
-    log(`[BatchSender] Fired ZLOAD3-B1 to auto_gui2 for SO ${salesOrder.soNumber} (fire-and-forget — status updates will happen when /processing-data callback arrives)`);
+    log(`[BatchSender] Fired ZLOAD3-B1 to auto_gui2 for SO ${salesOrder.soNumber} with ${attachments.length} attachment(s) (fire-and-forget — status updates will happen when /processing-data callback arrives)`);
     return { success: true, logs };
   } catch (error) {
     log(
