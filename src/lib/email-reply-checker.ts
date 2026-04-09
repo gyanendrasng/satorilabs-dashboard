@@ -37,10 +37,16 @@ export async function checkForReplies(): Promise<{
   // Get all emails that are still in "sent" status and not yet completed
   // by a workflow handler (handleBranchReply marks workflowState='completed'
   // after firing ZLOAD1 fire-and-forget — those should not be reprocessed).
+  // NOTE: workflowState is NULL for legacy/plant_ls emails, so we must
+  // explicitly include NULL — `{ not: 'completed' }` alone excludes NULL
+  // due to standard SQL three-valued logic.
   const pendingEmails = await prisma.email.findMany({
     where: {
       status: 'sent',
-      workflowState: { not: 'completed' },
+      OR: [
+        { workflowState: null },
+        { workflowState: { not: 'completed' } },
+      ],
     },
     include: {
       salesOrder: true,
