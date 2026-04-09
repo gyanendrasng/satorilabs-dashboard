@@ -34,9 +34,14 @@ export async function checkForReplies(): Promise<{
     logs.push(logMessage);
   };
 
-  // Get all emails that are still in "sent" status
+  // Get all emails that are still in "sent" status and not yet completed
+  // by a workflow handler (handleBranchReply marks workflowState='completed'
+  // after firing ZLOAD1 fire-and-forget — those should not be reprocessed).
   const pendingEmails = await prisma.email.findMany({
-    where: { status: 'sent' },
+    where: {
+      status: 'sent',
+      workflowState: { not: 'completed' },
+    },
     include: {
       salesOrder: true,
       loadingSlipItem: true,
@@ -149,6 +154,12 @@ export async function checkForReplies(): Promise<{
           email.salesOrderId!
         );
         logs.push(...branchResult.logs);
+
+        // Branch replies are fully owned by handleBranchReply (ZLOAD1 result
+        // arrives via the zload1-data callback). Do NOT fall through to the
+        // legacy ZLOAD3-B1 PDF/BatchSender flow.
+        processed++;
+        continue;
       }
 
       // Also continue with existing PDF flow (legacy ZLOAD3-B path)

@@ -267,8 +267,8 @@ export async function handleBranchReply(
       });
       log(`[BranchReply] SO ${soNumber} status updated to stock_approved`);
 
-      log(`[BranchReply] Triggering ZLOAD1 for ${materials.length} materials`);
-      await triggerZload1(soNumber, materials);
+      log(`[BranchReply] Firing ZLOAD1 for ${materials.length} materials (fire-and-forget)`);
+      triggerZload1(soNumber, materials);
 
       // Update email workflow state
       await prisma.email.update({
@@ -622,12 +622,13 @@ export async function triggerVto1n(
  * Trigger ZLOAD1 transaction via auto_gui2 /chat endpoint
  *
  * ZLOAD1 expects per-material: material_code, batch, quantity (pick qty)
- * It creates a loading slip and sends it back via send_data
+ * It creates a loading slip and sends it back asynchronously via the
+ * /backend/orders/aman/zload1-data callback API — so this is fire-and-forget.
  */
-async function triggerZload1(
+function triggerZload1(
   soNumber: string,
   materials: MaterialItemPayload[]
-): Promise<void> {
+): void {
   const materialsList = materials
     .map(
       (m) =>
@@ -637,27 +638,32 @@ async function triggerZload1(
 
   const instruction = `VPN is connected, SAP is logged in. Execute ZLOAD1 for sales order ${soNumber}. Materials to dispatch:\n${materialsList}`;
 
-  const response = await fetch(
-    `http://${AUTO_GUI_HOST}:8000/chat`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        instruction,
-        transaction_code: 'ZLOAD1',
-        so_number: soNumber,
-      }),
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `ZLOAD1 trigger failed: ${response.status} ${response.statusText}`
-    );
-  }
-
-  const result = await response.json();
-  console.log(`[ZLOAD1] Result for SO ${soNumber}: success=${result.success}`);
+  // Fire-and-forget: auto_gui2 will call back the zload1-data API when done
+  fetch(`http://${AUTO_GUI_HOST}:8000/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      instruction,
+      transaction_code: 'ZLOAD1',
+      so_number: soNumber,
+    }),
+  })
+    .then((res) => {
+      if (!res.ok) {
+        console.error(
+          `[ZLOAD1] auto_gui2 returned ${res.status} for SO ${soNumber}`
+        );
+      } else {
+        console.log(`[ZLOAD1] Fired for SO ${soNumber}`);
+      }
+    })
+    .catch((err) => {
+      console.error(
+        `[ZLOAD1] auto_gui2 unreachable for SO ${soNumber}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    });
 }
 
 /**
