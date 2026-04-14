@@ -114,7 +114,7 @@ export async function checkAndSendBatchToAman(
         so_number: salesOrder.soNumber,
         attachments,
         extraction_context:
-          'For each file, extract the loaded quantity, invoice number, and invoice date',
+          'For each file, extract the loading slip number, loaded quantity, invoice number, and invoice date',
       }),
     }).then((res) => {
       if (!res.ok) {
