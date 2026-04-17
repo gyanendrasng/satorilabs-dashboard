@@ -28,6 +28,9 @@ import {
   Layers,
   Bot,
   Truck,
+  ScrollText,
+  Trash2,
+  ArrowDown,
 } from 'lucide-react';
 import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, groupItemsByLsNumber } from '@/components/orders/types';
 
@@ -50,7 +53,7 @@ interface WorkSession {
 
 export default function WorkPage() {
   // Active tab state
-  const [activeTab, setActiveTab] = useState<'hierarchy' | 'chat' | 'screen'>('hierarchy');
+  const [activeTab, setActiveTab] = useState<'hierarchy' | 'chat' | 'screen' | 'logs'>('hierarchy');
 
   // Chat state
   const [chat, setChat] = useState<WorkSession | null>(null);
@@ -140,6 +143,59 @@ export default function WorkPage() {
   // VM screen state
   const [showVmScreen, setShowVmScreen] = useState(true);
   const [screenZoom, setScreenZoom] = useState(100);
+
+  // Logs state
+  interface LogEntry {
+    timestamp: string;
+    level: string;
+    message: string;
+    logger?: string;
+    receivedAt: number;
+    source: 'log' | 'status';
+    statusType?: string;
+    step?: number;
+    totalSteps?: number;
+    agent?: string;
+    details?: Record<string, unknown>;
+  }
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [logFilter, setLogFilter] = useState<string>('');
+  const [expandedDetails, setExpandedDetails] = useState<Set<number>>(new Set());
+  const logContainerRef = useRef<HTMLDivElement>(null);
+  const [connected, setConnected] = useState(false);
+
+  // SSE connection for logs
+  useEffect(() => {
+    const es = new EventSource('/backend/logs/stream');
+
+    es.onopen = () => setConnected(true);
+
+    es.onmessage = (event) => {
+      try {
+        const log: LogEntry = JSON.parse(event.data);
+        setLogs((prev) => {
+          const next = [...prev, log];
+          return next.length > 500 ? next.slice(-500) : next;
+        });
+      } catch {
+        // ignore malformed events
+      }
+    };
+
+    es.onerror = () => {
+      setConnected(false);
+    };
+
+    return () => es.close();
+  }, []);
+
+  // Auto-scroll logs
+  useEffect(() => {
+    if (autoScroll && logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [logs, autoScroll]);
 
   // HLS video ref
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -620,6 +676,18 @@ export default function WorkPage() {
               <span className="font-medium">Agent Screen</span>
               <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
             </button>
+            <button
+              onClick={() => setActiveTab('logs')}
+              className={`px-4 py-2 flex items-center gap-2 border-b-2 transition-colors ${
+                activeTab === 'logs'
+                  ? 'border-cyan-500 text-cyan-400 bg-slate-700/30'
+                  : 'border-transparent text-slate-400 hover:text-slate-300'
+              }`}
+            >
+              <ScrollText className="w-4 h-4" />
+              <span className="font-medium">Logs</span>
+              {connected && <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>}
+            </button>
           </div>
         </div>
       </div>
@@ -1034,6 +1102,178 @@ export default function WorkPage() {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {/* Logs Tab */}
+        {activeTab === 'logs' && (
+          <div
+            className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl flex flex-col"
+            style={{ height: 'calc(100vh - 200px)' }}
+          >
+            {/* Logs Header */}
+            <div className="flex items-center justify-between p-4 border-b border-slate-700">
+              <div className="flex items-center gap-3">
+                <ScrollText className="w-5 h-5 text-cyan-400" />
+                <div>
+                  <h2 className="font-semibold text-lg">Agent Logs</h2>
+                  <p className="text-xs text-slate-400">
+                    {connected ? 'Streaming from auto_gui2' : 'Disconnected'} &middot; {logs.length} entries
+                  </p>
+                </div>
+                <div className={`w-2 h-2 rounded-full ${connected ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={logFilter}
+                  onChange={(e) => setLogFilter(e.target.value)}
+                  placeholder="Filter logs..."
+                  className="px-3 py-1.5 text-sm bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none w-48"
+                />
+                <button
+                  onClick={() => setAutoScroll(!autoScroll)}
+                  className={`p-2 rounded-lg transition-colors ${
+                    autoScroll ? 'bg-cyan-600 text-white' : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+                  }`}
+                  title={autoScroll ? 'Auto-scroll ON' : 'Auto-scroll OFF'}
+                >
+                  <ArrowDown className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => setLogs([])}
+                  className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-slate-400 hover:text-red-400"
+                  title="Clear logs"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Log Entries */}
+            <div
+              ref={logContainerRef}
+              className="flex-1 overflow-y-auto p-4 font-mono text-xs leading-relaxed"
+              onScroll={() => {
+                if (!logContainerRef.current) return;
+                const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
+                const atBottom = scrollHeight - scrollTop - clientHeight < 40;
+                if (autoScroll !== atBottom) setAutoScroll(atBottom);
+              }}
+            >
+              {logs.length === 0 ? (
+                <div className="flex-1 flex items-center justify-center text-slate-500 h-full">
+                  <div className="text-center">
+                    <ScrollText className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                    <p>No logs yet</p>
+                    <p className="text-slate-600 mt-1">
+                      Set LOG_WEBHOOK_URL to {typeof window !== 'undefined' ? window.location.origin : ''}/backend/logs/ingest
+                    </p>
+                    <p className="text-slate-600">
+                      Set STATUS_WEBHOOK_URL to {typeof window !== 'undefined' ? window.location.origin : ''}/backend/logs/status
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                logs
+                  .filter((log) => {
+                    if (!logFilter) return true;
+                    const q = logFilter.toLowerCase();
+                    return (
+                      log.message.toLowerCase().includes(q) ||
+                      log.level.toLowerCase().includes(q) ||
+                      (log.logger && log.logger.toLowerCase().includes(q)) ||
+                      (log.agent && log.agent.toLowerCase().includes(q)) ||
+                      (log.statusType && log.statusType.toLowerCase().includes(q))
+                    );
+                  })
+                  .map((log, i) => {
+                    const ts = log.timestamp.split('T')[1]?.split('.')[0] || log.timestamp;
+                    const hasDetails = log.details && Object.keys(log.details).length > 0;
+                    const isExpanded = expandedDetails.has(i);
+
+                    // Status messages get special rendering
+                    if (log.source === 'status') {
+                      const typeStyles: Record<string, { bg: string; border: string; icon: string; text: string }> = {
+                        milestone: { bg: 'bg-purple-900/30', border: 'border-l-purple-500', icon: '🏁', text: 'text-purple-300' },
+                        success:   { bg: 'bg-emerald-900/30', border: 'border-l-emerald-500', icon: '✓', text: 'text-emerald-300' },
+                        error:     { bg: 'bg-red-900/30', border: 'border-l-red-500', icon: '✗', text: 'text-red-300' },
+                        action:    { bg: 'bg-blue-900/20', border: 'border-l-blue-500', icon: '▶', text: 'text-blue-300' },
+                        waiting:   { bg: 'bg-yellow-900/20', border: 'border-l-yellow-500', icon: '⏳', text: 'text-yellow-300' },
+                        info:      { bg: 'bg-slate-800/50', border: 'border-l-cyan-500', icon: 'ℹ', text: 'text-cyan-300' },
+                      };
+                      const style = typeStyles[log.statusType || 'info'] || typeStyles.info;
+
+                      return (
+                        <div key={`${log.receivedAt}-${i}`} className={`${style.bg} border-l-2 ${style.border} rounded-r px-3 py-1.5 mb-1`}>
+                          <div className="flex items-center gap-2">
+                            <span className="text-slate-600 flex-shrink-0 text-xs">{ts}</span>
+                            <span className="flex-shrink-0 w-5 text-center">{style.icon}</span>
+                            {log.agent && (
+                              <span className="text-purple-400 flex-shrink-0 text-xs px-1.5 py-0.5 bg-purple-900/40 rounded">{log.agent}</span>
+                            )}
+                            <span className={`${style.text} flex-1`}>{log.message}</span>
+                            {log.step != null && log.totalSteps != null && (
+                              <span className="text-slate-500 flex-shrink-0 text-xs">
+                                {log.step}/{log.totalSteps}
+                              </span>
+                            )}
+                            {hasDetails && (
+                              <button
+                                onClick={() => {
+                                  setExpandedDetails((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(i)) next.delete(i);
+                                    else next.add(i);
+                                    return next;
+                                  });
+                                }}
+                                className="text-slate-500 hover:text-slate-300 flex-shrink-0 text-xs px-1"
+                              >
+                                {isExpanded ? '▾ JSON' : '▸ JSON'}
+                              </button>
+                            )}
+                          </div>
+                          {log.step != null && log.totalSteps != null && (
+                            <div className="mt-1 h-1 bg-slate-700 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-cyan-500 rounded-full transition-all"
+                                style={{ width: `${(log.step / log.totalSteps) * 100}%` }}
+                              />
+                            </div>
+                          )}
+                          {isExpanded && hasDetails && (
+                            <pre className="mt-2 text-xs text-slate-400 bg-slate-900/60 rounded p-2 overflow-x-auto">
+                              {JSON.stringify(log.details, null, 2)}
+                            </pre>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    // Regular debug log rendering
+                    const levelColor: Record<string, string> = {
+                      DEBUG: 'text-slate-500',
+                      INFO: 'text-cyan-400',
+                      WARNING: 'text-yellow-400',
+                      ERROR: 'text-red-400',
+                      CRITICAL: 'text-red-500 font-bold',
+                    };
+                    const color = levelColor[log.level] || 'text-slate-300';
+
+                    return (
+                      <div key={`${log.receivedAt}-${i}`} className="flex gap-3 hover:bg-slate-700/30 px-2 py-0.5 rounded">
+                        <span className="text-slate-600 flex-shrink-0">{ts}</span>
+                        <span className={`flex-shrink-0 w-16 text-right ${color}`}>{log.level}</span>
+                        {log.logger && (
+                          <span className="text-purple-400 flex-shrink-0 max-w-32 truncate">{log.logger}</span>
+                        )}
+                        <span className="text-slate-300 break-all">{log.message}</span>
+                      </div>
+                    );
+                  })
+              )}
+            </div>
           </div>
         )}
       </div>
