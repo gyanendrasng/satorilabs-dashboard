@@ -6,6 +6,12 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
 
+    const stepInfo = body.step && body.total_steps ? ` [${body.step}/${body.total_steps}]` : '';
+    const agentInfo = body.agent ? ` (${body.agent})` : '';
+    console.log(
+      `\x1b[92m[StatusIngest]\x1b[0m ${body.type || 'unknown'}${stepInfo}${agentInfo} | ${body.message || '<empty>'}`
+    );
+
     // Map status type to log level for unified display
     const levelMap: Record<string, string> = {
       info: 'INFO',
@@ -30,7 +36,8 @@ export async function POST(request: Request) {
     });
 
     return NextResponse.json({ ok: true });
-  } catch {
+  } catch (err) {
+    console.error(`\x1b[91m[StatusIngest]\x1b[0m Failed to parse payload:`, err);
     return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
   }
 }

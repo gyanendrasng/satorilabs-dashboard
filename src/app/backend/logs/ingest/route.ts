@@ -6,6 +6,10 @@ export async function POST(request: Request) {
   try {
     const body = await request.json();
 
+    console.log(
+      `\x1b[94m[LogIngest]\x1b[0m ${body.level || 'INFO'} | ${body.logger || 'unknown'} | ${body.message || '<empty>'}`
+    );
+
     logStore.push({
       timestamp: body.timestamp || new Date().toISOString(),
       level: body.level || 'INFO',
@@ -16,7 +20,8 @@ export async function POST(request: Request) {
     });
 
     return NextResponse.json({ ok: true });
-  } catch {
+  } catch (err) {
+    console.error(`\x1b[91m[LogIngest]\x1b[0m Failed to parse payload:`, err);
     return NextResponse.json({ error: 'Invalid payload' }, { status: 400 });
   }
 }
