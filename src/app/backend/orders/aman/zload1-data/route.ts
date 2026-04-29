@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { computeBundlesForPo, isPoZload1Complete } from '@/lib/bundler';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { sendReplyEmail, sendPlainEmail, getMessageRfc822Id } from '@/lib/gmail';
@@ -64,7 +65,7 @@ export async function POST(request: Request) {
     // Find the sales order
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
-      select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true },
+      select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true, purchaseOrderId: true },
     });
 
     if (!salesOrder) {
@@ -113,6 +114,23 @@ export async function POST(request: Request) {
       where: { id: salesOrder.id },
       data: { status: 'ls_created' },
     });
+
+    // Bundle gate: once every SO in the PO has at least one LSI with a
+    // fileUrl, recompute capacity-based bundles for the whole PO. Idempotent.
+    try {
+      const poComplete = await isPoZload1Complete(salesOrder.purchaseOrderId);
+      if (poComplete) {
+        const result = await computeBundlesForPo(salesOrder.purchaseOrderId);
+        console.log(
+          `[ZLOAD1 Data] Computed ${result.bundleCount} bundle(s) for PO ${salesOrder.purchaseOrderId}: ${result.totalKg.toFixed(0)} kg / ${result.capacityKg} kg cap`
+        );
+      }
+    } catch (bundleErr) {
+      console.error(
+        `[ZLOAD1 Data] Bundle computation failed for PO ${salesOrder.purchaseOrderId}:`,
+        bundleErr
+      );
+    }
 
     // Send email asking for vehicle details (reply in original thread).
     // Only one email per SO — multiple LS files arrive in separate requests,

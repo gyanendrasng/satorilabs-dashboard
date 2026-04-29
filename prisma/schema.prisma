@@ -114,8 +114,29 @@ model PurchaseOrder {
   salesOrders SalesOrder[]
   emails      Email[]
   customer    Customer? @relation(fields: [customerId], references: [id])
+  bundles     Bundle[]
 
   @@map("purchase_order")
+}
+
+// One Bundle = one truck/vehicle worth of LoadingSlipItems. Computed from
+// LoadingSlipItem.fileUrl-bearing rows in the PO via greedy first-fit
+// packing against Customer.weightage (kg). A Bundle can contain LSIs from
+// multiple SalesOrders within the same PO (per the bundling diagram).
+model Bundle {
+  id              String   @id @default(cuid())
+  purchaseOrderId String
+  bundleNumber    Int      // 1-based within the PO (B1, B2, …)
+  totalWeightKg   Decimal  @default(0)
+  status          String   @default("planned") // planned, invoiced, dispatched
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  items         LoadingSlipItem[]
+
+  @@unique([purchaseOrderId, bundleNumber])
+  @@map("bundle")
 }
 
 // Customer record keyed by the externally-provided customer_id from the
@@ -220,11 +241,12 @@ model Material {
 }
 
 model LoadingSlipItem {
-  id           String @id @default(cuid())
+  id           String  @id @default(cuid())
   salesOrderId String
+  bundleId     String?
   lsNumber     String
   material     String
-  status       String @default("pending") // pending, in-progress, completed
+  status       String  @default("pending") // pending, in-progress, completed
 
   // Aman fields (read-only, populated via API later)
   materialDescription String?
@@ -248,6 +270,7 @@ model LoadingSlipItem {
 
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   emails     Email[]
+  bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
 
   @@unique([lsNumber, material])
   @@map("loading_slip_item")
