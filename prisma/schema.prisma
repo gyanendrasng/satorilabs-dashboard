@@ -157,6 +157,9 @@ model SalesOrder {
   // JSON release plan computed after branch reply intent (release_all / release_part):
   // [{material_code, batch, quantity, weight_kg}]. Held until weight gate clears.
   releasePlan         String?
+  // For 'wait' branch reply intents: re-fire ZSO-VISIBILITY when this passes.
+  waitUntil           DateTime?
+  waitRechecks        Int       @default(0)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 

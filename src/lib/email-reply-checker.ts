@@ -578,6 +578,65 @@ export async function checkForNewEmails(): Promise<{
 }
 
 /**
+ * SOs whose branch reply intent was 'wait' get a `waitUntil` date set on them.
+ * Once that elapses, re-fire ZSO-VISIBILITY to refresh stock data. Caps at
+ * MAX_WAIT_RECHECKS (default 3) to avoid infinite loops if stock never returns.
+ */
+export async function checkWaitRechecks(): Promise<{
+  rechecked: number;
+  errors: string[];
+  logs: string[];
+}> {
+  const errors: string[] = [];
+  const logs: string[] = [];
+  let rechecked = 0;
+
+  const log = (m: string) => {
+    const t = `[${new Date().toISOString()}] ${m}`;
+    console.log(t);
+    logs.push(t);
+  };
+
+  const maxRechecks = parseInt(process.env.MAX_WAIT_RECHECKS || '3', 10);
+
+  const due = await prisma.salesOrder.findMany({
+    where: {
+      waitUntil: { lte: new Date() },
+    },
+    orderBy: { waitUntil: 'asc' },
+  });
+
+  if (due.length === 0) return { rechecked: 0, errors: [], logs };
+  log(`[WaitRecheck] ${due.length} SO(s) due for recheck`);
+
+  for (const so of due) {
+    try {
+      if (so.waitRechecks >= maxRechecks) {
+        log(`[WaitRecheck] SO ${so.soNumber} exhausted ${maxRechecks} rechecks — clearing waitUntil`);
+        await prisma.salesOrder.update({
+          where: { id: so.id },
+          data: { waitUntil: null },
+        });
+        continue;
+      }
+      await prisma.salesOrder.update({
+        where: { id: so.id },
+        data: { waitUntil: null, visibilityState: 'queued' },
+      });
+      await triggerZsoVisibility(so.soNumber);
+      rechecked++;
+      log(`[WaitRecheck] Re-fired ZSO-VISIBILITY for SO ${so.soNumber} (recheck ${so.waitRechecks + 1}/${maxRechecks})`);
+    } catch (err) {
+      const errMsg = `Wait-recheck error for SO ${so.soNumber}: ${err instanceof Error ? err.message : String(err)}`;
+      log(`[WaitRecheck] ${errMsg}`);
+      errors.push(errMsg);
+    }
+  }
+
+  return { rechecked, errors, logs };
+}
+
+/**
  * Recover the multi-SO serial pipeline when an SO is stuck in `visibilityState='firing'`
  * past the stale threshold (e.g. auto_gui2 crashed before it could call /visibility-data).
  *

@@ -335,48 +335,21 @@ async function classifyAndPlanForSo(args: {
   }
 
   if (result.intent === 'wait') {
-    if (!PRODUCTION_EMAIL) {
-      log(`[BranchReply] PRODUCTION_EMAIL not configured, cannot send inquiry for SO ${soNumber}`);
-      return { success: false, intent: 'wait' };
-    }
-    const emailPayload = result.email_payload;
-    if (!emailPayload) {
-      log(`[BranchReply] SO ${soNumber}: 'wait' result has no email_payload`);
-      return { success: false, intent: 'wait' };
-    }
+    // Simplified flow: branch wants us to wait a few days and re-check
+    // stock availability. No production team contact — just schedule a
+    // recheck. The cron will re-fire ZSO-VISIBILITY when waitUntil elapses.
+    const waitDays = parseInt(process.env.WAIT_RECHECK_DAYS || '3', 10);
+    const waitUntil = new Date(Date.now() + waitDays * 86400000);
 
-    log(`[BranchReply] Sending production inquiry for SO ${soNumber} to ${PRODUCTION_EMAIL}`);
-    const sentResult = await sendPlainEmail(
-      PRODUCTION_EMAIL,
-      emailPayload.subject,
-      emailPayload.body
-    );
-
-    const storedMaterials = await prisma.material.findMany({
-      where: { salesOrderId },
-    });
-    const missingCodes: string[] = result.missing_materials || [];
-    const filteredStored = storedMaterials.filter((m) =>
-      missingCodes.some((c) => c === m.material || c.includes(m.material))
-    );
-    const carryForward = filteredStored.length > 0 ? filteredStored : storedMaterials;
-
-    await prisma.email.create({
+    await prisma.salesOrder.update({
+      where: { id: salesOrderId },
       data: {
-        salesOrderId,
-        loadingSlipItemId: parentLoadingSlipItemId,
-        gmailMessageId: sentResult.messageId,
-        gmailThreadId: sentResult.threadId,
-        recipientEmail: PRODUCTION_EMAIL,
-        subject: emailPayload.subject,
-        status: 'sent',
-        emailType: 'production_inquiry',
-        workflowState: 'awaiting_production_reply',
-        relatedMaterials: JSON.stringify(carryForward),
+        waitUntil,
+        waitRechecks: { increment: 1 },
       },
     });
 
-    log(`[BranchReply] Production inquiry sent for SO ${soNumber}, messageId=${sentResult.messageId}`);
+    log(`[BranchReply] SO ${soNumber} 'wait' → recheck scheduled at ${waitUntil.toISOString()} (${waitDays} day${waitDays === 1 ? '' : 's'})`);
     return { success: true, intent: 'wait' };
   }
 
