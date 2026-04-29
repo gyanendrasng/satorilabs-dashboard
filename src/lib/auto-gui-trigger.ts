@@ -1645,12 +1645,30 @@ export async function handleVehicleDetailsReply(
   // Strip HTML tags for cleaner text
   const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-  // Extract fields using OpenAI
-  const VehicleDetailsSchema = z.object({
-    vehicleNumber: z.string().describe('Vehicle registration number, e.g. GJ12AB1234'),
-    driverMobile: z.string().describe('Driver mobile phone number, e.g. 9876543210'),
-    containerNumber: z.string().describe('Container/shipment number'),
+  // Branch may reply with vehicle details for ONE bundle or for MULTIPLE
+  // bundles in the same email (e.g. when the PO needs 2 trucks). Extract an
+  // ARRAY of {bundleNumber?, vehicleNumber, driverMobile, containerNumber}.
+  const VehicleSetSchema = z.object({
+    bundleNumber: z.number().int().nullable().optional(),
+    vehicleNumber: z.string(),
+    driverMobile: z.string(),
+    containerNumber: z.string(),
   });
+  const ExtractionSchema = z.object({
+    vehicles: z.array(VehicleSetSchema).min(1).max(10),
+  });
+
+  // Build the bundle context for the LLM so it can disambiguate multi-truck replies.
+  const poBundles = email.purchaseOrderId
+    ? await prisma.bundle.findMany({
+        where: { purchaseOrderId: email.purchaseOrderId },
+        select: { id: true, bundleNumber: true, totalWeightKg: true },
+        orderBy: { bundleNumber: 'asc' },
+      })
+    : [];
+  const bundleContext = poBundles.length > 0
+    ? `\nBundles in this PO (truck IDs): ${poBundles.map((b) => `Bundle ${b.bundleNumber}`).join(', ')}.\n`
+    : '';
 
   try {
     const openai = new OpenAI();
@@ -1661,27 +1679,28 @@ export async function handleVehicleDetailsReply(
       messages: [
         {
           role: 'system',
-          content: 'You extract vehicle/transport details from email replies. Return a JSON object with vehicleNumber, driverMobile, and containerNumber. If a field is not mentioned or unclear, set it to an empty string "".',
+          content:
+            'You extract vehicle/transport details from email replies. The reply may cover ONE truck or MULTIPLE trucks (when the dispatch is split into bundles). Return strict JSON of the form {"vehicles": [{"bundleNumber": <int or null>, "vehicleNumber": "<reg no>", "driverMobile": "<10-digit>", "containerNumber": "<container>"}, ...]}. ' +
+            'For each vehicle/truck mentioned, output one entry. ' +
+            'If the reply explicitly references "Bundle 1", "Bundle 2", "truck 1", "vehicle 1" etc., set bundleNumber to that integer. ' +
+            'If only one set of details is given without a bundle reference, set bundleNumber=null. ' +
+            'If a field is not mentioned, set it to an empty string "".',
         },
         {
           role: 'user',
-          content: `Extract vehicle details from this email reply:\n\n${replyText}`,
+          content: `Extract vehicle details from this email reply.${bundleContext}\n\n${replyText}`,
         },
       ],
     });
 
     const rawJson = completion.choices[0]?.message?.content;
-    let vehicleNumber = '';
-    let driverMobile = '';
-    let containerNumber = '';
+    let extractedSets: Array<{ bundleNumber?: number | null; vehicleNumber: string; driverMobile: string; containerNumber: string }> = [];
 
     if (rawJson) {
       try {
-        const parsed = VehicleDetailsSchema.safeParse(JSON.parse(rawJson));
+        const parsed = ExtractionSchema.safeParse(JSON.parse(rawJson));
         if (parsed.success) {
-          vehicleNumber = parsed.data.vehicleNumber;
-          driverMobile = parsed.data.driverMobile;
-          containerNumber = parsed.data.containerNumber;
+          extractedSets = parsed.data.vehicles;
         } else {
           log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
         }
@@ -1691,33 +1710,95 @@ export async function handleVehicleDetailsReply(
     } else {
       log(`[VehicleDetails] OpenAI returned empty response`);
     }
-    log(`[VehicleDetails] Extracted: vehicle=${vehicleNumber}, driver=${driverMobile}, container=${containerNumber}`);
+    log(`[VehicleDetails] Extracted ${extractedSets.length} vehicle set(s) for PO ${email.purchaseOrderId ?? '(legacy)'}`);
 
-    // Check if all fields are present
-    if (!vehicleNumber || !driverMobile || !containerNumber) {
-      log(`[VehicleDetails] Missing fields, asking for complete details`);
+    // Apply each extracted set: resolve which Bundle it belongs to, save
+    // when complete, follow up if missing fields.
+    type Saved = { bundleId: string; bundleNumber: number };
+    const saved: Saved[] = [];
+    const incomplete: Array<{ label: string; missing: string[] }> = [];
 
-      // Reply asking for complete details
-      const missingFields: string[] = [];
-      if (!vehicleNumber) missingFields.push('Vehicle Number');
-      if (!driverMobile) missingFields.push('Driver Mobile Number');
-      if (!containerNumber) missingFields.push('Container Number');
+    for (let i = 0; i < extractedSets.length; i++) {
+      const v = extractedSets[i];
+      // Resolve target bundle.
+      let targetBundleId: string | null = null;
+      let targetBundleNumber: number | null = null;
+      if (v.bundleNumber != null && email.purchaseOrderId) {
+        const match = poBundles.find((b) => b.bundleNumber === v.bundleNumber);
+        if (match) {
+          targetBundleId = match.id;
+          targetBundleNumber = match.bundleNumber;
+        }
+      }
+      // Fallback 1: PO has only one bundle → use it.
+      if (!targetBundleId && poBundles.length === 1) {
+        targetBundleId = poBundles[0].id;
+        targetBundleNumber = poBundles[0].bundleNumber;
+      }
+      // Fallback 2: this email was scoped to a bundle and there's only one set.
+      if (!targetBundleId && email.bundleId && extractedSets.length === 1) {
+        targetBundleId = email.bundleId;
+        const found = poBundles.find((b) => b.id === email.bundleId);
+        targetBundleNumber = found?.bundleNumber ?? null;
+      }
 
+      const label = targetBundleNumber ? `Bundle ${targetBundleNumber}` : `set #${i + 1}`;
+      const missing: string[] = [];
+      if (!v.vehicleNumber) missing.push('Vehicle Number');
+      if (!v.driverMobile) missing.push('Driver Mobile Number');
+      if (!v.containerNumber) missing.push('Container Number');
+
+      if (missing.length > 0) {
+        incomplete.push({ label, missing });
+        log(`[VehicleDetails] ${label}: incomplete — missing ${missing.join(', ')}`);
+        continue;
+      }
+
+      if (targetBundleId) {
+        await prisma.bundle.update({
+          where: { id: targetBundleId },
+          data: {
+            vehicleNumber: v.vehicleNumber,
+            driverMobile: v.driverMobile,
+            containerNumber: v.containerNumber,
+          },
+        });
+        saved.push({ bundleId: targetBundleId, bundleNumber: targetBundleNumber ?? -1 });
+        log(`[VehicleDetails] Saved on ${label}: vehicle=${v.vehicleNumber}, driver=${v.driverMobile}, container=${v.containerNumber}`);
+      } else if (!email.bundleId) {
+        // Legacy per-SO path (no bundle context at all).
+        await prisma.salesOrder.update({
+          where: { id: salesOrderId },
+          data: {
+            vehicleNumber: v.vehicleNumber,
+            driverMobile: v.driverMobile,
+            containerNumber: v.containerNumber,
+          },
+        });
+        log(`[VehicleDetails] Saved vehicle details to SO ${soNumber} (legacy per-SO path)`);
+      } else {
+        log(`[VehicleDetails] Could not resolve a bundle for ${label}; skipping (operator review)`);
+      }
+    }
+
+    // If any set was incomplete, send a single follow-up email naming each.
+    if (incomplete.length > 0) {
+      const lines = incomplete.map((i) => `  - ${i.label}: missing ${i.missing.join(', ')}`);
       const replyBody = [
-        `Thank you for your reply regarding Sales Order ${soNumber}.`,
+        `Thank you for your reply.`,
         '',
-        `The following details are still missing: ${missingFields.join(', ')}`,
+        `The following vehicle detail(s) are still incomplete:`,
+        ...lines,
         '',
-        'Please reply with the complete details:',
-        '1. Vehicle Number (e.g., GJ12AB1234)',
-        '2. Driver Mobile Number (e.g., 9876543210)',
-        '3. Container Number',
+        'Please reply with the complete details for each truck:',
+        '  1. Vehicle Number (e.g., GJ12AB1234)',
+        '  2. Driver Mobile Number (e.g., 9876543210)',
+        '  3. Container Number',
       ].join('\n');
 
       try {
         const so = email.salesOrder!;
         let replyResult: { messageId: string; threadId: string };
-
         if (so.originalThreadId && so.originalMessageId) {
           try {
             const rfc822Id = await getMessageRfc822Id(so.originalMessageId);
@@ -1732,8 +1813,6 @@ export async function handleVehicleDetailsReply(
         } else {
           replyResult = await sendPlainEmail(BRANCH_EMAIL, `Vehicle Details Required - SO ${soNumber}`, replyBody);
         }
-
-        // Update email record to track the new message (keep status 'sent' for continued polling)
         await prisma.email.update({
           where: { id: emailId },
           data: {
@@ -1742,48 +1821,45 @@ export async function handleVehicleDetailsReply(
             status: 'sent',
           },
         });
-
-        log(`[VehicleDetails] Sent follow-up asking for missing fields: ${missingFields.join(', ')}`);
+        log(`[VehicleDetails] Sent follow-up for ${incomplete.length} incomplete bundle(s)`);
       } catch (sendErr) {
         log(`[VehicleDetails] Failed to send follow-up: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
       }
 
-      return { success: true, logs };
-    }
-
-    // All fields present.
-    // If this email was sent for a specific Bundle (per-truck), save vehicle
-    // details on that Bundle (PO-level grouping, can span multiple SOs).
-    // Otherwise fall back to the legacy per-SO save path.
-    if (email.bundleId) {
-      await prisma.bundle.update({
-        where: { id: email.bundleId },
-        data: { vehicleNumber, driverMobile, containerNumber },
-      });
-      log(`[VehicleDetails] Saved vehicle details on Bundle ${email.bundleId} (truck-level)`);
+      // If NOTHING was saved, leave the email open and return.
+      if (saved.length === 0) return { success: true, logs };
     } else {
-      await prisma.salesOrder.update({
-        where: { id: salesOrderId },
-        data: { vehicleNumber, driverMobile, containerNumber },
+      // Everything saved cleanly — close the email.
+      await prisma.email.update({
+        where: { id: emailId },
+        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed' },
       });
-      log(`[VehicleDetails] Saved vehicle details to SO ${soNumber} (legacy per-SO path)`);
     }
 
-    // Mark email as completed
-    await prisma.email.update({
-      where: { id: emailId },
-      data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed' },
-    });
-
-    // Send stored LS PDF(s) directly to plant (skip ZLOAD3-A — file already in R2 from ZLOAD1).
-    // For bundle emails: send only the LSIs in THIS bundle. For legacy: per-SO.
-    const lsItems = email.bundleId
+    // Send LS PDFs to plant for every bundle that just got complete details.
+    // Each saved bundle's LSIs go out with that bundle's vehicle info.
+    const completedBundleIds = saved.map((s) => s.bundleId);
+    const lsItems = completedBundleIds.length > 0
       ? await prisma.loadingSlipItem.findMany({
-          where: { bundleId: email.bundleId, fileUrl: { not: null } },
+          where: { bundleId: { in: completedBundleIds }, fileUrl: { not: null } },
+          include: {
+            bundle: {
+              select: { id: true, vehicleNumber: true, driverMobile: true, containerNumber: true },
+            },
+          },
         })
-      : await prisma.loadingSlipItem.findMany({
-          where: { salesOrderId, fileUrl: { not: null } },
-        });
+      : email.bundleId
+        ? await prisma.loadingSlipItem.findMany({
+            where: { bundleId: email.bundleId, fileUrl: { not: null } },
+            include: {
+              bundle: {
+                select: { id: true, vehicleNumber: true, driverMobile: true, containerNumber: true },
+              },
+            },
+          })
+        : (await prisma.loadingSlipItem.findMany({
+            where: { salesOrderId, fileUrl: { not: null } },
+          })).map((it) => ({ ...it, bundle: null as null | { id: string; vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } }));
 
     if (lsItems.length === 0) {
       log(`[VehicleDetails] No LS files found, skipping plant email`);
@@ -1799,16 +1875,37 @@ export async function handleVehicleDetailsReply(
             select: { soNumber: true },
           });
           const itemSoNumber = itemSo?.soNumber ?? soNumber;
+          // Use the LSI's own bundle vehicle details when available; for the
+          // legacy non-bundle path, fall back to the SalesOrder fields.
+          const itemBundle = (item as { bundle?: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } | null }).bundle;
+          let vehicleForEmail: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null };
+          if (itemBundle) {
+            vehicleForEmail = {
+              vehicleNumber: itemBundle.vehicleNumber,
+              driverMobile: itemBundle.driverMobile,
+              containerNumber: itemBundle.containerNumber,
+            };
+          } else {
+            const soRow = await prisma.salesOrder.findUnique({
+              where: { id: item.salesOrderId },
+              select: { vehicleNumber: true, driverMobile: true, containerNumber: true },
+            });
+            vehicleForEmail = {
+              vehicleNumber: soRow?.vehicleNumber ?? null,
+              driverMobile: soRow?.driverMobile ?? null,
+              containerNumber: soRow?.containerNumber ?? null,
+            };
+          }
           await sendLSEmail(
             item.id,
             item.salesOrderId,
             itemSoNumber,
             item.lsNumber,
             pdfBuffer,
-            { vehicleNumber, driverMobile, containerNumber },
+            vehicleForEmail,
             filename
           );
-          log(`[VehicleDetails] Sent LS ${item.lsNumber} to plant for SO ${itemSoNumber}`);
+          log(`[VehicleDetails] Sent LS ${item.lsNumber} to plant for SO ${itemSoNumber} (vehicle ${vehicleForEmail.vehicleNumber ?? 'n/a'})`);
         } catch (sendErr) {
           log(`[VehicleDetails] Failed to send LS ${item.lsNumber} to plant: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
         }
