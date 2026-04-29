@@ -53,16 +53,26 @@ export interface SalesOrder {
   lrDate: string | null; // Lorry Receipt Date
   status: string;
   requiresInput: boolean;
+  visibilityState: string | null; // null | 'queued' | 'firing' | 'received' | 'failed'
+  visibilityRetries: number;
   createdAt: string;
   updatedAt: string;
   items: LoadingSlipItem[];
   invoice: Invoice | null;
 }
 
+export interface Customer {
+  id: string;
+  name: string;
+  weightage: string; // tonnes; serialized as string by Prisma Decimal
+}
+
 export interface PurchaseOrder {
   id: string;
   poNumber: string;
   customerName: string;
+  customerId: string | null;
+  customer: Customer | null;
   status: string;
   stage: number;
   createdAt: string;

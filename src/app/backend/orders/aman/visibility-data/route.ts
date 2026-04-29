@@ -1,33 +1,40 @@
 import { NextResponse } from 'next/server';
+import { randomUUID } from 'node:crypto';
 import { prisma } from '@/lib/prisma';
-import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from '@/lib/gmail';
+import { assembleAndSendCombinedEmail } from '@/lib/auto-gui-trigger';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
 interface VisibilityMaterial {
-  material_code: string;
-  batch_number: string;
+  material: string;
+  material_description?: string | null;
+  batch: string;
   order_quantity: number;
+  available_stock_for_so?: number | null;
+  order_weight_kg?: number | null;
+  // Legacy fallback fields (older auto_gui2 versions)
+  material_code?: string;
+  batch_number?: string;
 }
 
 interface VisibilityPayload {
   so_number?: string;
   soNumber?: string;
-  email_body: string;
+  email_body?: string; // legacy; no longer required — dashboard composes the HTML itself
   materials: VisibilityMaterial[];
 }
 
 /**
  * POST /backend/orders/aman/visibility-data
  *
- * Receives ZSO-VISIBILITY response from Aman (auto_gui2) as application/json.
- * JSON body must contain `email_body` (string), `materials` (array),
- * and optionally `so_number` or `soNumber`. Falls back to CurrentSO singleton.
+ * Receives ZSO-VISIBILITY response from Aman (auto_gui2). Multi-SO pipeline:
  *
- * 1. Reads SO number from payload or CurrentSO singleton
- * 2. Sends email_body to BRANCH_EMAIL
- * 3. Stores materials (with batch + quantity) on the Email record for later use in ZLOAD1
- * 4. Creates Email record with emailType='ls_dispatch' for tracking branch reply
+ *   1. Mark this SO's `visibilityState='received'`.
+ *   2. Buffer per-SO email_body + materials onto a `ls_dispatch_buffered` Email row.
+ *   3. If another sibling SO in the same PO is still `visibilityState='queued'`,
+ *      flip it to 'firing' and fire its ZSO-VISIBILITY (serial pipeline).
+ *   4. Else (this was the last SO), call assembleAndSendCombinedEmail()
+ *      to send ONE combined email to the branch with sections per SO.
  */
 export async function POST(request: Request) {
   try {
@@ -47,16 +54,8 @@ export async function POST(request: Request) {
 
     console.log(`[VisibilityData] Parsed payload keys:`, Object.keys(body));
     console.log(`[VisibilityData] so_number=${body.so_number}, soNumber=${body.soNumber}, materials=${body.materials?.length}, email_body length=${body.email_body?.length}`);
-    console.log(`[VisibilityData] Full body contents:`, rawText);
 
     const { email_body, materials } = body;
-
-    if (!email_body) {
-      return NextResponse.json(
-        { error: 'email_body is required' },
-        { status: 400 }
-      );
-    }
 
     if (!materials || !Array.isArray(materials) || materials.length === 0) {
       return NextResponse.json(
@@ -67,7 +66,6 @@ export async function POST(request: Request) {
 
     // SO lookup priority: so_number → soNumber → CurrentSO singleton
     let soNumber = body.so_number || body.soNumber;
-    console.log(`[VisibilityData] Step 1: SO number from body="${soNumber}"`);
     if (!soNumber) {
       const currentSO = await prisma.currentSO.findFirst();
       if (!currentSO) {
@@ -77,24 +75,22 @@ export async function POST(request: Request) {
         );
       }
       soNumber = currentSO.soNumber;
-      console.log(`[VisibilityData] Step 1: Fell back to CurrentSO="${soNumber}"`);
+      console.log(`[VisibilityData] Fell back to CurrentSO="${soNumber}"`);
     }
 
-    // Find the sales order
-    console.log(`[VisibilityData] Step 2: Looking up SO ${soNumber} in DB...`);
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
-      include: { items: true },
+      include: { purchaseOrder: true },
     });
 
     if (!salesOrder) {
-      console.error(`[VisibilityData] Step 2 FAILED: SO ${soNumber} not found in DB`);
+      console.error(`[VisibilityData] SO ${soNumber} not found in DB`);
       return NextResponse.json(
         { error: `Sales order not found: ${soNumber}` },
         { status: 404 }
       );
     }
-    console.log(`[VisibilityData] Step 2: Found SO ${soNumber} (id=${salesOrder.id}, items=${salesOrder.items.length})`);
+    console.log(`[VisibilityData] Found SO ${soNumber} (id=${salesOrder.id}, PO=${salesOrder.purchaseOrder.poNumber})`);
 
     if (!BRANCH_EMAIL) {
       return NextResponse.json(
@@ -103,85 +99,101 @@ export async function POST(request: Request) {
       );
     }
 
-    // Send dispatch status email to branch (reply in original thread if possible)
-    console.log(`[VisibilityData] Step 3: Sending email to ${BRANCH_EMAIL}...`);
-    const subject = `Dispatch Status - Sales Order ${soNumber}`;
-    let messageId: string;
-    let threadId: string;
-    try {
-      let result: { messageId: string; threadId: string };
+    // Step 1: mark this SO's visibility as received
+    await prisma.salesOrder.update({
+      where: { id: salesOrder.id },
+      data: { visibilityState: 'received' },
+    });
 
-      if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
-        // Reply in the same thread as the original NEW ORDER email
-        try {
-          const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
-          if (rfc822Id) {
-            console.log(`[VisibilityData] Step 3: Replying in original thread ${salesOrder.originalThreadId}`);
-            result = await sendReplyEmail(
-              BRANCH_EMAIL,
-              subject,
-              email_body,
-              salesOrder.originalThreadId,
-              rfc822Id
-            );
-          } else {
-            console.log(`[VisibilityData] Step 3: Could not get RFC822 ID, sending new email`);
-            result = await sendPlainEmail(BRANCH_EMAIL, subject, email_body);
-          }
-        } catch (replyErr) {
-          console.warn(`[VisibilityData] Step 3: Reply-in-thread failed, falling back to new email:`, replyErr instanceof Error ? replyErr.message : replyErr);
-          result = await sendPlainEmail(BRANCH_EMAIL, subject, email_body);
-        }
-      } else {
-        console.log(`[VisibilityData] Step 3: No original thread info, sending new email`);
-        result = await sendPlainEmail(BRANCH_EMAIL, subject, email_body);
+    // Step 1b: persist materials in the dedicated Material table (queryable).
+    // Normalize legacy field names so old auto_gui2 payloads still work.
+    for (const raw of materials) {
+      const materialCode = raw.material ?? raw.material_code ?? '';
+      const batch = raw.batch ?? raw.batch_number ?? '';
+      if (!materialCode || !batch) {
+        console.warn(`[VisibilityData] Skipping material row missing code/batch:`, raw);
+        continue;
       }
-
-      messageId = result.messageId;
-      threadId = result.threadId;
-    } catch (emailErr) {
-      console.error(`[VisibilityData] Step 3 FAILED: send email threw:`, emailErr);
-      return NextResponse.json(
-        { error: 'Failed to send dispatch email', details: emailErr instanceof Error ? emailErr.message : String(emailErr) },
-        { status: 500 }
-      );
+      await prisma.material.upsert({
+        where: {
+          salesOrderId_material_batch: {
+            salesOrderId: salesOrder.id,
+            material: materialCode,
+            batch,
+          },
+        },
+        update: {
+          materialDescription: raw.material_description ?? null,
+          orderQuantity: raw.order_quantity,
+          availableStock: raw.available_stock_for_so ?? null,
+          orderWeightKg: raw.order_weight_kg ?? null,
+        },
+        create: {
+          salesOrderId: salesOrder.id,
+          material: materialCode,
+          materialDescription: raw.material_description ?? null,
+          batch,
+          orderQuantity: raw.order_quantity,
+          availableStock: raw.available_stock_for_so ?? null,
+          orderWeightKg: raw.order_weight_kg ?? null,
+        },
+      });
     }
+    console.log(`[VisibilityData] Persisted ${materials.length} Material row(s) for SO ${soNumber}`);
 
-    console.log(
-      `[VisibilityData] Step 3: Sent dispatch email to ${BRANCH_EMAIL} for SO ${soNumber} - messageId: ${messageId}`
-    );
-
-    // Store full materials array (with batch + quantity) for ZLOAD1 later
+    // Step 2: buffer the per-SO email body + materials (raw JSON, for combined-email assembly).
     const materialsJson = JSON.stringify(materials);
-
-    // Create Email record for tracking branch reply
-    console.log(`[VisibilityData] Step 4: Creating Email record...`);
     await prisma.email.create({
       data: {
         salesOrderId: salesOrder.id,
-        gmailMessageId: messageId,
-        gmailThreadId: threadId,
+        purchaseOrderId: salesOrder.purchaseOrderId,
+        gmailMessageId: `pending-${randomUUID()}`,
+        gmailThreadId: '',
         recipientEmail: BRANCH_EMAIL,
-        subject,
-        status: 'sent',
-        emailType: 'ls_dispatch',
-        workflowState: 'awaiting_reply',
+        subject: '(buffered)',
+        status: 'queued',
+        emailType: 'ls_dispatch_buffered',
+        workflowState: 'buffering',
         relatedMaterials: materialsJson,
-        sentBody: email_body,
+        sentBody: email_body || null, // legacy; combined email body is now generated from Material rows
+
+      },
+    });
+    console.log(`[VisibilityData] Buffered visibility output for SO ${soNumber}`);
+
+    // Step 3: queue advancement is now handled by /step-status (the WorkQueue).
+    // Here we only check whether all SOs in the PO have their visibility
+    // result and, if so, assemble the combined dispatch email. The next
+    // queued ZSO-VISIBILITY fires after auto_gui2 calls /step-status with
+    // status='done' for this work item.
+    const remainingNotReceived = await prisma.salesOrder.count({
+      where: {
+        purchaseOrderId: salesOrder.purchaseOrderId,
+        visibilityState: { notIn: ['received', 'failed'] },
       },
     });
 
-    console.log(
-      `[VisibilityData] Created email record for SO ${soNumber} with ${materials.length} materials`
-    );
+    if (remainingNotReceived > 0) {
+      return NextResponse.json({
+        success: true,
+        so_number: soNumber,
+        soNumber,
+        buffered: true,
+        remainingNotReceived,
+      });
+    }
+
+    // All SOs in the PO are settled — assemble and send the combined email.
+    console.log(`[VisibilityData] All SOs in PO ${salesOrder.purchaseOrder.poNumber} settled — assembling combined email`);
+    const result = await assembleAndSendCombinedEmail(salesOrder.purchaseOrderId);
 
     return NextResponse.json({
-      success: true,
+      success: result.success,
       so_number: soNumber,
       soNumber,
-      emailSent: true,
-      messageId,
-      materialsCount: materials.length,
+      buffered: true,
+      combinedEmailSent: result.success && !result.alreadySent,
+      combinedEmailAlreadySent: !!result.alreadySent,
     });
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);
@@ -189,10 +201,7 @@ export async function POST(request: Request) {
     console.error(`[VisibilityData] UNHANDLED ERROR: ${errMsg}`);
     console.error(`[VisibilityData] Stack:`, errStack || error);
     return NextResponse.json(
-      {
-        error: 'Internal server error',
-        details: errMsg,
-      },
+      { error: 'Internal server error', details: errMsg },
       { status: 500 }
     );
   }

@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { linkLsiToBundle } from '@/lib/bundler';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { sendReplyEmail, sendPlainEmail, getMessageRfc822Id } from '@/lib/gmail';
@@ -64,7 +65,7 @@ export async function POST(request: Request) {
     // Find the sales order
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
-      select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true },
+      select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true, purchaseOrderId: true },
     });
 
     if (!salesOrder) {
@@ -114,72 +115,30 @@ export async function POST(request: Request) {
       data: { status: 'ls_created' },
     });
 
-    // Send email asking for vehicle details (reply in original thread).
-    // Only one email per SO — multiple LS files arrive in separate requests,
-    // but the body is SO-level and the reply handler applies the details to
-    // every LoadingSlipItem, so subsequent LSs must not re-fire the email.
-    if (BRANCH_EMAIL) {
-      const existingVehicleEmail = await prisma.email.findFirst({
-        where: {
-          salesOrderId: salesOrder.id,
-          emailType: 'vehicle_details',
-          status: 'sent',
-        },
-        select: { id: true },
-      });
-
-      if (existingVehicleEmail) {
-        console.log(`[ZLOAD1 Data] Vehicle details email already sent for SO ${soNumber} — skipping (LS ${lsNumber})`);
+    // Bundles + vehicle-details emails were created at dispatch-confirmation
+    // time (before ZLOAD1 fired) so the truck count was settled with the
+    // branch already.
+    //
+    // auto_gui2's `meta` passthrough merges the bundle_id we sent in /chat
+    // into this multipart callback (see services/gui_service.py send_data).
+    // When present, set LSI.bundleId directly. Otherwise fall back to the
+    // material-lookup heuristic.
+    try {
+      const incomingBundleId = (formData.get('bundle_id') as string | null) || null;
+      if (incomingBundleId) {
+        await prisma.loadingSlipItem.update({
+          where: { id: loadingSlipItem.id },
+          data: { bundleId: incomingBundleId },
+        });
+        console.log(`[ZLOAD1 Data] Linked LSI ${loadingSlipItem.id} to Bundle ${incomingBundleId} (via meta)`);
       } else {
-        const vehicleEmailBody = [
-          `Loading slip for Sales Order ${soNumber} has been created successfully.`,
-          '',
-          'Please reply with the following vehicle/transport details:',
-          '1. Vehicle Number (e.g., GJ12AB1234)',
-          '2. Driver Mobile Number (e.g., 9876543210)',
-          '3. Container Number',
-        ].join('\n');
-
-        const subject = `Vehicle Details Required - SO ${soNumber}`;
-
-        try {
-          let emailResult: { messageId: string; threadId: string };
-
-          if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
-            try {
-              const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
-              if (rfc822Id) {
-                console.log(`[ZLOAD1 Data] Replying in original thread ${salesOrder.originalThreadId} for vehicle details`);
-                emailResult = await sendReplyEmail(BRANCH_EMAIL, subject, vehicleEmailBody, salesOrder.originalThreadId, rfc822Id);
-              } else {
-                emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
-              }
-            } catch {
-              emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
-            }
-          } else {
-            emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
-          }
-
-          // Create Email record for tracking vehicle details reply
-          await prisma.email.create({
-            data: {
-              salesOrderId: salesOrder.id,
-              gmailMessageId: emailResult.messageId,
-              gmailThreadId: emailResult.threadId,
-              recipientEmail: BRANCH_EMAIL,
-              subject,
-              status: 'sent',
-              emailType: 'vehicle_details',
-              workflowState: 'awaiting_reply',
-            },
-          });
-
-          console.log(`[ZLOAD1 Data] Vehicle details email sent for SO ${soNumber} - messageId: ${emailResult.messageId}`);
-        } catch (emailErr) {
-          console.error(`[ZLOAD1 Data] Failed to send vehicle details email for SO ${soNumber}:`, emailErr instanceof Error ? emailErr.message : emailErr);
-        }
+        await linkLsiToBundle(loadingSlipItem.id);
       }
+    } catch (linkErr) {
+      console.error(
+        `[ZLOAD1 Data] Failed to link LSI ${loadingSlipItem.id} to bundle:`,
+        linkErr
+      );
     }
 
     return NextResponse.json({

@@ -1,5 +1,11 @@
 import { NextResponse } from 'next/server';
-import { checkForReplies, checkWorkflowTimers, checkForNewEmails } from '@/lib/email-reply-checker';
+import {
+  checkForReplies,
+  checkWorkflowTimers,
+  checkForNewEmails,
+  checkStaleVisibility,
+  checkWaitRechecks,
+} from '@/lib/email-reply-checker';
 
 /**
  * GET /api/cron/check-emails
@@ -21,16 +27,30 @@ export async function GET(request: Request) {
 
     console.log('[Cron] Starting email reply check and timer check...');
 
-    // Run all three checks
+    // Run all checks
     const newEmailResult = await checkForNewEmails();
     const replyResult = await checkForReplies();
     const timerResult = await checkWorkflowTimers();
+    const staleResult = await checkStaleVisibility();
+    const waitResult = await checkWaitRechecks();
 
-    const allLogs = [...newEmailResult.logs, ...replyResult.logs, ...timerResult.logs];
-    const allErrors = [...newEmailResult.errors, ...replyResult.errors, ...timerResult.errors];
+    const allLogs = [
+      ...newEmailResult.logs,
+      ...replyResult.logs,
+      ...timerResult.logs,
+      ...staleResult.logs,
+      ...waitResult.logs,
+    ];
+    const allErrors = [
+      ...newEmailResult.errors,
+      ...replyResult.errors,
+      ...timerResult.errors,
+      ...staleResult.errors,
+      ...waitResult.errors,
+    ];
 
     console.log(
-      `[Cron] Complete. New emails: ${newEmailResult.triggered}, Replies: ${replyResult.processed}, Reminders: ${timerResult.reminders_sent}, Errors: ${allErrors.length}`
+      `[Cron] Complete. New: ${newEmailResult.triggered}, Replies: ${replyResult.processed}, Reminders: ${timerResult.reminders_sent}, Stale: ${staleResult.recovered}, Combined: ${staleResult.combinedSent}, Rechecks: ${waitResult.rechecked}, Errors: ${allErrors.length}`
     );
 
     return NextResponse.json({
@@ -38,6 +58,9 @@ export async function GET(request: Request) {
       new_emails_triggered: newEmailResult.triggered,
       processed: replyResult.processed,
       reminders_sent: timerResult.reminders_sent,
+      stale_recovered: staleResult.recovered,
+      combined_emails_sent: staleResult.combinedSent,
+      wait_rechecks: waitResult.rechecked,
       errors: allErrors,
       logs: allLogs,
       timestamp: new Date().toISOString(),

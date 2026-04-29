@@ -105,14 +105,64 @@ model PurchaseOrder {
   id           String   @id @default(cuid())
   poNumber     String   @unique
   customerName String
+  customerId   String?
   status       String   @default("in-progress") // pending, in-progress, completed
   stage        Int      @default(1) // 1-6 workflow stages
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   salesOrders SalesOrder[]
+  emails      Email[]
+  customer    Customer? @relation(fields: [customerId], references: [id])
+  bundles     Bundle[]
 
   @@map("purchase_order")
+}
+
+// One Bundle = one truck/vehicle worth of LoadingSlipItems. Computed from
+// LoadingSlipItem.fileUrl-bearing rows in the PO via greedy first-fit
+// packing against Customer.weightage (kg). A Bundle can contain LSIs from
+// multiple SalesOrders within the same PO (per the bundling diagram).
+model Bundle {
+  id              String   @id @default(cuid())
+  purchaseOrderId String
+  bundleNumber    Int      // 1-based within the PO (B1, B2, …)
+  totalWeightKg   Decimal  @default(0)
+  status          String   @default("planned") // planned, invoiced, dispatched
+
+  // Vehicle / transport details — one set per Bundle (per-truck), since
+  // a bundle can carry LSIs from multiple SOs of the same PO.
+  vehicleNumber   String?
+  driverMobile    String?
+  containerNumber String?
+  transportId     String?
+  sealNumber      String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  items         LoadingSlipItem[]
+  materials     Material[]
+  emails        Email[]
+
+  @@unique([purchaseOrderId, bundleNumber])
+  @@map("bundle")
+}
+
+// Customer record keyed by the externally-provided customer_id from the
+// NEW ORDER email. Auto-created on first sight with a generic name.
+// `weightage` is the customer's truck capacity in tonnes (default 31).
+model Customer {
+  id        String   @id
+  name      String   @default("New Customer")
+  weightage Decimal  @default(31)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchaseOrders PurchaseOrder[]
+
+  @@map("customer")
 }
 
 model SalesOrder {
@@ -134,6 +184,14 @@ model SalesOrder {
   originalMessageId   String?  // Gmail message ID of the original "NEW ORDER" email (for In-Reply-To)
   status              String   @default("pending") // pending, pending-input, in-progress, completed
   requiresInput       Boolean  @default(true)
+  visibilityState     String?  // null | 'queued' | 'firing' | 'received' | 'failed' — drives serial ZSO-VISIBILITY for multi-SO POs
+  visibilityRetries   Int      @default(0)
+  // JSON release plan computed after branch reply intent (release_all / release_part):
+  // [{material_code, batch, quantity, weight_kg}]. Held until weight gate clears.
+  releasePlan         String?
+  // For 'wait' branch reply intents: re-fire ZSO-VISIBILITY when this passes.
+  waitUntil           DateTime?
+  waitRechecks        Int       @default(0)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
@@ -141,16 +199,67 @@ model SalesOrder {
   items         LoadingSlipItem[]
   emails        Email[]
   invoice       Invoice?
+  materials     Material[]
+  workItems     WorkQueue[]
 
   @@map("sales_order")
 }
 
+// Global FIFO work queue. One row per pending /chat fire to auto_gui2.
+// Invariant: at most one row in `state='firing'` at a time, system-wide.
+// auto_gui2 acknowledges completion via POST /backend/orders/aman/step-status
+// with the row's id as `work_id`. No retries — failed rows are skipped.
+model WorkQueue {
+  id           String    @id @default(cuid())
+  salesOrderId String?
+  step         String    // 'visibility' | 'zload1' | 'zload3b1' | 'vto1n'
+  payload      String    // JSON of the /chat body (so_number, instruction, attachments, etc.)
+  state        String    @default("queued") // queued | firing | done | failed
+  error        String?
+  createdAt    DateTime  @default(now())
+  startedAt    DateTime?
+  finishedAt   DateTime?
+
+  salesOrder   SalesOrder? @relation(fields: [salesOrderId], references: [id], onDelete: SetNull)
+
+  @@index([state, createdAt])
+  @@map("work_queue")
+}
+
+// SO-level material visibility data returned by ZSO-VISIBILITY.
+// Distinct from LoadingSlipItem (which is per-LS, created after ZLOAD1).
+model Material {
+  id                  String   @id @default(cuid())
+  salesOrderId        String
+  bundleId            String?
+  material            String   // SAP material code
+  materialDescription String?
+  batch               String
+  orderQuantity       Int
+  availableStock      Int?     // available_stock_for_so
+  orderWeightKg       Decimal? // order_weight_kg
+  // Branch's selection for dispatch:
+  //   null  = not yet decided
+  //   0     = excluded (branch said skip / hold)
+  //   >0    = release this many units
+  dispatchQuantity    Int?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
+
+  @@unique([salesOrderId, material, batch])
+  @@map("material")
+}
+
 model LoadingSlipItem {
-  id           String @id @default(cuid())
+  id           String  @id @default(cuid())
   salesOrderId String
+  bundleId     String?
   lsNumber     String
   material     String
-  status       String @default("pending") // pending, in-progress, completed
+  status       String  @default("pending") // pending, in-progress, completed
 
   // Aman fields (read-only, populated via API later)
   materialDescription String?
@@ -174,6 +283,7 @@ model LoadingSlipItem {
 
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   emails     Email[]
+  bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
 
   @@unique([lsNumber, material])
   @@map("loading_slip_item")
@@ -181,20 +291,22 @@ model LoadingSlipItem {
 
 model Email {
   id                String    @id @default(cuid())
-  salesOrderId      String?   // Direct link to SalesOrder
+  salesOrderId      String?   // Direct link to SalesOrder (lead SO for combined dispatch emails)
   loadingSlipItemId String?   // Optional link to LoadingSlipItem (for LS-specific emails)
+  purchaseOrderId   String?   // For multi-SO dispatch emails grouped under one PO
+  bundleId          String?   // For per-bundle (per-truck) emails — vehicle details, etc.
   gmailMessageId    String    @unique // Gmail message ID for reply tracking
   gmailThreadId     String             // Thread ID to find replies
   recipientEmail    String
   subject           String
-  status            String    @default("sent") // sent, replied, processed
+  status            String    @default("sent") // sent, replied, processed, queued, consumed
   sentAt            DateTime  @default(now())
   repliedAt         DateTime?
   replyPdfUrl       String?   // R2 key for the reply PDF attachment
 
   // Workflow fields
-  emailType         String?   // 'ls_dispatch' | 'production_inquiry' | 'production_reminder' | null (legacy)
-  workflowState     String?   // 'awaiting_reply' | 'awaiting_production_reply' | 'waiting_timer' | 'awaiting_confirmation' | 'completed' | null
+  emailType         String?   // 'ls_dispatch' | 'ls_dispatch_buffered' | 'production_inquiry' | 'production_reminder' | null (legacy)
+  workflowState     String?   // 'awaiting_reply' | 'awaiting_production_reply' | 'waiting_timer' | 'awaiting_confirmation' | 'buffering' | 'completed' | null
   waitUntil         DateTime? // When to send reminder (set after production replies with days)
   relatedMaterials  String?   // JSON string of missing material codes
   sentBody          String?   // Plain text body of the sent email
@@ -202,6 +314,8 @@ model Email {
 
   salesOrder      SalesOrder?      @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   loadingSlipItem LoadingSlipItem? @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
+  purchaseOrder   PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  bundle          Bundle?          @relation(fields: [bundleId], references: [id], onDelete: Cascade)
 
   @@map("email")
 }
@@ -210,7 +324,7 @@ model Email {
 model ProcessedEmail {
   gmailMessageId String   @id
   gmailThreadId  String
-  soNumber       String?
+  soNumbers      String?  // CSV list (1–4 SO numbers extracted from one NEW ORDER email)
   processedAt    DateTime @default(now())
 
   @@map("processed_email")

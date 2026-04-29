@@ -288,12 +288,29 @@ export default function OrdersPage() {
                           <ChevronRight className="w-5 h-5" />
                         )}
                         <CardTitle className="text-lg">
-                          {po.poNumber} | {po.customerName}
+                          {po.poNumber} | {po.customer?.name ?? po.customerName}
                         </CardTitle>
                       </div>
-                      <span className="text-sm text-muted-foreground">
-                        {po.salesOrders.length} SO(s)
-                      </span>
+                      <div className="flex items-center gap-3 text-sm text-muted-foreground">
+                        {po.customer && (
+                          <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs" title={`Truck capacity for ${po.customer.name}`}>
+                            {po.customer.weightage} t
+                          </span>
+                        )}
+                        {po.salesOrders.length > 1 && (() => {
+                          const total = po.salesOrders.length;
+                          const done = po.salesOrders.filter(
+                            (s) => s.visibilityState === 'received' || s.visibilityState === 'failed'
+                          ).length;
+                          if (done === total) return null;
+                          return (
+                            <span className="px-2 py-0.5 rounded bg-amber-100 text-amber-900 text-xs">
+                              {done}/{total} visibility done
+                            </span>
+                          );
+                        })()}
+                        <span>{po.salesOrders.length} SO(s)</span>
+                      </div>
                     </div>
                   </CardHeader>
                 </CollapsibleTrigger>
@@ -627,6 +644,24 @@ function SOSection({
               <ChevronRight className="w-4 h-4" />
             )}
             <span className="font-medium">SO: {so.soNumber}</span>
+            {so.visibilityState && so.visibilityState !== 'received' && (
+              <span
+                className={`px-2 py-0.5 rounded text-xs ${
+                  so.visibilityState === 'queued'
+                    ? 'bg-slate-200 text-slate-700'
+                    : so.visibilityState === 'firing'
+                      ? 'bg-amber-100 text-amber-900'
+                      : 'bg-red-100 text-red-900'
+                }`}
+                title={`Visibility: ${so.visibilityState}`}
+              >
+                {so.visibilityState === 'queued'
+                  ? 'Queued'
+                  : so.visibilityState === 'firing'
+                    ? 'Visibility running'
+                    : 'Visibility failed'}
+              </span>
+            )}
             {so.vehicleNumber && (
               <span className="text-sm text-muted-foreground">
                 | Vehicle: {so.vehicleNumber}

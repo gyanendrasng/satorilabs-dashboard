@@ -6,8 +6,14 @@ import {
   handleProductionReply,
   handleProductionConfirmation,
   handleVehicleDetailsReply,
+  handleVehicleSplitConfirmation,
+  handleDispatchConfirmation,
+  triggerZsoVisibility,
+  assembleAndSendCombinedEmail,
 } from './auto-gui-trigger';
 import { uploadToS3 } from './s3';
+import { extractOrderInfoWithAI, extractOrderInfoFallback } from './so-extractor';
+import { markFailed, pumpQueue } from './work-queue';
 
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
@@ -117,6 +123,22 @@ export async function checkForReplies(): Promise<{
       // Route based on emailType
       const emailType = (email as any).emailType as string | null;
 
+      if (emailType === 'vehicle_split_inquiry') {
+        log(`[EmailChecker] Routing to handleVehicleSplitConfirmation for PO email ${email.id}`);
+        const splitResult = await handleVehicleSplitConfirmation(email.id, replyBodyHtml);
+        logs.push(...splitResult.logs);
+        processed++;
+        continue;
+      }
+
+      if (emailType === 'dispatch_confirmation') {
+        log(`[EmailChecker] Routing to handleDispatchConfirmation for PO email ${email.id}`);
+        const dcResult = await handleDispatchConfirmation(email.id, replyBodyHtml);
+        logs.push(...dcResult.logs);
+        processed++;
+        continue;
+      }
+
       if (emailType === 'production_inquiry') {
         // Production team replied to our inquiry — extract days
         log(`[EmailChecker] Routing to handleProductionReply for SO ${soNumber}`);
@@ -183,9 +205,12 @@ export async function checkForReplies(): Promise<{
           },
         });
 
-        // Check if all emails for this SO now have replies
+        // Check if all emails for this (Bundle, SO) pair now have replies.
+        // bundleId comes from the LSI the email is tied to; null = legacy
+        // (whole-SO) behavior.
         if (email.salesOrderId) {
-          const batchResult = await checkAndSendBatchToAman(email.salesOrderId);
+          const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
+          const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
           logs.push(...batchResult.logs);
         }
         continue;
@@ -216,9 +241,10 @@ export async function checkForReplies(): Promise<{
 
       processed++;
 
-      // Check if all emails for this SO now have replies
+      // Check if all emails for this (Bundle, SO) pair now have replies.
       if (email.salesOrderId) {
-        const batchResult = await checkAndSendBatchToAman(email.salesOrderId);
+        const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
+        const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
         logs.push(...batchResult.logs);
       }
     } catch (error) {
@@ -275,7 +301,7 @@ export async function checkWorkflowTimers(): Promise<{
       : [];
     // Extract string codes for /email/reminder API (accepts string[])
     const materialCodes: string[] = storedMaterials.map((m: any) =>
-      typeof m === 'string' ? m : m.material_code || ''
+      typeof m === 'string' ? m : (m.material ?? m.material_code ?? '')
     );
 
     try {
@@ -415,92 +441,133 @@ export async function checkForNewEmails(): Promise<{
           },
         });
 
-        // Get the email body — should just contain SO number
+        // Get the email body — may contain 1–4 SO numbers
         const body = await getMessageBody(msg.id);
         if (!body) {
           log(`[NewEmail] Empty body for message ${msg.id}, skipping`);
           continue;
         }
 
-        // Extract SO number — trim whitespace, strip HTML tags, get the number
-        const stripped = body.replace(/<[^>]*>/g, '').trim();
-        const soMatch = stripped.match(/\d{7,}/); // SO numbers are 7+ digits
-        if (!soMatch) {
-          log(`[NewEmail] No SO number found in message ${msg.id}: "${stripped.substring(0, 50)}"`);
+        const stripped = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+        // Extract customer_id + SO numbers via AI; fall back to regex on failure.
+        let customerId: string | null = null;
+        let soNumbers: string[] = [];
+        try {
+          const extracted = await extractOrderInfoWithAI(stripped);
+          customerId = extracted.customerId;
+          soNumbers = extracted.soNumbers;
+          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+        } catch (aiErr) {
+          log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
+          const fb = extractOrderInfoFallback(stripped);
+          customerId = fb.customerId;
+          soNumbers = fb.soNumbers;
+          if (soNumbers.length > 0) {
+            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+          }
+        }
+
+        if (soNumbers.length === 0) {
+          log(`[NewEmail] No SO numbers found in message ${msg.id}: "${stripped.substring(0, 80)}"`);
           continue;
         }
 
-        const soNumber = soMatch[0].trim();
-        log(`[NewEmail] Extracted SO number: ${soNumber} from message ${msg.id}`);
+        // Upsert Customer if we extracted an id; auto-create with generic name + default 31t capacity.
+        let customer: { id: string; name: string } | null = null;
+        if (customerId) {
+          const existing = await prisma.customer.findUnique({ where: { id: customerId } });
+          if (existing) {
+            customer = { id: existing.id, name: existing.name };
+          } else {
+            const count = await prisma.customer.count();
+            const created = await prisma.customer.create({
+              data: { id: customerId, name: `Customer ${count + 1}` },
+            });
+            customer = { id: created.id, name: created.name };
+            log(`[NewEmail] Created new Customer ${customerId} ("${created.name}", default 31 tonne capacity)`);
+          }
+        }
 
-        // Update the processed email record with the SO number
+        // Update the processed email record with the CSV list
         await prisma.processedEmail.update({
           where: { gmailMessageId: msg.id },
-          data: { soNumber },
+          data: { soNumbers: soNumbers.join(',') },
         });
 
-        // Create PO + SO in DB so it shows on dashboard
-        let salesOrder = await prisma.salesOrder.findFirst({ where: { soNumber } });
-        if (!salesOrder) {
-          const subject = await getMessageSubject(msg.id);
-          const purchaseOrder = await prisma.purchaseOrder.create({
-            data: {
-              poNumber: `AUTO-${soNumber}`,
-              customerName: subject || `Branch Order ${soNumber}`,
-              status: 'in-progress',
-              stage: 1,
-            },
-          });
-          salesOrder = await prisma.salesOrder.create({
+        // Create or reuse the PO (one PO per NEW ORDER email; keyed by Gmail message ID)
+        const poNumber = `AUTO-${msg.id}`;
+        const subject = await getMessageSubject(msg.id);
+        const purchaseOrder = await prisma.purchaseOrder.upsert({
+          where: { poNumber },
+          update: customer ? { customerId: customer.id } : {},
+          create: {
+            poNumber,
+            customerName: customer?.name || subject || `Branch Order (${soNumbers.length} SOs)`,
+            customerId: customer?.id,
+            status: 'in-progress',
+            stage: 1,
+          },
+        });
+
+        // Create or backfill SOs (skip ones that already exist for this PO)
+        const createdSoNumbers: string[] = [];
+        for (const soNumber of soNumbers) {
+          const existing = await prisma.salesOrder.findFirst({ where: { soNumber, purchaseOrderId: purchaseOrder.id } });
+          if (existing) {
+            if (!existing.originalThreadId) {
+              await prisma.salesOrder.update({
+                where: { id: existing.id },
+                data: {
+                  originalThreadId: msg.threadId,
+                  originalMessageId: msg.id,
+                  visibilityState: existing.visibilityState ?? 'queued',
+                },
+              });
+            }
+            continue;
+          }
+          await prisma.salesOrder.create({
             data: {
               purchaseOrderId: purchaseOrder.id,
               soNumber,
               status: 'pending',
               originalThreadId: msg.threadId,
               originalMessageId: msg.id,
+              visibilityState: 'queued',
             },
           });
-          log(`[NewEmail] Created PO ${purchaseOrder.poNumber} + SO ${soNumber} in dashboard`);
-        } else if (!salesOrder.originalThreadId) {
-          // SO already exists but missing thread info — backfill
+          createdSoNumbers.push(soNumber);
+        }
+        log(`[NewEmail] PO ${poNumber}: ${createdSoNumbers.length} new SO(s), ${soNumbers.length - createdSoNumbers.length} already existed (total ${soNumbers.length})`);
+
+        // Enqueue ZSO-VISIBILITY for every queued SO of this PO. The global
+        // WorkQueue ensures only one fires at a time across the whole system,
+        // even when multiple POs land at once.
+        const queuedSOs = await prisma.salesOrder.findMany({
+          where: { purchaseOrderId: purchaseOrder.id, visibilityState: 'queued' },
+          orderBy: { createdAt: 'asc' },
+        });
+
+        if (queuedSOs.length === 0) {
+          log(`[NewEmail] No queued SOs for PO ${poNumber} (already in progress?), skipping`);
+          triggered++;
+          continue;
+        }
+
+        for (const so of queuedSOs) {
           await prisma.salesOrder.update({
-            where: { id: salesOrder.id },
-            data: {
-              originalThreadId: msg.threadId,
-              originalMessageId: msg.id,
-            },
+            where: { id: so.id },
+            data: { visibilityState: 'firing' }, // marks "in pipeline"; queue controls ordering
           });
-        }
-
-        // Save to CurrentSO so visibility-data endpoint knows which SO
-        await prisma.currentSO.deleteMany();
-        await prisma.currentSO.create({ data: { soNumber } });
-
-        // Trigger ZSO-VISIBILITY on auto_gui2
-        try {
-          const response = await fetch(
-            `http://${AUTO_GUI_HOST}:8000/chat`,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
-                transaction_code: 'ZSO-VISIBILITY',
-                so_number: soNumber,
-              }),
-            }
-          );
-
-          if (!response.ok) {
-            log(`[NewEmail] ZSO-VISIBILITY trigger failed for SO ${soNumber}: ${response.statusText}`);
-            errors.push(`ZSO-VISIBILITY failed for SO ${soNumber}`);
-          } else {
-            log(`[NewEmail] ZSO-VISIBILITY triggered for SO ${soNumber}`);
+          try {
+            await triggerZsoVisibility(so.soNumber);
+          } catch (fetchError) {
+            log(`[NewEmail] enqueue ZSO-VISIBILITY failed for SO ${so.soNumber}: ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`);
+            errors.push(`enqueue ZSO-VISIBILITY failed for SO ${so.soNumber}`);
           }
-        } catch (fetchError) {
-          log(`[NewEmail] ZSO-VISIBILITY call failed for SO ${soNumber} (will not retry): ${fetchError instanceof Error ? fetchError.message : String(fetchError)}`);
-          errors.push(`ZSO-VISIBILITY unreachable for SO ${soNumber}`);
         }
+        log(`[NewEmail] PO ${poNumber}: enqueued ZSO-VISIBILITY for ${queuedSOs.length} SO(s)`);
 
         triggered++;
       } catch (error) {
@@ -521,4 +588,166 @@ export async function checkForNewEmails(): Promise<{
 
   log(`[NewEmail] Complete. Triggered: ${triggered}, Errors: ${errors.length}`);
   return { triggered, errors, logs };
+}
+
+/**
+ * SOs whose branch reply intent was 'wait' get a `waitUntil` date set on them.
+ * Once that elapses, re-fire ZSO-VISIBILITY to refresh stock data. Caps at
+ * MAX_WAIT_RECHECKS (default 3) to avoid infinite loops if stock never returns.
+ */
+export async function checkWaitRechecks(): Promise<{
+  rechecked: number;
+  errors: string[];
+  logs: string[];
+}> {
+  const errors: string[] = [];
+  const logs: string[] = [];
+  let rechecked = 0;
+
+  const log = (m: string) => {
+    const t = `[${new Date().toISOString()}] ${m}`;
+    console.log(t);
+    logs.push(t);
+  };
+
+  const maxRechecks = parseInt(process.env.MAX_WAIT_RECHECKS || '3', 10);
+
+  const due = await prisma.salesOrder.findMany({
+    where: {
+      waitUntil: { lte: new Date() },
+    },
+    orderBy: { waitUntil: 'asc' },
+  });
+
+  if (due.length === 0) return { rechecked: 0, errors: [], logs };
+  log(`[WaitRecheck] ${due.length} SO(s) due for recheck`);
+
+  for (const so of due) {
+    try {
+      if (so.waitRechecks >= maxRechecks) {
+        log(`[WaitRecheck] SO ${so.soNumber} exhausted ${maxRechecks} rechecks — clearing waitUntil`);
+        await prisma.salesOrder.update({
+          where: { id: so.id },
+          data: { waitUntil: null },
+        });
+        continue;
+      }
+      await prisma.salesOrder.update({
+        where: { id: so.id },
+        data: { waitUntil: null, visibilityState: 'queued' },
+      });
+      await triggerZsoVisibility(so.soNumber);
+      rechecked++;
+      log(`[WaitRecheck] Re-fired ZSO-VISIBILITY for SO ${so.soNumber} (recheck ${so.waitRechecks + 1}/${maxRechecks})`);
+    } catch (err) {
+      const errMsg = `Wait-recheck error for SO ${so.soNumber}: ${err instanceof Error ? err.message : String(err)}`;
+      log(`[WaitRecheck] ${errMsg}`);
+      errors.push(errMsg);
+    }
+  }
+
+  return { rechecked, errors, logs };
+}
+
+/**
+ * Recover the multi-SO serial pipeline when an SO is stuck in `visibilityState='firing'`
+ * past the stale threshold (e.g. auto_gui2 crashed before it could call /visibility-data).
+ *
+ * Strategy:
+ *   - For each stale firing SO: re-fire ZSO-VISIBILITY up to MAX_VISIBILITY_RETRIES,
+ *     then mark it 'failed' and let the PO settle with the SOs that did succeed.
+ *   - For each PO whose every SO is in {received, failed} but with no sent ls_dispatch
+ *     email yet, call assembleAndSendCombinedEmail (idempotent).
+ */
+export async function checkStaleVisibility(): Promise<{
+  recovered: number;
+  combinedSent: number;
+  errors: string[];
+  logs: string[];
+}> {
+  const errors: string[] = [];
+  const logs: string[] = [];
+  let recovered = 0;
+  let combinedSent = 0;
+
+  const log = (message: string) => {
+    const m = `[${new Date().toISOString()}] ${message}`;
+    console.log(m);
+    logs.push(m);
+  };
+
+  const staleMinutes = parseInt(process.env.STALE_VISIBILITY_MINUTES || '15', 10);
+  const cutoff = new Date(Date.now() - staleMinutes * 60_000);
+
+  // Step 1: any WorkQueue row stuck `firing` past the cutoff is treated as
+  // abandoned by auto_gui2 (no /step-status callback ever arrived). Mark it
+  // failed and pump the queue so the next item fires.
+  const stuckWork = await prisma.workQueue.findMany({
+    where: { state: 'firing', startedAt: { lt: cutoff } },
+    orderBy: { startedAt: 'asc' },
+  });
+
+  if (stuckWork.length > 0) {
+    log(`[StaleVisibility] Found ${stuckWork.length} WorkQueue row(s) stuck in 'firing' beyond ${staleMinutes}min`);
+  }
+
+  for (const wq of stuckWork) {
+    try {
+      const ok = await markFailed(wq.id, `auto_gui2 timeout (no /step-status callback for ${staleMinutes}min)`);
+      if (ok) {
+        recovered++;
+        log(`[StaleVisibility] Marked work ${wq.id} (${wq.step}) as failed`);
+        // If this work was a visibility step, also flip the SO row.
+        if (wq.step === 'visibility' && wq.salesOrderId) {
+          await prisma.salesOrder.update({
+            where: { id: wq.salesOrderId },
+            data: { visibilityState: 'failed' },
+          });
+        }
+      }
+    } catch (err) {
+      const errMsg = `Stale work ${wq.id} error: ${err instanceof Error ? err.message : String(err)}`;
+      log(`[StaleVisibility] ${errMsg}`);
+      errors.push(errMsg);
+    }
+  }
+
+  // After failing stuck work, pump once to fire the next queued item (if any).
+  if (stuckWork.length > 0) {
+    await pumpQueue();
+  }
+
+  // Step 3: sweep POs whose every SO is in {received, failed} but no sent ls_dispatch yet
+  const candidatePOs = await prisma.purchaseOrder.findMany({
+    where: {
+      salesOrders: {
+        some: { visibilityState: { in: ['received', 'failed'] } },
+        every: { visibilityState: { in: ['received', 'failed'] } },
+      },
+    },
+    include: {
+      emails: {
+        where: { emailType: 'ls_dispatch', status: 'sent' },
+        take: 1,
+      },
+    },
+  });
+
+  for (const po of candidatePOs) {
+    if (po.emails.length > 0) continue; // already sent
+    try {
+      const result = await assembleAndSendCombinedEmail(po.id);
+      logs.push(...result.logs);
+      if (result.success && !result.alreadySent) {
+        combinedSent++;
+      }
+    } catch (err) {
+      const errMsg = `Assemble error for PO ${po.poNumber}: ${err instanceof Error ? err.message : String(err)}`;
+      log(`[StaleVisibility] ${errMsg}`);
+      errors.push(errMsg);
+    }
+  }
+
+  log(`[StaleVisibility] Complete. Recovered: ${recovered}, Combined emails sent: ${combinedSent}, Errors: ${errors.length}`);
+  return { recovered, combinedSent, errors, logs };
 }
