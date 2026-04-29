@@ -697,6 +697,7 @@ export async function assembleAndSendCombinedEmail(
   const purchaseOrder = await prisma.purchaseOrder.findUnique({
     where: { id: purchaseOrderId },
     include: {
+      customer: true,
       salesOrders: {
         orderBy: { createdAt: 'asc' },
         include: {
@@ -738,7 +739,10 @@ export async function assembleAndSendCombinedEmail(
       orderWeightKg: m.orderWeightKg ? Number(m.orderWeightKg) : null,
     })),
   }));
-  const combinedBody = buildDispatchApprovalHtml(purchaseOrder.poNumber, sections);
+  const capacityTonnes = purchaseOrder.customer?.weightage
+    ? Number(purchaseOrder.customer.weightage)
+    : 31;
+  const combinedBody = buildDispatchApprovalHtml(purchaseOrder.poNumber, sections, capacityTonnes);
 
   // Aggregated v2 materials JSON (used by handleBranchReply to reconstruct per-SO context)
   const aggregated = {

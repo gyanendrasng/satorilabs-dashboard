@@ -288,10 +288,15 @@ export default function OrdersPage() {
                           <ChevronRight className="w-5 h-5" />
                         )}
                         <CardTitle className="text-lg">
-                          {po.poNumber} | {po.customerName}
+                          {po.poNumber} | {po.customer?.name ?? po.customerName}
                         </CardTitle>
                       </div>
                       <div className="flex items-center gap-3 text-sm text-muted-foreground">
+                        {po.customer && (
+                          <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs" title={`Truck capacity for ${po.customer.name}`}>
+                            {po.customer.weightage} t
+                          </span>
+                        )}
                         {po.salesOrders.length > 1 && (() => {
                           const total = po.salesOrders.length;
                           const done = po.salesOrders.filter(

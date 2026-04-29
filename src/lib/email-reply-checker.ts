@@ -10,7 +10,7 @@ import {
   assembleAndSendCombinedEmail,
 } from './auto-gui-trigger';
 import { uploadToS3 } from './s3';
-import { extractSoNumbersWithAI, extractSoNumbersFallback } from './so-extractor';
+import { extractOrderInfoWithAI, extractOrderInfoFallback } from './so-extractor';
 import { markFailed, pumpQueue } from './work-queue';
 
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
@@ -428,22 +428,43 @@ export async function checkForNewEmails(): Promise<{
 
         const stripped = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        // Extract SO numbers via AI; fall back to regex on failure
+        // Extract customer_id + SO numbers via AI; fall back to regex on failure.
+        let customerId: string | null = null;
         let soNumbers: string[] = [];
         try {
-          soNumbers = await extractSoNumbersWithAI(stripped);
-          log(`[NewEmail] AI extracted SO numbers from ${msg.id}: ${soNumbers.join(', ')}`);
+          const extracted = await extractOrderInfoWithAI(stripped);
+          customerId = extracted.customerId;
+          soNumbers = extracted.soNumbers;
+          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
         } catch (aiErr) {
           log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
-          soNumbers = extractSoNumbersFallback(stripped);
+          const fb = extractOrderInfoFallback(stripped);
+          customerId = fb.customerId;
+          soNumbers = fb.soNumbers;
           if (soNumbers.length > 0) {
-            log(`[NewEmail] Fallback regex extracted: ${soNumbers.join(', ')}`);
+            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
           }
         }
 
         if (soNumbers.length === 0) {
           log(`[NewEmail] No SO numbers found in message ${msg.id}: "${stripped.substring(0, 80)}"`);
           continue;
+        }
+
+        // Upsert Customer if we extracted an id; auto-create with generic name + default 31t capacity.
+        let customer: { id: string; name: string } | null = null;
+        if (customerId) {
+          const existing = await prisma.customer.findUnique({ where: { id: customerId } });
+          if (existing) {
+            customer = { id: existing.id, name: existing.name };
+          } else {
+            const count = await prisma.customer.count();
+            const created = await prisma.customer.create({
+              data: { id: customerId, name: `Customer ${count + 1}` },
+            });
+            customer = { id: created.id, name: created.name };
+            log(`[NewEmail] Created new Customer ${customerId} ("${created.name}", default 31 tonne capacity)`);
+          }
         }
 
         // Update the processed email record with the CSV list
@@ -457,10 +478,11 @@ export async function checkForNewEmails(): Promise<{
         const subject = await getMessageSubject(msg.id);
         const purchaseOrder = await prisma.purchaseOrder.upsert({
           where: { poNumber },
-          update: {},
+          update: customer ? { customerId: customer.id } : {},
           create: {
             poNumber,
-            customerName: subject || `Branch Order (${soNumbers.length} SOs)`,
+            customerName: customer?.name || subject || `Branch Order (${soNumbers.length} SOs)`,
+            customerId: customer?.id,
             status: 'in-progress',
             stage: 1,
           },

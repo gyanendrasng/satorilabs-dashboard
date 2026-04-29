@@ -61,6 +61,10 @@ function renderMaterialCard(m: DispatchMaterial, idx: number): string {
   const value = `${m.material}|${m.batch}`;
   const valueAttr = escapeHtml(value);
   const qtyName = `qty_${m.material}`;
+  const perUnitKg = m.orderWeightKg !== null && requested > 0
+    ? Number(m.orderWeightKg) / requested
+    : 0;
+  const perUnitAttr = perUnitKg > 0 ? perUnitKg.toFixed(4) : '0';
 
   const label = m.materialDescription
     ? `${escapeHtml(m.materialDescription)} <span style="color:#888;font-weight:normal;font-size:13px;">[${escapeHtml(m.material)} / ${escapeHtml(m.batch)}]</span>`
@@ -83,7 +87,7 @@ function renderMaterialCard(m: DispatchMaterial, idx: number): string {
       ? 'Custom Quantity'
       : 'Custom Quantity (optional)';
   const weightLine = m.orderWeightKg !== null
-    ? `<p style="font-size:12px;color:#888;margin-top:4px;">Weight: ${m.orderWeightKg} kg</p>`
+    ? `<p style="font-size:12px;color:#888;margin-top:4px;">Total weight (full qty): ${Number(m.orderWeightKg)} kg @ ${perUnitAttr} kg/unit</p>`
     : '';
 
   const holdId = idx === 0 && isPartial ? 'id="hold_partial"' : '';
@@ -95,7 +99,7 @@ function renderMaterialCard(m: DispatchMaterial, idx: number): string {
 
 <h3 style="margin-top:0;">
 <label>
-<input type="checkbox" class="materialCheck" name="approve" value="${valueAttr}" ${isOutOfStock ? 'disabled' : ''}>
+<input type="checkbox" class="materialCheck" name="approve" value="${valueAttr}" data-perunit="${perUnitAttr}" data-maxqty="${maxQty}" onchange="updateTotal(this)" ${isOutOfStock ? 'disabled' : ''}>
 ${label}
 </label>
 </h3>
@@ -108,12 +112,12 @@ ${weightLine}
 <tr>
 <td width="50%">
 ${customQtyLabel}<br><br>
-<input type="number" name="${escapeHtml(qtyName)}" min="1" max="${maxQty}" placeholder="${maxQty}" style="width:90px;padding:8px;border:1px solid #ccc;" ${isOutOfStock ? 'disabled' : ''}>
+<input type="number" name="${escapeHtml(qtyName)}" min="1" max="${maxQty}" placeholder="${maxQty}" data-perunit="${perUnitAttr}" data-maxqty="${maxQty}" oninput="updateTotal(this)" style="width:90px;padding:8px;border:1px solid #ccc;" ${isOutOfStock ? 'disabled' : ''}>
 </td>
 <td>
 <br>
 <label>
-<input type="checkbox" class="holdCheck" name="hold" value="${valueAttr}" ${holdId}>
+<input type="checkbox" class="holdCheck" name="hold" value="${valueAttr}" onchange="updateTotal(this)" ${holdId}>
 Hold Item
 </label>
 </td>
@@ -123,7 +127,7 @@ Hold Item
 </tr>`;
 }
 
-function renderSoSection(poNumber: string, section: DispatchSoSection, formUrl: string): string {
+function renderSoSection(poNumber: string, section: DispatchSoSection, formUrl: string, capacityTonnes: number): string {
   const materials = section.materials.length > 0
     ? section.materials.map((m, i) => renderMaterialCard(m, i)).join('\n')
     : `<tr><td height="24"></td></tr><tr><td style="padding:20px;border:1px solid #dbe3ea;border-radius:10px;color:#888;">No materials returned for this sales order.</td></tr>`;
@@ -149,21 +153,33 @@ Optional quantity can override approved quantity.
 <td style="padding:22px;border:1px solid #d6dbe1;border-radius:10px;background:#fafafa;">
 <h3 style="margin-top:0;">Bulk Decision (Select One)</h3>
 <label style="display:block;margin-bottom:14px;">
-<input type="radio" name="bulk" value="approve" onclick="bulkAction('approve')">
+<input type="radio" name="bulk" value="approve" onclick="bulkAction('approve', this)">
 Approve All Available Materials
 </label>
 <label style="display:block;margin-bottom:14px;">
-<input type="radio" name="bulk" value="holdall" onclick="bulkAction('holdall')">
+<input type="radio" name="bulk" value="holdall" onclick="bulkAction('holdall', this)">
 Hold Entire Order
 </label>
 <label style="display:block;">
-<input type="radio" name="bulk" value="holdshortage" onclick="bulkAction('holdshortage')">
+<input type="radio" name="bulk" value="holdshortage" onclick="bulkAction('holdshortage', this)">
 Hold Only Unavailable / Shortage Items
 </label>
 </td>
 </tr>
 
 ${materials}
+
+<tr><td height="20"></td></tr>
+
+<!-- CAPACITY GAUGE (live in Gmail web; static placeholder elsewhere) -->
+<tr>
+<td>
+<div data-grandtotal="1" style="padding:18px 22px;border:1px solid #d6dbe1;border-radius:10px;background:#f9fafb;text-align:center;">
+<p data-grandtotal-label="1" style="margin:0;font-size:15px;color:#111;">Total: <b>0 / ${capacityTonnes} tonnes</b> — no materials approved</p>
+<p style="margin:6px 0 0;font-size:12px;color:#666;">Truck capacity ${capacityTonnes} t. Updates as you tick approve checkboxes (Gmail web).</p>
+</div>
+</td>
+</tr>
 
 <tr><td height="30"></td></tr>
 
@@ -186,6 +202,7 @@ Submit Dispatch Decision – SO ${escapeHtml(section.soNumber)}
 export function buildDispatchApprovalHtml(
   poNumber: string,
   sections: DispatchSoSection[],
+  capacityTonnes: number = 31,
   formUrl: string = process.env.DISPATCH_FORM_URL || DEFAULT_FORM_URL
 ): string {
   const head = `<!DOCTYPE html>
@@ -197,17 +214,69 @@ export function buildDispatchApprovalHtml(
 <body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;">
 
 <script>
-function bulkAction(val){
-  let materials = document.querySelectorAll(".materialCheck");
-  let holds = document.querySelectorAll(".holdCheck");
-  materials.forEach(c=>c.checked=false);
-  holds.forEach(c=>c.checked=false);
-  if(val==="approve"){ materials.forEach(c=>c.checked=true); }
-  if(val==="holdall"){ holds.forEach(c=>c.checked=true); }
-  if(val==="holdshortage"){
-    let p = document.getElementById("hold_partial");
+const CAPACITY_TONNES = ${capacityTonnes};
+
+function formOf(el){ return el.closest("form"); }
+
+function updateTotal(srcEl){
+  const form = formOf(srcEl);
+  if(!form) return;
+  const approves = form.querySelectorAll(".materialCheck");
+  let totalKg = 0;
+  let approvedCount = 0;
+  approves.forEach(cb => {
+    if(!cb.checked) return;
+    approvedCount++;
+    const perUnit = parseFloat(cb.dataset.perunit || "0");
+    const maxQty = parseFloat(cb.dataset.maxqty || "0");
+    const qtyInput = form.querySelector('input[name="qty_' + cb.value.split("|")[0] + '"]');
+    let qty = maxQty;
+    if(qtyInput && qtyInput.value.trim() !== ""){
+      const v = parseFloat(qtyInput.value);
+      if(!isNaN(v) && v > 0) qty = v;
+    }
+    totalKg += qty * perUnit;
+  });
+  const tonnes = totalKg / 1000;
+  const tonnesStr = tonnes.toFixed(2).replace(/\\.00$/, "");
+  const box = form.querySelector('[data-grandtotal="1"]');
+  const label = form.querySelector('[data-grandtotal-label="1"]');
+  if(!box || !label) return;
+  if(approvedCount === 0){
+    label.innerHTML = "Total: <b>0 / " + CAPACITY_TONNES + " tonnes</b> — no materials approved";
+    box.style.background = "#f9fafb";
+    box.style.borderColor = "#d6dbe1";
+    return;
+  }
+  let msg = "Total: <b>" + tonnesStr + " / " + CAPACITY_TONNES + " tonnes</b> across " + approvedCount + " material(s)";
+  if(tonnes > CAPACITY_TONNES){
+    box.style.background = "#fef2f2";
+    box.style.borderColor = "#f87171";
+    msg += " ⚠ Over capacity by " + (tonnes - CAPACITY_TONNES).toFixed(2).replace(/\\.00$/, "") + " t";
+  } else if(tonnes > CAPACITY_TONNES * 0.9){
+    box.style.background = "#fffdf0";
+    box.style.borderColor = "#facc15";
+  } else {
+    box.style.background = "#ecfdf5";
+    box.style.borderColor = "#34d399";
+  }
+  label.innerHTML = msg;
+}
+
+function bulkAction(val, srcEl){
+  const form = srcEl ? formOf(srcEl) : null;
+  const root = form || document;
+  const materials = root.querySelectorAll(".materialCheck");
+  const holds = root.querySelectorAll(".holdCheck");
+  materials.forEach(c => { if(!c.disabled) c.checked = false; });
+  holds.forEach(c => c.checked = false);
+  if(val === "approve"){ materials.forEach(c => { if(!c.disabled) c.checked = true; }); }
+  if(val === "holdall"){ holds.forEach(c => c.checked = true); }
+  if(val === "holdshortage"){
+    const p = root.querySelector("#hold_partial");
     if(p) p.checked = true;
   }
+  if(form) updateTotal(form.querySelector(".materialCheck") || form);
 }
 </script>
 
@@ -226,7 +295,7 @@ function bulkAction(val){
 <tr><td height="30"></td></tr>
 `;
 
-  const body = sections.map((s) => renderSoSection(poNumber, s, formUrl)).join('\n');
+  const body = sections.map((s) => renderSoSection(poNumber, s, formUrl, capacityTonnes)).join('\n');
 
   const tail = `
 <tr>

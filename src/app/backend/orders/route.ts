@@ -19,6 +19,7 @@ export async function GET(request: Request) {
         createdAt: 'desc',
       },
       include: {
+        customer: true,
         salesOrders: {
           orderBy: {
             createdAt: 'asc',

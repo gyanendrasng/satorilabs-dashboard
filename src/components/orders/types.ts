@@ -61,10 +61,18 @@ export interface SalesOrder {
   invoice: Invoice | null;
 }
 
+export interface Customer {
+  id: string;
+  name: string;
+  weightage: string; // tonnes; serialized as string by Prisma Decimal
+}
+
 export interface PurchaseOrder {
   id: string;
   poNumber: string;
   customerName: string;
+  customerId: string | null;
+  customer: Customer | null;
   status: string;
   stage: number;
   createdAt: string;

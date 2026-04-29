@@ -105,6 +105,7 @@ model PurchaseOrder {
   id           String   @id @default(cuid())
   poNumber     String   @unique
   customerName String
+  customerId   String?
   status       String   @default("in-progress") // pending, in-progress, completed
   stage        Int      @default(1) // 1-6 workflow stages
   createdAt    DateTime @default(now())
@@ -112,8 +113,24 @@ model PurchaseOrder {
 
   salesOrders SalesOrder[]
   emails      Email[]
+  customer    Customer? @relation(fields: [customerId], references: [id])
 
   @@map("purchase_order")
+}
+
+// Customer record keyed by the externally-provided customer_id from the
+// NEW ORDER email. Auto-created on first sight with a generic name.
+// `weightage` is the customer's truck capacity in tonnes (default 31).
+model Customer {
+  id        String   @id
+  name      String   @default("New Customer")
+  weightage Decimal  @default(31)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  purchaseOrders PurchaseOrder[]
+
+  @@map("customer")
 }
 
 model SalesOrder {
