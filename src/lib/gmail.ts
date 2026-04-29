@@ -143,6 +143,80 @@ export async function getMessageRfc822Id(gmailMessageId: string): Promise<string
 }
 
 /**
+ * Send an HTML email (no attachments)
+ */
+export async function sendHtmlEmail(
+  to: string,
+  subject: string,
+  html: string
+): Promise<{ messageId: string; threadId: string }> {
+  const mimeMessage = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset="UTF-8"',
+    '',
+    html,
+  ].join('\r\n');
+
+  const raw = Buffer.from(mimeMessage)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  const response = await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw },
+  });
+
+  if (!response.data.id || !response.data.threadId) {
+    throw new Error('Failed to send HTML email: missing message or thread ID');
+  }
+
+  return { messageId: response.data.id, threadId: response.data.threadId };
+}
+
+/**
+ * Send an HTML email as a reply in an existing thread
+ */
+export async function sendHtmlReplyEmail(
+  to: string,
+  subject: string,
+  html: string,
+  threadId: string,
+  inReplyToRfc822Id: string
+): Promise<{ messageId: string; threadId: string }> {
+  const mimeMessage = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    `In-Reply-To: ${inReplyToRfc822Id}`,
+    `References: ${inReplyToRfc822Id}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/html; charset="UTF-8"',
+    '',
+    html,
+  ].join('\r\n');
+
+  const raw = Buffer.from(mimeMessage)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+
+  const response = await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw, threadId },
+  });
+
+  if (!response.data.id || !response.data.threadId) {
+    throw new Error('Failed to send HTML reply email: missing message or thread ID');
+  }
+
+  return { messageId: response.data.id, threadId: response.data.threadId };
+}
+
+/**
  * Send a plain text email as a reply in an existing thread
  */
 export async function sendReplyEmail(

@@ -773,6 +773,18 @@ export default function WorkPage() {
                           </div>
                         </div>
                         <div className="flex items-center gap-4 text-sm text-slate-400">
+                          {po.salesOrders.length > 1 && (() => {
+                            const total = po.salesOrders.length;
+                            const done = po.salesOrders.filter(
+                              (s) => s.visibilityState === 'received' || s.visibilityState === 'failed'
+                            ).length;
+                            if (done === total) return null;
+                            return (
+                              <span className="px-2 py-0.5 rounded bg-amber-700 text-amber-100 text-xs">
+                                {done}/{total} visibility done
+                              </span>
+                            );
+                          })()}
                           <span>{po.salesOrders.length} Sales Orders</span>
                           <span>-</span>
                           <span>
@@ -829,6 +841,24 @@ export default function WorkPage() {
                                             {so.soNumber}
                                           </span>
                                           {getStatusBadge(so.status, so.requiresInput && so.items.length > 0 && so.items.every(item => item.status === 'completed'))}
+                                          {so.visibilityState && so.visibilityState !== 'received' && (
+                                            <span
+                                              className={`px-2 py-0.5 rounded text-xs ${
+                                                so.visibilityState === 'queued'
+                                                  ? 'bg-slate-700 text-slate-200'
+                                                  : so.visibilityState === 'firing'
+                                                    ? 'bg-amber-700 text-amber-100'
+                                                    : 'bg-red-700 text-red-100'
+                                              }`}
+                                              title={`Visibility: ${so.visibilityState}`}
+                                            >
+                                              {so.visibilityState === 'queued'
+                                                ? 'Queued'
+                                                : so.visibilityState === 'firing'
+                                                  ? 'Visibility running'
+                                                  : 'Visibility failed'}
+                                            </span>
+                                          )}
                                           <span className="text-xs text-slate-400">
                                             {lsNumbers.length} LS - {so.items.length} Items
                                           </span>

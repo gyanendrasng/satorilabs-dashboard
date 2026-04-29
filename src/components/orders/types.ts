@@ -53,6 +53,8 @@ export interface SalesOrder {
   lrDate: string | null; // Lorry Receipt Date
   status: string;
   requiresInput: boolean;
+  visibilityState: string | null; // null | 'queued' | 'firing' | 'received' | 'failed'
+  visibilityRetries: number;
   createdAt: string;
   updatedAt: string;
   items: LoadingSlipItem[];

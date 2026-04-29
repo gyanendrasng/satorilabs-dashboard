@@ -1,5 +1,10 @@
 import { NextResponse } from 'next/server';
-import { checkForReplies, checkWorkflowTimers, checkForNewEmails } from '@/lib/email-reply-checker';
+import {
+  checkForReplies,
+  checkWorkflowTimers,
+  checkForNewEmails,
+  checkStaleVisibility,
+} from '@/lib/email-reply-checker';
 
 /**
  * GET /api/cron/check-emails
@@ -21,16 +26,27 @@ export async function GET(request: Request) {
 
     console.log('[Cron] Starting email reply check and timer check...');
 
-    // Run all three checks
+    // Run all four checks
     const newEmailResult = await checkForNewEmails();
     const replyResult = await checkForReplies();
     const timerResult = await checkWorkflowTimers();
+    const staleResult = await checkStaleVisibility();
 
-    const allLogs = [...newEmailResult.logs, ...replyResult.logs, ...timerResult.logs];
-    const allErrors = [...newEmailResult.errors, ...replyResult.errors, ...timerResult.errors];
+    const allLogs = [
+      ...newEmailResult.logs,
+      ...replyResult.logs,
+      ...timerResult.logs,
+      ...staleResult.logs,
+    ];
+    const allErrors = [
+      ...newEmailResult.errors,
+      ...replyResult.errors,
+      ...timerResult.errors,
+      ...staleResult.errors,
+    ];
 
     console.log(
-      `[Cron] Complete. New emails: ${newEmailResult.triggered}, Replies: ${replyResult.processed}, Reminders: ${timerResult.reminders_sent}, Errors: ${allErrors.length}`
+      `[Cron] Complete. New emails: ${newEmailResult.triggered}, Replies: ${replyResult.processed}, Reminders: ${timerResult.reminders_sent}, Stale recovered: ${staleResult.recovered}, Combined sent: ${staleResult.combinedSent}, Errors: ${allErrors.length}`
     );
 
     return NextResponse.json({
@@ -38,6 +54,8 @@ export async function GET(request: Request) {
       new_emails_triggered: newEmailResult.triggered,
       processed: replyResult.processed,
       reminders_sent: timerResult.reminders_sent,
+      stale_recovered: staleResult.recovered,
+      combined_emails_sent: staleResult.combinedSent,
       errors: allErrors,
       logs: allLogs,
       timestamp: new Date().toISOString(),
