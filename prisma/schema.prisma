@@ -154,6 +154,9 @@ model SalesOrder {
   requiresInput       Boolean  @default(true)
   visibilityState     String?  // null | 'queued' | 'firing' | 'received' | 'failed' — drives serial ZSO-VISIBILITY for multi-SO POs
   visibilityRetries   Int      @default(0)
+  // JSON release plan computed after branch reply intent (release_all / release_part):
+  // [{material_code, batch, quantity, weight_kg}]. Held until weight gate clears.
+  releasePlan         String?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 

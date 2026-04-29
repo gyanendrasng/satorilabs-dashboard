@@ -6,6 +6,7 @@ import {
   handleProductionReply,
   handleProductionConfirmation,
   handleVehicleDetailsReply,
+  handleVehicleSplitConfirmation,
   triggerZsoVisibility,
   assembleAndSendCombinedEmail,
 } from './auto-gui-trigger';
@@ -120,6 +121,14 @@ export async function checkForReplies(): Promise<{
 
       // Route based on emailType
       const emailType = (email as any).emailType as string | null;
+
+      if (emailType === 'vehicle_split_inquiry') {
+        log(`[EmailChecker] Routing to handleVehicleSplitConfirmation for PO email ${email.id}`);
+        const splitResult = await handleVehicleSplitConfirmation(email.id, replyBodyHtml);
+        logs.push(...splitResult.logs);
+        processed++;
+        continue;
+      }
 
       if (emailType === 'production_inquiry') {
         // Production team replied to our inquiry — extract days

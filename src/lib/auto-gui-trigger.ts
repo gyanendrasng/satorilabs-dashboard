@@ -222,28 +222,44 @@ function isPerSoMaterials(parsed: unknown): parsed is PerSoMaterials {
   );
 }
 
+interface ReleaseItem {
+  material_code: string;
+  batch: string;
+  quantity: number;
+  weight_kg: number;
+}
+
+interface SoReleasePlan {
+  soNumber: string;
+  salesOrderId: string;
+  items: ReleaseItem[];
+  totalWeightKg: number;
+}
+
 /**
- * Classify and act on a branch reply for a single SO. Used both directly
- * (legacy single-SO emails) and inside a loop (multi-SO combined emails).
+ * Classify a single SO's branch reply and (for release intents) compute the
+ * release plan from the persisted Material rows. Does NOT fire ZLOAD1 yet —
+ * that decision lives outside, after summing weights across the whole PO.
  *
- * `parentEmailId` — the Email row that originated this reply; used as
- * `loadingSlipItemId` carry-over for production inquiries when present.
+ * For 'wait' intent, sends the production inquiry email immediately
+ * (production replies are scoped per SO and don't go through the weight gate).
  */
-async function processBranchReplyForSo(args: {
-  parentEmailId: string;
+async function classifyAndPlanForSo(args: {
   parentLoadingSlipItemId: string | null;
   soNumber: string;
   salesOrderId: string;
-  storedMaterials: StoredMaterial[];
   originalEmailHtml: string;
   replyHtml: string;
   log: (msg: string) => void;
-}): Promise<{ success: boolean; intent?: string }> {
+}): Promise<
+  | { success: true; intent: 'release_all' | 'release_part'; plan: SoReleasePlan }
+  | { success: true; intent: 'wait' }
+  | { success: false; intent?: string }
+> {
   const {
     parentLoadingSlipItemId,
     soNumber,
     salesOrderId,
-    storedMaterials,
     originalEmailHtml,
     replyHtml,
     log,
@@ -279,28 +295,43 @@ async function processBranchReplyForSo(args: {
   }
 
   if (result.intent === 'release_all' || result.intent === 'release_part') {
-    const llmMaterials = result.materials || [];
-    const materials: MaterialItemPayload[] = llmMaterials.map((m: any) => {
-      const llmCode = m.material ?? m.material_code ?? '';
-      const llmBatch = m.batch ?? m.batch_number ?? '';
-      const stored = storedMaterials.find(
-        (s) => materialCodeOf(s) === llmCode || (llmBatch && batchOf(s) === llmBatch)
-      );
-      return {
-        material_code: llmCode,
-        batch: llmBatch || (stored ? batchOf(stored) : ''),
-        quantity: stored?.order_quantity || m.quantity || 0,
-      };
+    // Source release plan from the canonical Material rows (fresh DB read)
+    // rather than echoing back the LLM's parsed list — Material has the
+    // weight per row needed for the truck-capacity gate.
+    const materials = await prisma.material.findMany({
+      where: { salesOrderId },
+      orderBy: { createdAt: 'asc' },
     });
 
-    await prisma.salesOrder.update({
-      where: { id: salesOrderId },
-      data: { status: 'stock_approved' },
-    });
-    log(`[BranchReply] SO ${soNumber} status → stock_approved; enqueuing ZLOAD1 for ${materials.length} material(s)`);
-    await triggerZload1(soNumber, materials);
+    const items: ReleaseItem[] = [];
+    let totalWeightKg = 0;
+    for (const m of materials) {
+      const requested = m.orderQuantity;
+      const available = m.availableStock ?? requested;
+      // release_all → full requested qty; release_part → cap at availability
+      const qty = result.intent === 'release_all'
+        ? requested
+        : Math.min(requested, Math.max(available, 0));
+      if (qty <= 0) continue;
+      const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+      const perUnit = requested > 0 ? fullWeight / requested : 0;
+      const itemWeight = perUnit * qty;
+      items.push({
+        material_code: m.material,
+        batch: m.batch,
+        quantity: qty,
+        weight_kg: itemWeight,
+      });
+      totalWeightKg += itemWeight;
+    }
 
-    return { success: true, intent: result.intent };
+    log(`[BranchReply] SO ${soNumber} plan: ${items.length} item(s), ${(totalWeightKg / 1000).toFixed(2)} t`);
+
+    return {
+      success: true,
+      intent: result.intent,
+      plan: { soNumber, salesOrderId, items, totalWeightKg },
+    };
   }
 
   if (result.intent === 'wait') {
@@ -321,12 +352,13 @@ async function processBranchReplyForSo(args: {
       emailPayload.body
     );
 
-    const missingCodes: string[] = result.missing_materials || [];
-    const filteredStored = storedMaterials.filter((m) => {
-      const code = materialCodeOf(m);
-      if (!code) return false;
-      return missingCodes.some((c) => c === code || c.includes(code));
+    const storedMaterials = await prisma.material.findMany({
+      where: { salesOrderId },
     });
+    const missingCodes: string[] = result.missing_materials || [];
+    const filteredStored = storedMaterials.filter((m) =>
+      missingCodes.some((c) => c === m.material || c.includes(m.material))
+    );
     const carryForward = filteredStored.length > 0 ? filteredStored : storedMaterials;
 
     await prisma.email.create({
@@ -350,6 +382,174 @@ async function processBranchReplyForSo(args: {
 
   log(`[BranchReply] SO ${soNumber}: unknown intent "${result.intent}"`);
   return { success: false, intent: result.intent };
+}
+
+/**
+ * Email the branch asking whether to split a multi-vehicle dispatch.
+ * Plain prose body with a per-SO breakdown of what would be released and
+ * the total tonnage vs. truck capacity. Branch replies in plain text;
+ * `handleVehicleSplitConfirmation` parses the reply.
+ */
+async function sendVehicleSplitInquiry(args: {
+  purchaseOrderId: string;
+  plans: SoReleasePlan[];
+  totalTonnes: number;
+  capacityTonnes: number;
+  originalCombinedEmail: { gmailThreadId: string; gmailMessageId: string };
+  log: (msg: string) => void;
+}): Promise<void> {
+  const { purchaseOrderId, plans, totalTonnes, capacityTonnes, originalCombinedEmail, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log(`[VehicleSplit] BRANCH_EMAIL not configured, cannot send inquiry`);
+    return;
+  }
+
+  const po = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId } });
+  if (!po) {
+    log(`[VehicleSplit] PO ${purchaseOrderId} not found`);
+    return;
+  }
+
+  const overBy = (totalTonnes - capacityTonnes).toFixed(2).replace(/\.00$/, '');
+  const totalStr = totalTonnes.toFixed(2).replace(/\.00$/, '');
+
+  const breakdown = plans
+    .map((p) => {
+      const t = (p.totalWeightKg / 1000).toFixed(2).replace(/\.00$/, '');
+      return `  • SO ${p.soNumber}: ${p.items.length} item(s), ${t} t`;
+    })
+    .join('\n');
+
+  const subject = `Vehicle Split Confirmation Required - PO ${po.poNumber}`;
+  const body = [
+    `Dear Branch Team,`,
+    ``,
+    `The total weight of the approved dispatch for Purchase Order ${po.poNumber} is ${totalStr} tonnes, which exceeds the truck capacity of ${capacityTonnes} tonnes by ${overBy} tonnes.`,
+    ``,
+    `Per-SO breakdown:`,
+    breakdown,
+    ``,
+    `Please confirm whether to proceed with TWO vehicles. Reply "yes" to split into 2 vehicles, or "no" to revise the dispatch.`,
+    ``,
+    `Best regards,`,
+    `Sales Order Dispatch Co-ordinator`,
+  ].join('\n');
+
+  let sent: { messageId: string; threadId: string };
+  try {
+    const rfc822Id = await getMessageRfc822Id(originalCombinedEmail.gmailMessageId);
+    if (rfc822Id) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, originalCombinedEmail.gmailThreadId, rfc822Id);
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[VehicleSplit] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  await prisma.email.create({
+    data: {
+      purchaseOrderId,
+      salesOrderId: plans[0]?.salesOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'vehicle_split_inquiry',
+      workflowState: 'awaiting_split_confirmation',
+      sentBody: body,
+      relatedMaterials: JSON.stringify({ version: 'split-v1', plans, totalTonnes, capacityTonnes }),
+    },
+  });
+
+  log(`[VehicleSplit] Inquiry sent to ${BRANCH_EMAIL} for PO ${po.poNumber} (messageId=${sent.messageId})`);
+}
+
+/**
+ * Handle branch's reply to the vehicle-split inquiry.
+ * Reads each SO's stored releasePlan and fires ZLOAD1 if confirmed.
+ */
+export async function handleVehicleSplitConfirmation(
+  emailId: string,
+  replyHtml: string
+): Promise<{ success: boolean; logs: string[] }> {
+  const logs: string[] = [];
+  const log = (msg: string) => {
+    const m = `[${new Date().toISOString()}] ${msg}`;
+    console.log(m);
+    logs.push(m);
+  };
+
+  try {
+    const email = await prisma.email.findUnique({ where: { id: emailId } });
+    if (!email || !email.purchaseOrderId) {
+      log(`[VehicleSplit] Email or purchaseOrderId missing on ${emailId}`);
+      return { success: false, logs };
+    }
+
+    // Light-weight yes/no detection. Reply text is short and structured here.
+    const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(
+      replyText
+    );
+    const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
+
+    log(`[VehicleSplit] Reply intent: yes=${isYes} no=${isNo} text="${replyText.slice(0, 80)}"`);
+
+    if (isYes && !isNo) {
+      // Confirmed: load each SO's stored plan and fire ZLOAD1.
+      const sos = await prisma.salesOrder.findMany({
+        where: { purchaseOrderId: email.purchaseOrderId, releasePlan: { not: null } },
+      });
+      log(`[VehicleSplit] Confirmed split — firing ZLOAD1 for ${sos.length} SO(s)`);
+      for (const so of sos) {
+        if (!so.releasePlan) continue;
+        try {
+          const plan = JSON.parse(so.releasePlan) as SoReleasePlan;
+          await fireZload1FromPlan(plan, log);
+        } catch (err) {
+          log(`[VehicleSplit] failed to fire SO ${so.soNumber}: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      await prisma.email.update({
+        where: { id: emailId },
+        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
+      });
+      return { success: true, logs };
+    }
+
+    if (isNo) {
+      log(`[VehicleSplit] Branch declined split — keeping plans on hold`);
+      await prisma.email.update({
+        where: { id: emailId },
+        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
+      });
+      return { success: true, logs };
+    }
+
+    log(`[VehicleSplit] Reply ambiguous — leaving in 'awaiting_split_confirmation'`);
+    return { success: false, logs };
+  } catch (err) {
+    log(`[VehicleSplit] error: ${err instanceof Error ? err.message : err}`);
+    return { success: false, logs };
+  }
+}
+
+async function fireZload1FromPlan(plan: SoReleasePlan, log: (msg: string) => void): Promise<void> {
+  await prisma.salesOrder.update({
+    where: { id: plan.salesOrderId },
+    data: { status: 'stock_approved', releasePlan: null },
+  });
+  const materials: MaterialItemPayload[] = plan.items.map((i) => ({
+    material_code: i.material_code,
+    batch: i.batch,
+    quantity: i.quantity,
+  }));
+  log(`[BranchReply] Firing ZLOAD1 for SO ${plan.soNumber}: ${materials.length} item(s)`);
+  await triggerZload1(plan.soNumber, materials);
 }
 
 export async function handleBranchReply(
@@ -387,19 +587,72 @@ export async function handleBranchReply(
     if (email.purchaseOrderId && isPerSoMaterials(parsedMaterials)) {
       log(`[BranchReply] Multi-SO mode for PO email ${emailId}: ${parsedMaterials.perSO.length} SO(s)`);
 
+      const plans: SoReleasePlan[] = [];
       let anyFailure = false;
+
+      // Phase 1: classify each SO and either build a release plan OR
+      // dispatch a per-SO production inquiry ('wait' intent).
       for (const entry of parsedMaterials.perSO) {
-        const r = await processBranchReplyForSo({
-          parentEmailId: emailId,
+        const r = await classifyAndPlanForSo({
           parentLoadingSlipItemId: email.loadingSlipItemId,
           soNumber: entry.soNumber,
           salesOrderId: entry.salesOrderId,
-          storedMaterials: entry.materials || [],
           originalEmailHtml,
           replyHtml,
           log,
         });
-        if (!r.success) anyFailure = true;
+        if (!r.success) {
+          anyFailure = true;
+          continue;
+        }
+        if (r.intent === 'release_all' || r.intent === 'release_part') {
+          plans.push(r.plan);
+        }
+        // 'wait' SOs are already handled inside classifyAndPlanForSo
+      }
+
+      // Phase 2: weight gate. Sum across all release plans for this PO.
+      // If the total exceeds the customer's truck capacity, pause and ask
+      // for 2-vehicle confirmation before firing any ZLOAD1.
+      if (plans.length > 0) {
+        const totalKg = plans.reduce((s, p) => s + p.totalWeightKg, 0);
+        const totalTonnes = totalKg / 1000;
+
+        const po = await prisma.purchaseOrder.findUnique({
+          where: { id: email.purchaseOrderId },
+          include: { customer: true },
+        });
+        const capacityTonnes = po?.customer?.weightage
+          ? Number(po.customer.weightage)
+          : 31;
+
+        log(`[BranchReply] PO ${po?.poNumber}: total release weight ${totalTonnes.toFixed(2)} t (capacity ${capacityTonnes} t)`);
+
+        if (totalTonnes > capacityTonnes) {
+          log(`[BranchReply] Over capacity by ${(totalTonnes - capacityTonnes).toFixed(2)} t — sending vehicle-split inquiry`);
+
+          // Persist plans on each SO so the split-confirmation reply can fire ZLOAD1.
+          for (const plan of plans) {
+            await prisma.salesOrder.update({
+              where: { id: plan.salesOrderId },
+              data: { releasePlan: JSON.stringify(plan) },
+            });
+          }
+
+          await sendVehicleSplitInquiry({
+            purchaseOrderId: email.purchaseOrderId,
+            plans,
+            totalTonnes,
+            capacityTonnes,
+            originalCombinedEmail: email,
+            log,
+          });
+        } else {
+          // Under capacity — fire ZLOAD1 per SO using each plan.
+          for (const plan of plans) {
+            await fireZload1FromPlan(plan, log);
+          }
+        }
       }
 
       await prisma.email.update({
@@ -410,22 +663,46 @@ export async function handleBranchReply(
       return { success: !anyFailure, logs };
     }
 
-    // Legacy single-SO path
+    // Legacy single-SO path. Treat the same way: classify, plan, weight-gate
+    // against the (optional) customer capacity if linked.
     const soNumber = email.salesOrder!.soNumber;
-    const storedMaterials: StoredMaterial[] = Array.isArray(parsedMaterials)
-      ? (parsedMaterials as StoredMaterial[])
-      : [];
-
-    const r = await processBranchReplyForSo({
-      parentEmailId: emailId,
+    const r = await classifyAndPlanForSo({
       parentLoadingSlipItemId: email.loadingSlipItemId,
       soNumber,
       salesOrderId: email.salesOrderId!,
-      storedMaterials,
       originalEmailHtml,
       replyHtml,
       log,
     });
+
+    if (r.success && (r.intent === 'release_all' || r.intent === 'release_part')) {
+      const totalTonnes = r.plan.totalWeightKg / 1000;
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: r.plan.salesOrderId },
+        include: { purchaseOrder: { include: { customer: true } } },
+      });
+      const capacityTonnes = so?.purchaseOrder.customer?.weightage
+        ? Number(so.purchaseOrder.customer.weightage)
+        : 31;
+
+      if (totalTonnes > capacityTonnes) {
+        log(`[BranchReply] Single-SO over capacity (${totalTonnes.toFixed(2)} t > ${capacityTonnes} t) — sending split inquiry`);
+        await prisma.salesOrder.update({
+          where: { id: r.plan.salesOrderId },
+          data: { releasePlan: JSON.stringify(r.plan) },
+        });
+        await sendVehicleSplitInquiry({
+          purchaseOrderId: so!.purchaseOrderId,
+          plans: [r.plan],
+          totalTonnes,
+          capacityTonnes,
+          originalCombinedEmail: email,
+          log,
+        });
+      } else {
+        await fireZload1FromPlan(r.plan, log);
+      }
+    }
 
     await prisma.email.update({
       where: { id: emailId },
