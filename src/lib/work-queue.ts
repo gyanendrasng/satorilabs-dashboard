@@ -12,6 +12,10 @@ export interface ChatPayload {
   so_number: string;
   attachments?: Array<{ filename: string; content_base64: string }>;
   extraction_context?: string;
+  // auto_gui2 passthrough metadata. Echoed in the /chat response and
+  // automatically merged into outgoing send_data callbacks (zload1-data,
+  // visibility-data, etc.) and into the COMPLETION_WEBHOOK payload.
+  meta?: Record<string, unknown>;
 }
 
 /**
@@ -66,7 +70,13 @@ export async function pumpQueue(): Promise<WorkQueue | null> {
 
   // Fire-and-forget POST to auto_gui2. The status callback advances the queue.
   const payload = JSON.parse(next.payload) as ChatPayload;
-  const wireBody = { work_id: next.id, ...payload };
+  // Inject work_id into both the top level (legacy) and `meta` (so the
+  // COMPLETION_WEBHOOK and any send_data callbacks echo it back).
+  const wireBody = {
+    work_id: next.id,
+    ...payload,
+    meta: { ...(payload.meta ?? {}), work_id: next.id },
+  };
 
   fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
     method: 'POST',

@@ -2,10 +2,41 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { markDone, markFailed, pumpQueue } from '@/lib/work-queue';
 
+/**
+ * Accepts EITHER of two body shapes:
+ *
+ * 1. Legacy:                 { work_id, status: 'done'|'failed', error? }
+ * 2. auto_gui2 webhook:      { event: 'workflow_complete', meta: { work_id, ... }, success: bool, summary, error? }
+ *
+ * COMPLETION_WEBHOOK_URL on auto_gui2 should be set to this route.
+ */
 interface StepStatusPayload {
+  // shape 1
   work_id?: string;
   status?: 'done' | 'failed';
   error?: string;
+  // shape 2 (auto_gui2 COMPLETION_WEBHOOK)
+  event?: string;
+  meta?: { work_id?: string; [k: string]: unknown };
+  success?: boolean;
+  summary?: string;
+}
+
+function normalizeBody(body: StepStatusPayload): { workId: string | null; status: 'done' | 'failed' | null; errorMsg?: string } {
+  // Shape 2 — has `event:'workflow_complete'` or any `meta.work_id` + `success`.
+  const isWebhook = body.event === 'workflow_complete' || (typeof body.success === 'boolean' && body.meta && typeof body.meta.work_id === 'string');
+  if (isWebhook) {
+    const workId = (body.meta?.work_id as string | undefined) ?? null;
+    const status: 'done' | 'failed' | null = body.success === true ? 'done' : body.success === false ? 'failed' : null;
+    const errorMsg = body.success === false ? (body.error ?? body.summary ?? 'auto_gui2 reported failure') : undefined;
+    return { workId, status, errorMsg };
+  }
+  // Shape 1
+  return {
+    workId: body.work_id ?? null,
+    status: body.status === 'done' || body.status === 'failed' ? body.status : null,
+    errorMsg: body.error,
+  };
 }
 
 /**
@@ -25,16 +56,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const workId = body.work_id;
-  const status = body.status;
-  const errorMsg = body.error;
+  const { workId, status, errorMsg } = normalizeBody(body);
 
-  if (!workId || typeof workId !== 'string') {
-    return NextResponse.json({ error: 'work_id is required' }, { status: 400 });
+  if (!workId) {
+    return NextResponse.json({ error: 'work_id (or meta.work_id) is required' }, { status: 400 });
   }
   if (status !== 'done' && status !== 'failed') {
     return NextResponse.json(
-      { error: "status must be 'done' or 'failed'" },
+      { error: "status must be 'done' or 'failed' (or success: bool in webhook shape)" },
       { status: 400 }
     );
   }

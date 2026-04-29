@@ -869,33 +869,62 @@ export async function handleDispatchConfirmation(
         await sendVehicleDetailsForBundle(b.id);
       }
 
-      const sos = await prisma.salesOrder.findMany({
+      // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that
+      // SO that live in that bundle. An SO that spans bundles gets multiple
+      // fires; a bundle that holds multiple SOs also gets multiple fires.
+      // The global WorkQueue serializes everything; we just control enqueue
+      // order: bundleNumber asc, then SO createdAt asc within a bundle.
+      const bundlesWithMaterials = await prisma.bundle.findMany({
         where: { purchaseOrderId: email.purchaseOrderId },
+        orderBy: { bundleNumber: 'asc' },
         include: {
           materials: {
             where: { dispatchQuantity: { gt: 0 } },
+            include: {
+              salesOrder: { select: { id: true, soNumber: true, createdAt: true } },
+            },
           },
         },
       });
 
       let fired = 0;
-      for (const so of sos) {
-        if (so.materials.length === 0) {
-          log(`[DispatchConfirm] SO ${so.soNumber}: no materials to dispatch — skipping`);
-          continue;
+      const stockApprovedSoIds = new Set<string>();
+
+      for (const bundle of bundlesWithMaterials) {
+        // Group this bundle's materials by SO.
+        type Slot = { soNumber: string; salesOrderId: string; createdAt: Date; items: MaterialItemPayload[] };
+        const bySo = new Map<string, Slot>();
+        for (const m of bundle.materials) {
+          const slot = bySo.get(m.salesOrderId) ?? {
+            soNumber: m.salesOrder.soNumber,
+            salesOrderId: m.salesOrderId,
+            createdAt: m.salesOrder.createdAt,
+            items: [],
+          };
+          slot.items.push({
+            material_code: m.material,
+            batch: m.batch,
+            quantity: m.dispatchQuantity!,
+          });
+          bySo.set(m.salesOrderId, slot);
         }
-        const items: MaterialItemPayload[] = so.materials.map((m) => ({
-          material_code: m.material,
-          batch: m.batch,
-          quantity: m.dispatchQuantity!,
-        }));
-        await prisma.salesOrder.update({
-          where: { id: so.id },
-          data: { status: 'stock_approved', releasePlan: null },
-        });
-        await triggerZload1(so.soNumber, items);
-        fired++;
-        log(`[DispatchConfirm] Fired ZLOAD1 for SO ${so.soNumber}: ${items.length} item(s)`);
+
+        const slots = Array.from(bySo.values()).sort(
+          (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
+        );
+
+        for (const slot of slots) {
+          if (!stockApprovedSoIds.has(slot.salesOrderId)) {
+            await prisma.salesOrder.update({
+              where: { id: slot.salesOrderId },
+              data: { status: 'stock_approved', releasePlan: null },
+            });
+            stockApprovedSoIds.add(slot.salesOrderId);
+          }
+          await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
+          fired++;
+          log(`[DispatchConfirm] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
+        }
       }
 
       await prisma.email.update({
@@ -1544,7 +1573,9 @@ export async function triggerVto1n(
  */
 async function triggerZload1(
   soNumber: string,
-  materials: MaterialItemPayload[]
+  materials: MaterialItemPayload[],
+  bundleId?: string,
+  bundleNumber?: number
 ): Promise<void> {
   const materialsList = materials
     .map(
@@ -1553,7 +1584,8 @@ async function triggerZload1(
     )
     .join('\n');
 
-  const instruction = `VPN is connected, SAP is logged in. Execute ZLOAD1 for sales order ${soNumber}. Materials to dispatch:\n${materialsList}`;
+  const bundleSuffix = bundleNumber ? ` (Bundle ${bundleNumber})` : '';
+  const instruction = `VPN is connected, SAP is logged in. Execute ZLOAD1 for sales order ${soNumber}${bundleSuffix}. Materials to dispatch:\n${materialsList}`;
 
   const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
 
@@ -1564,10 +1596,15 @@ async function triggerZload1(
       instruction,
       transaction_code: 'ZLOAD1',
       so_number: soNumber,
+      meta: {
+        so_number: soNumber,
+        ...(bundleId ? { bundle_id: bundleId } : {}),
+        ...(bundleNumber ? { bundle_number: bundleNumber } : {}),
+      },
     },
   });
   await pumpQueue();
-  console.log(`[ZLOAD1] Enqueued for SO ${soNumber} (${materials.length} material(s))`);
+  console.log(`[ZLOAD1] Enqueued for SO ${soNumber}${bundleSuffix} (${materials.length} material(s))`);
 }
 
 /**

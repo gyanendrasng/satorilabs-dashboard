@@ -117,9 +117,23 @@ export async function POST(request: Request) {
 
     // Bundles + vehicle-details emails were created at dispatch-confirmation
     // time (before ZLOAD1 fired) so the truck count was settled with the
-    // branch already. Just link this LSI to the matching Material's bundle.
+    // branch already.
+    //
+    // auto_gui2's `meta` passthrough merges the bundle_id we sent in /chat
+    // into this multipart callback (see services/gui_service.py send_data).
+    // When present, set LSI.bundleId directly. Otherwise fall back to the
+    // material-lookup heuristic.
     try {
-      await linkLsiToBundle(loadingSlipItem.id);
+      const incomingBundleId = (formData.get('bundle_id') as string | null) || null;
+      if (incomingBundleId) {
+        await prisma.loadingSlipItem.update({
+          where: { id: loadingSlipItem.id },
+          data: { bundleId: incomingBundleId },
+        });
+        console.log(`[ZLOAD1 Data] Linked LSI ${loadingSlipItem.id} to Bundle ${incomingBundleId} (via meta)`);
+      } else {
+        await linkLsiToBundle(loadingSlipItem.id);
+      }
     } catch (linkErr) {
       console.error(
         `[ZLOAD1 Data] Failed to link LSI ${loadingSlipItem.id} to bundle:`,
