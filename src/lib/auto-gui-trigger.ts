@@ -530,6 +530,112 @@ export async function handleVehicleSplitConfirmation(
   }
 }
 
+/**
+ * Send a vehicle-details email to BRANCH_EMAIL for ONE Bundle (one truck).
+ * Saves email row keyed to bundleId so the reply lands on the right bundle.
+ * Idempotent: skips if a 'sent' vehicle_details email already exists for the bundle.
+ */
+export async function sendVehicleDetailsForBundle(
+  bundleId: string
+): Promise<{ sent: boolean; logs: string[] }> {
+  const logs: string[] = [];
+  const log = (m: string) => {
+    const t = `[${new Date().toISOString()}] ${m}`;
+    console.log(t);
+    logs.push(t);
+  };
+
+  if (!BRANCH_EMAIL) {
+    log(`[VehicleDetails] BRANCH_EMAIL not configured`);
+    return { sent: false, logs };
+  }
+
+  const bundle = await prisma.bundle.findUnique({
+    where: { id: bundleId },
+    include: {
+      purchaseOrder: true,
+      items: {
+        include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+      },
+    },
+  });
+  if (!bundle) {
+    log(`[VehicleDetails] Bundle ${bundleId} not found`);
+    return { sent: false, logs };
+  }
+
+  // Idempotency
+  const existing = await prisma.email.findFirst({
+    where: { bundleId, emailType: 'vehicle_details', status: 'sent' },
+    select: { id: true },
+  });
+  if (existing) {
+    log(`[VehicleDetails] Bundle ${bundle.bundleNumber} already has vehicle_details email — skipping`);
+    return { sent: false, logs };
+  }
+
+  const lsLines = bundle.items
+    .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
+    .join('\n');
+  const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
+
+  const subject = `Vehicle Details Required - PO ${bundle.purchaseOrder.poNumber} / Bundle ${bundle.bundleNumber}`;
+  const body = [
+    `Dear Branch Team,`,
+    ``,
+    `Loading slips have been created for Bundle ${bundle.bundleNumber} of Purchase Order ${bundle.purchaseOrder.poNumber} (~${totalT} t). The bundle covers the following items:`,
+    ``,
+    lsLines,
+    ``,
+    `Please reply with the following vehicle/transport details for this bundle:`,
+    `  1. Vehicle Number (e.g., GJ12AB1234)`,
+    `  2. Driver Mobile Number (e.g., 9876543210)`,
+    `  3. Container Number`,
+    ``,
+    `Best regards,`,
+    `Sales Order Dispatch Co-ordinator`,
+  ].join('\n');
+
+  // Reply in the original NEW ORDER thread of any SO in this bundle, when possible.
+  const anchor = bundle.items.find((it) => it.salesOrder.originalThreadId && it.salesOrder.originalMessageId)?.salesOrder;
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
+      const rfc822Id = await getMessageRfc822Id(anchor.originalMessageId);
+      if (rfc822Id) {
+        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.originalThreadId, rfc822Id);
+      } else {
+        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      }
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[VehicleDetails] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  await prisma.email.create({
+    data: {
+      bundleId,
+      purchaseOrderId: bundle.purchaseOrderId,
+      // also link to the lead SO so existing reply-checker SO logging stays sane
+      salesOrderId: bundle.items[0]?.salesOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'vehicle_details',
+      workflowState: 'awaiting_reply',
+      sentBody: body,
+    },
+  });
+
+  log(`[VehicleDetails] Sent vehicle-details email for Bundle ${bundle.bundleNumber} (PO ${bundle.purchaseOrder.poNumber})`);
+  return { sent: true, logs };
+}
+
 async function fireZload1FromPlan(plan: SoReleasePlan, log: (msg: string) => void): Promise<void> {
   await prisma.salesOrder.update({
     where: { id: plan.salesOrderId },
@@ -1581,12 +1687,23 @@ export async function handleVehicleDetailsReply(
       return { success: true, logs };
     }
 
-    // All fields present — save to SalesOrder
-    await prisma.salesOrder.update({
-      where: { id: salesOrderId },
-      data: { vehicleNumber, driverMobile, containerNumber },
-    });
-    log(`[VehicleDetails] Saved vehicle details to SO ${soNumber}`);
+    // All fields present.
+    // If this email was sent for a specific Bundle (per-truck), save vehicle
+    // details on that Bundle (PO-level grouping, can span multiple SOs).
+    // Otherwise fall back to the legacy per-SO save path.
+    if (email.bundleId) {
+      await prisma.bundle.update({
+        where: { id: email.bundleId },
+        data: { vehicleNumber, driverMobile, containerNumber },
+      });
+      log(`[VehicleDetails] Saved vehicle details on Bundle ${email.bundleId} (truck-level)`);
+    } else {
+      await prisma.salesOrder.update({
+        where: { id: salesOrderId },
+        data: { vehicleNumber, driverMobile, containerNumber },
+      });
+      log(`[VehicleDetails] Saved vehicle details to SO ${soNumber} (legacy per-SO path)`);
+    }
 
     // Mark email as completed
     await prisma.email.update({
@@ -1594,28 +1711,40 @@ export async function handleVehicleDetailsReply(
       data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed' },
     });
 
-    // Send stored LS PDF(s) directly to plant (skip ZLOAD3-A — file already in R2 from ZLOAD1)
-    const lsItems = await prisma.loadingSlipItem.findMany({
-      where: { salesOrderId, fileUrl: { not: null } },
-    });
+    // Send stored LS PDF(s) directly to plant (skip ZLOAD3-A — file already in R2 from ZLOAD1).
+    // For bundle emails: send only the LSIs in THIS bundle. For legacy: per-SO.
+    const lsItems = email.bundleId
+      ? await prisma.loadingSlipItem.findMany({
+          where: { bundleId: email.bundleId, fileUrl: { not: null } },
+        })
+      : await prisma.loadingSlipItem.findMany({
+          where: { salesOrderId, fileUrl: { not: null } },
+        });
 
     if (lsItems.length === 0) {
-      log(`[VehicleDetails] No LS files found for SO ${soNumber}, skipping plant email`);
+      log(`[VehicleDetails] No LS files found, skipping plant email`);
     } else {
       for (const item of lsItems) {
         try {
           const pdfBuffer = await downloadFromS3(item.fileUrl!);
           const filename = item.fileUrl!.split('/').pop() || `${item.lsNumber}.pdf`;
+          // Look up the LSI's own SO (for bundle emails this can differ
+          // from the email's anchor SO).
+          const itemSo = await prisma.salesOrder.findUnique({
+            where: { id: item.salesOrderId },
+            select: { soNumber: true },
+          });
+          const itemSoNumber = itemSo?.soNumber ?? soNumber;
           await sendLSEmail(
             item.id,
-            salesOrderId,
-            soNumber,
+            item.salesOrderId,
+            itemSoNumber,
             item.lsNumber,
             pdfBuffer,
             { vehicleNumber, driverMobile, containerNumber },
             filename
           );
-          log(`[VehicleDetails] Sent LS ${item.lsNumber} to plant for SO ${soNumber}`);
+          log(`[VehicleDetails] Sent LS ${item.lsNumber} to plant for SO ${itemSoNumber}`);
         } catch (sendErr) {
           log(`[VehicleDetails] Failed to send LS ${item.lsNumber} to plant: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
         }

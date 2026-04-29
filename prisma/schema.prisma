@@ -129,11 +129,21 @@ model Bundle {
   bundleNumber    Int      // 1-based within the PO (B1, B2, …)
   totalWeightKg   Decimal  @default(0)
   status          String   @default("planned") // planned, invoiced, dispatched
+
+  // Vehicle / transport details — one set per Bundle (per-truck), since
+  // a bundle can carry LSIs from multiple SOs of the same PO.
+  vehicleNumber   String?
+  driverMobile    String?
+  containerNumber String?
+  transportId     String?
+  sealNumber      String?
+
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
   purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   items         LoadingSlipItem[]
+  emails        Email[]
 
   @@unique([purchaseOrderId, bundleNumber])
   @@map("bundle")
@@ -281,6 +291,7 @@ model Email {
   salesOrderId      String?   // Direct link to SalesOrder (lead SO for combined dispatch emails)
   loadingSlipItemId String?   // Optional link to LoadingSlipItem (for LS-specific emails)
   purchaseOrderId   String?   // For multi-SO dispatch emails grouped under one PO
+  bundleId          String?   // For per-bundle (per-truck) emails — vehicle details, etc.
   gmailMessageId    String    @unique // Gmail message ID for reply tracking
   gmailThreadId     String             // Thread ID to find replies
   recipientEmail    String
@@ -301,6 +312,7 @@ model Email {
   salesOrder      SalesOrder?      @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   loadingSlipItem LoadingSlipItem? @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
   purchaseOrder   PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  bundle          Bundle?          @relation(fields: [bundleId], references: [id], onDelete: Cascade)
 
   @@map("email")
 }

@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { computeBundlesForPo, isPoZload1Complete } from '@/lib/bundler';
+import { sendVehicleDetailsForBundle } from '@/lib/auto-gui-trigger';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { sendReplyEmail, sendPlainEmail, getMessageRfc822Id } from '@/lib/gmail';
@@ -116,7 +117,9 @@ export async function POST(request: Request) {
     });
 
     // Bundle gate: once every SO in the PO has at least one LSI with a
-    // fileUrl, recompute capacity-based bundles for the whole PO. Idempotent.
+    // fileUrl, recompute capacity-based bundles for the whole PO and send
+    // one vehicle-details email per bundle (per-truck). Idempotent —
+    // sendVehicleDetailsForBundle skips if already sent.
     try {
       const poComplete = await isPoZload1Complete(salesOrder.purchaseOrderId);
       if (poComplete) {
@@ -124,80 +127,20 @@ export async function POST(request: Request) {
         console.log(
           `[ZLOAD1 Data] Computed ${result.bundleCount} bundle(s) for PO ${salesOrder.purchaseOrderId}: ${result.totalKg.toFixed(0)} kg / ${result.capacityKg} kg cap`
         );
+        const bundles = await prisma.bundle.findMany({
+          where: { purchaseOrderId: salesOrder.purchaseOrderId },
+          select: { id: true, bundleNumber: true },
+          orderBy: { bundleNumber: 'asc' },
+        });
+        for (const b of bundles) {
+          await sendVehicleDetailsForBundle(b.id);
+        }
       }
     } catch (bundleErr) {
       console.error(
-        `[ZLOAD1 Data] Bundle computation failed for PO ${salesOrder.purchaseOrderId}:`,
+        `[ZLOAD1 Data] Bundle/vehicle-email step failed for PO ${salesOrder.purchaseOrderId}:`,
         bundleErr
       );
-    }
-
-    // Send email asking for vehicle details (reply in original thread).
-    // Only one email per SO — multiple LS files arrive in separate requests,
-    // but the body is SO-level and the reply handler applies the details to
-    // every LoadingSlipItem, so subsequent LSs must not re-fire the email.
-    if (BRANCH_EMAIL) {
-      const existingVehicleEmail = await prisma.email.findFirst({
-        where: {
-          salesOrderId: salesOrder.id,
-          emailType: 'vehicle_details',
-          status: 'sent',
-        },
-        select: { id: true },
-      });
-
-      if (existingVehicleEmail) {
-        console.log(`[ZLOAD1 Data] Vehicle details email already sent for SO ${soNumber} — skipping (LS ${lsNumber})`);
-      } else {
-        const vehicleEmailBody = [
-          `Loading slip for Sales Order ${soNumber} has been created successfully.`,
-          '',
-          'Please reply with the following vehicle/transport details:',
-          '1. Vehicle Number (e.g., GJ12AB1234)',
-          '2. Driver Mobile Number (e.g., 9876543210)',
-          '3. Container Number',
-        ].join('\n');
-
-        const subject = `Vehicle Details Required - SO ${soNumber}`;
-
-        try {
-          let emailResult: { messageId: string; threadId: string };
-
-          if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
-            try {
-              const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
-              if (rfc822Id) {
-                console.log(`[ZLOAD1 Data] Replying in original thread ${salesOrder.originalThreadId} for vehicle details`);
-                emailResult = await sendReplyEmail(BRANCH_EMAIL, subject, vehicleEmailBody, salesOrder.originalThreadId, rfc822Id);
-              } else {
-                emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
-              }
-            } catch {
-              emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
-            }
-          } else {
-            emailResult = await sendPlainEmail(BRANCH_EMAIL, subject, vehicleEmailBody);
-          }
-
-          // Create Email record for tracking vehicle details reply
-          await prisma.email.create({
-            data: {
-              salesOrderId: salesOrder.id,
-              gmailMessageId: emailResult.messageId,
-              gmailThreadId: emailResult.threadId,
-              recipientEmail: BRANCH_EMAIL,
-              subject,
-              status: 'sent',
-              emailType: 'vehicle_details',
-              workflowState: 'awaiting_reply',
-            },
-          });
-
-          console.log(`[ZLOAD1 Data] Vehicle details email sent for SO ${soNumber} - messageId: ${emailResult.messageId}`);
-        } catch (emailErr) {
-          console.error(`[ZLOAD1 Data] Failed to send vehicle details email for SO ${soNumber}:`, emailErr instanceof Error ? emailErr.message : emailErr);
-        }
-      }
     }
 
     return NextResponse.json({
