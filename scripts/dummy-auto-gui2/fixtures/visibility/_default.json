@@ -1,0 +1,28 @@
+{
+  "materials": [
+    {
+      "material": "OP7WJ300X450-5",
+      "material_description": "LUNIA BROWN HT ELV MDR-P",
+      "batch": "B001",
+      "order_quantity": 20,
+      "available_stock_for_so": 20,
+      "order_weight_kg": 480
+    },
+    {
+      "material": "OOWJ300X450-6",
+      "material_description": "DOVER LT GL-P",
+      "batch": "B002",
+      "order_quantity": 20,
+      "available_stock_for_so": 13,
+      "order_weight_kg": 240
+    },
+    {
+      "material": "OA4FJ600X600-4",
+      "material_description": "ABESCATO WHITE MT REC-P",
+      "batch": "B003",
+      "order_quantity": 20,
+      "available_stock_for_so": 20,
+      "order_weight_kg": 600
+    }
+  ]
+}

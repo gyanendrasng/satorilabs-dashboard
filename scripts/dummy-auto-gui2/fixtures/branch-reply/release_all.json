@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "intent": "release_all",
+  "materials": [
+    { "material": "OP7WJ300X450-5", "batch": "B001", "quantity": 20 },
+    { "material": "OOWJ300X450-6", "batch": "B002", "quantity": 20 },
+    { "material": "OA4FJ600X600-4", "batch": "B003", "quantity": 20 }
+  ]
+}

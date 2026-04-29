@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "intent": "wait",
+  "missing_materials": ["OP7WJ300X450-5"],
+  "email_payload": {
+    "subject": "Re: Production timeline",
+    "body": "Branch is asking us to wait. (No production inquiry — recheck timer set instead.)"
+  }
+}
