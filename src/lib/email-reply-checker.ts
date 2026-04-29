@@ -205,9 +205,12 @@ export async function checkForReplies(): Promise<{
           },
         });
 
-        // Check if all emails for this SO now have replies
+        // Check if all emails for this (Bundle, SO) pair now have replies.
+        // bundleId comes from the LSI the email is tied to; null = legacy
+        // (whole-SO) behavior.
         if (email.salesOrderId) {
-          const batchResult = await checkAndSendBatchToAman(email.salesOrderId);
+          const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
+          const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
           logs.push(...batchResult.logs);
         }
         continue;
@@ -238,9 +241,10 @@ export async function checkForReplies(): Promise<{
 
       processed++;
 
-      // Check if all emails for this SO now have replies
+      // Check if all emails for this (Bundle, SO) pair now have replies.
       if (email.salesOrderId) {
-        const batchResult = await checkAndSendBatchToAman(email.salesOrderId);
+        const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
+        const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
         logs.push(...batchResult.logs);
       }
     } catch (error) {

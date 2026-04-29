@@ -14,11 +14,19 @@ const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
 /**
- * Check if all LoadingSlipItems for a SalesOrder have replies with PDFs,
- * and send batch request to Aman's auto_gui2 backend if they do.
+ * Check if all LoadingSlipItems in a (Bundle, SO) pair have plant invoice
+ * replies with PDFs, and fire ZLOAD3-B1 for that pair if they do.
+ *
+ * When `bundleId` is omitted (legacy callers / non-bundle SOs), the scope
+ * widens to every LSI of the SO — same behaviour as before.
+ *
+ * Each (Bundle, SO) pair fires its own ZLOAD3-B1. A bundle that contains
+ * 2 SOs → 2 fires (one per SO in the bundle). An SO that spans 2 bundles
+ * → 2 fires (one per bundle for the SO). Single SO + single bundle → 1 fire.
  */
 export async function checkAndSendBatchToAman(
-  salesOrderId: string
+  salesOrderId: string,
+  bundleId?: string | null
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
 
@@ -29,16 +37,16 @@ export async function checkAndSendBatchToAman(
     logs.push(logMessage);
   };
 
-  log(`[BatchSender] Checking if all replies received for SO ID: ${salesOrderId}`);
+  const scopeLabel = bundleId ? `(Bundle ${bundleId.slice(-6)}, SO ${salesOrderId})` : `SO ${salesOrderId}`;
+  log(`[BatchSender] Checking if all replies received for ${scopeLabel}`);
 
-  // Get the sales order with all its loading slip items and emails
+  // Items are filtered to the (bundle, SO) pair when bundleId is provided.
   const salesOrder = await prisma.salesOrder.findUnique({
     where: { id: salesOrderId },
     include: {
       items: {
-        include: {
-          emails: true,
-        },
+        where: bundleId ? { bundleId } : undefined,
+        include: { emails: true },
       },
       purchaseOrder: true,
     },
@@ -49,15 +57,47 @@ export async function checkAndSendBatchToAman(
     return { success: false, logs };
   }
 
-  // Log status of each item's emails
-  log(`[BatchSender] SO ${salesOrder.soNumber} has ${salesOrder.items.length} items:`);
+  // Resolve bundleNumber once (for log/instruction/meta).
+  let bundleNumber: number | null = null;
+  if (bundleId) {
+    const b = await prisma.bundle.findUnique({
+      where: { id: bundleId },
+      select: { bundleNumber: true },
+    });
+    bundleNumber = b?.bundleNumber ?? null;
+  }
+
+  // Idempotency: if a ZLOAD3-B1 work item for this exact (Bundle, SO) pair
+  // is already in flight or done, skip. JSON substring match on payload is
+  // crude but sufficient on SQLite without a dedicated index.
+  if (bundleId) {
+    const existing = await prisma.workQueue.findFirst({
+      where: {
+        salesOrderId,
+        step: 'zload3b1',
+        state: { in: ['queued', 'firing', 'done'] },
+        payload: { contains: `"bundle_id":"${bundleId}"` },
+      },
+      select: { id: true, state: true },
+    });
+    if (existing) {
+      log(`[BatchSender] ZLOAD3-B1 for ${scopeLabel} already exists in WorkQueue (${existing.state}) — skipping`);
+      return { success: true, logs };
+    }
+  }
+
+  log(`[BatchSender] ${scopeLabel} has ${salesOrder.items.length} item(s):`);
   for (const item of salesOrder.items) {
     const repliedEmail = item.emails.find((e) => e.status === 'replied' && e.replyPdfUrl);
     const status = repliedEmail ? `replied (PDF: ${repliedEmail.replyPdfUrl})` : 'waiting';
     log(`  - LS ${item.lsNumber}: ${status}`);
   }
 
-  // Check if ALL items have at least one email with status 'replied' and replyPdfUrl
+  if (salesOrder.items.length === 0) {
+    log(`[BatchSender] No items in scope for ${scopeLabel} — nothing to fire`);
+    return { success: false, logs };
+  }
+
   const allReplied = salesOrder.items.every((item) =>
     item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
   );
@@ -67,14 +107,13 @@ export async function checkAndSendBatchToAman(
       item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
     ).length;
     log(
-      `[BatchSender] Not ready yet for SO ${salesOrder.soNumber}: ${repliedCount}/${salesOrder.items.length} items have replies`
+      `[BatchSender] Not ready yet for ${scopeLabel}: ${repliedCount}/${salesOrder.items.length} items have replies`
     );
     return { success: false, logs };
   }
 
-  log(`[BatchSender] All ${salesOrder.items.length} items have replies for SO ${salesOrder.soNumber}. Sending batch to auto_gui2...`);
+  log(`[BatchSender] All ${salesOrder.items.length} item(s) replied for ${scopeLabel}. Enqueueing ZLOAD3-B1...`);
 
-  // Collect ALL reply PDFs (one per LS item)
   const attachments: Array<{ filename: string; content_base64: string }> = [];
 
   try {
@@ -95,8 +134,8 @@ export async function checkAndSendBatchToAman(
       });
     }
 
-    // Build instruction
-    const instruction = `VPN is connected, SAP is logged in. Just execute ZLOAD3-B1 for the sales order ${salesOrder.soNumber}`;
+    const bundleSuffix = bundleNumber ? ` (Bundle ${bundleNumber})` : '';
+    const instruction = `VPN is connected, SAP is logged in. Just execute ZLOAD3-B1 for sales order ${salesOrder.soNumber}${bundleSuffix}`;
 
     const totalBytes = attachments.reduce((sum, a) => sum + Buffer.from(a.content_base64, 'base64').length, 0);
     log(`[BatchSender] Sending to auto_gui2:`);
@@ -107,8 +146,6 @@ export async function checkAndSendBatchToAman(
       log(`      • ${a.filename} (${bytes} bytes)`);
     }
 
-    // Enqueue on the global work queue. auto_gui2 will call /processing-data
-    // (data) AND /step-status (done/failed) when the SAP run finishes.
     await enqueueWork({
       salesOrderId: salesOrder.id,
       step: 'zload3b1',
@@ -119,15 +156,20 @@ export async function checkAndSendBatchToAman(
         attachments,
         extraction_context:
           'For each file, extract the loading slip number, loaded quantity, invoice number, and invoice date',
+        meta: {
+          so_number: salesOrder.soNumber,
+          ...(bundleId ? { bundle_id: bundleId } : {}),
+          ...(bundleNumber ? { bundle_number: bundleNumber } : {}),
+        },
       },
     });
     await pumpQueue();
 
-    log(`[BatchSender] Enqueued ZLOAD3-B1 for SO ${salesOrder.soNumber} with ${attachments.length} attachment(s)`);
+    log(`[BatchSender] Enqueued ZLOAD3-B1 for ${scopeLabel} with ${attachments.length} attachment(s)`);
     return { success: true, logs };
   } catch (error) {
     log(
-      `[BatchSender] Failed to send batch to auto_gui2 for SO ${salesOrder.soNumber}: ${
+      `[BatchSender] Failed to enqueue batch for ${scopeLabel}: ${
         error instanceof Error ? error.message : String(error)
       }`
     );
