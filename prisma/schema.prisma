@@ -205,6 +205,11 @@ model Material {
   orderQuantity       Int
   availableStock      Int?     // available_stock_for_so
   orderWeightKg       Decimal? // order_weight_kg
+  // Branch's selection for dispatch:
+  //   null  = not yet decided
+  //   0     = excluded (branch said skip / hold)
+  //   >0    = release this many units
+  dispatchQuantity    Int?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 

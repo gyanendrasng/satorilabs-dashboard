@@ -7,6 +7,7 @@ import {
   handleProductionConfirmation,
   handleVehicleDetailsReply,
   handleVehicleSplitConfirmation,
+  handleDispatchConfirmation,
   triggerZsoVisibility,
   assembleAndSendCombinedEmail,
 } from './auto-gui-trigger';
@@ -126,6 +127,14 @@ export async function checkForReplies(): Promise<{
         log(`[EmailChecker] Routing to handleVehicleSplitConfirmation for PO email ${email.id}`);
         const splitResult = await handleVehicleSplitConfirmation(email.id, replyBodyHtml);
         logs.push(...splitResult.logs);
+        processed++;
+        continue;
+      }
+
+      if (emailType === 'dispatch_confirmation') {
+        log(`[EmailChecker] Routing to handleDispatchConfirmation for PO email ${email.id}`);
+        const dcResult = await handleDispatchConfirmation(email.id, replyBodyHtml);
+        logs.push(...dcResult.logs);
         processed++;
         continue;
       }

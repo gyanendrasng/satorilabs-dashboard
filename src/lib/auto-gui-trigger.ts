@@ -473,20 +473,39 @@ export async function handleVehicleSplitConfirmation(
     log(`[VehicleSplit] Reply intent: yes=${isYes} no=${isNo} text="${replyText.slice(0, 80)}"`);
 
     if (isYes && !isNo) {
-      // Confirmed: load each SO's stored plan and fire ZLOAD1.
+      // Confirmed: load each SO's stored plan and send a dispatch-confirmation
+      // email (text). ZLOAD1 only fires after that final confirmation arrives.
       const sos = await prisma.salesOrder.findMany({
         where: { purchaseOrderId: email.purchaseOrderId, releasePlan: { not: null } },
       });
-      log(`[VehicleSplit] Confirmed split — firing ZLOAD1 for ${sos.length} SO(s)`);
+      const plans: SoReleasePlan[] = [];
       for (const so of sos) {
         if (!so.releasePlan) continue;
         try {
-          const plan = JSON.parse(so.releasePlan) as SoReleasePlan;
-          await fireZload1FromPlan(plan, log);
-        } catch (err) {
-          log(`[VehicleSplit] failed to fire SO ${so.soNumber}: ${err instanceof Error ? err.message : err}`);
+          plans.push(JSON.parse(so.releasePlan) as SoReleasePlan);
+        } catch {
+          log(`[VehicleSplit] could not parse stored plan for SO ${so.soNumber}`);
         }
       }
+      const totalKg = plans.reduce((s, p) => s + p.totalWeightKg, 0);
+      const totalTonnes = totalKg / 1000;
+      const po = await prisma.purchaseOrder.findUnique({
+        where: { id: email.purchaseOrderId },
+        include: { customer: true },
+      });
+      const capacityTonnes = po?.customer?.weightage ? Number(po.customer.weightage) : 31;
+
+      log(`[VehicleSplit] Confirmed split — sending dispatch confirmation email for ${plans.length} SO(s)`);
+      await sendDispatchConfirmationEmail({
+        purchaseOrderId: email.purchaseOrderId,
+        plans,
+        twoVehicles: true,
+        totalTonnes,
+        capacityTonnes,
+        threadAnchor: email,
+        log,
+      });
+
       await prisma.email.update({
         where: { id: emailId },
         data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
@@ -523,6 +542,248 @@ async function fireZload1FromPlan(plan: SoReleasePlan, log: (msg: string) => voi
   }));
   log(`[BranchReply] Firing ZLOAD1 for SO ${plan.soNumber}: ${materials.length} item(s)`);
   await triggerZload1(plan.soNumber, materials);
+}
+
+/**
+ * Persist proposed dispatch quantities onto Material rows for a single SO.
+ * dispatchQuantity:
+ *   null  = not yet decided (default)
+ *   0     = excluded
+ *   >0    = include with that qty
+ */
+async function persistDispatchPlan(plan: SoReleasePlan): Promise<void> {
+  // First reset all Material rows for this SO to 0 (excluded), then bump
+  // each plan item up to its decided qty. Anything not in the plan stays 0.
+  await prisma.material.updateMany({
+    where: { salesOrderId: plan.salesOrderId },
+    data: { dispatchQuantity: 0 },
+  });
+  for (const item of plan.items) {
+    await prisma.material.updateMany({
+      where: {
+        salesOrderId: plan.salesOrderId,
+        material: item.material_code,
+        batch: item.batch,
+      },
+      data: { dispatchQuantity: item.quantity },
+    });
+  }
+}
+
+/**
+ * Compose the prose dispatch-confirmation email body for the whole PO.
+ * Lists each SO's planned items with quantities; asks branch to reply
+ * 'yes' to confirm or describe changes in plain English.
+ */
+function renderDispatchConfirmationBody(args: {
+  poNumber: string;
+  customerName: string;
+  twoVehicles: boolean;
+  totalTonnes: number;
+  capacityTonnes: number;
+  plans: SoReleasePlan[];
+}): string {
+  const { poNumber, customerName, twoVehicles, totalTonnes, capacityTonnes, plans } = args;
+
+  const totalStr = totalTonnes.toFixed(2).replace(/\.00$/, '');
+  const intro = twoVehicles
+    ? `Vehicle split confirmed for Purchase Order ${poNumber} (${customerName}). Total dispatch ${totalStr} t across 2 vehicles (capacity ${capacityTonnes} t each).`
+    : `Dispatch plan ready for Purchase Order ${poNumber} (${customerName}). Total ${totalStr} t — fits in 1 vehicle (capacity ${capacityTonnes} t).`;
+
+  const sections = plans
+    .map((p) => {
+      const lines = p.items.map((i) => {
+        const w = (i.weight_kg / 1000).toFixed(2).replace(/\.00$/, '');
+        return `  - ${i.material_code} (Batch ${i.batch}): ${i.quantity} units, ~${w} t`;
+      });
+      const t = (p.totalWeightKg / 1000).toFixed(2).replace(/\.00$/, '');
+      return `Sales Order ${p.soNumber} — ${t} t:\n${lines.join('\n')}`;
+    })
+    .join('\n\n');
+
+  return [
+    'Dear Branch Team,',
+    '',
+    intro,
+    '',
+    'Proposed dispatch:',
+    '',
+    sections,
+    '',
+    'Please reply with:',
+    '  - "yes" / "confirm" to proceed with the above plan, or',
+    '  - the changes you want (e.g. "skip OOWJ on SO 1234567", "send only 15 of OP7WJ").',
+    '',
+    'Once confirmed we will create the loading slips.',
+    '',
+    'Best regards,',
+    'Sales Order Dispatch Co-ordinator',
+  ].join('\n');
+}
+
+/**
+ * After the weight gate clears (under capacity, or 2-vehicle confirmed):
+ *  1. Persist proposed dispatch quantities onto Material rows.
+ *  2. Send a prose confirmation email to the branch.
+ *  3. Create the awaiting_dispatch_confirmation Email row so the cron picks
+ *     up the reply via handleDispatchConfirmation.
+ *
+ * Does NOT fire ZLOAD1 — that happens after the branch confirms.
+ */
+async function sendDispatchConfirmationEmail(args: {
+  purchaseOrderId: string;
+  plans: SoReleasePlan[];
+  twoVehicles: boolean;
+  totalTonnes: number;
+  capacityTonnes: number;
+  threadAnchor: { gmailThreadId: string; gmailMessageId: string };
+  log: (msg: string) => void;
+}): Promise<void> {
+  const { purchaseOrderId, plans, twoVehicles, totalTonnes, capacityTonnes, threadAnchor, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log(`[DispatchConfirm] BRANCH_EMAIL not configured`);
+    return;
+  }
+
+  // 1) Persist the per-Material dispatch quantities.
+  for (const plan of plans) {
+    await persistDispatchPlan(plan);
+  }
+
+  // 2) Compose body.
+  const po = await prisma.purchaseOrder.findUnique({
+    where: { id: purchaseOrderId },
+    include: { customer: true },
+  });
+  if (!po) {
+    log(`[DispatchConfirm] PO ${purchaseOrderId} not found`);
+    return;
+  }
+  const body = renderDispatchConfirmationBody({
+    poNumber: po.poNumber,
+    customerName: po.customer?.name ?? po.customerName,
+    twoVehicles,
+    totalTonnes,
+    capacityTonnes,
+    plans,
+  });
+  const subject = `Dispatch Confirmation - PO ${po.poNumber}`;
+
+  // 3) Send (reply in original NEW ORDER thread when possible).
+  let sent: { messageId: string; threadId: string };
+  try {
+    const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
+    if (rfc822Id) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[DispatchConfirm] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  // 4) Track the Email row for reply detection.
+  await prisma.email.create({
+    data: {
+      purchaseOrderId,
+      salesOrderId: plans[0]?.salesOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'dispatch_confirmation',
+      workflowState: 'awaiting_dispatch_confirmation',
+      sentBody: body,
+      relatedMaterials: JSON.stringify({ version: 'dispatch-v1', plans, twoVehicles, totalTonnes, capacityTonnes }),
+    },
+  });
+
+  log(`[DispatchConfirm] Confirmation email sent to ${BRANCH_EMAIL} for PO ${po.poNumber} (${plans.length} SO(s), ${totalTonnes.toFixed(2)} t)`);
+}
+
+/**
+ * Branch replied to the dispatch confirmation email.
+ * Light parsing: 'yes/confirm/proceed' → fire ZLOAD1 per SO from the saved
+ * Material.dispatchQuantity values. Anything else (changes, 'no') is left
+ * for the operator to handle on the dashboard.
+ */
+export async function handleDispatchConfirmation(
+  emailId: string,
+  replyHtml: string
+): Promise<{ success: boolean; logs: string[] }> {
+  const logs: string[] = [];
+  const log = (m: string) => {
+    const t = `[${new Date().toISOString()}] ${m}`;
+    console.log(t);
+    logs.push(t);
+  };
+
+  try {
+    const email = await prisma.email.findUnique({ where: { id: emailId } });
+    if (!email || !email.purchaseOrderId) {
+      log(`[DispatchConfirm] Email or purchaseOrderId missing on ${emailId}`);
+      return { success: false, logs };
+    }
+
+    const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+    const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
+    const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
+
+    log(`[DispatchConfirm] Reply intent: yes=${isYes} no=${isNo} text="${replyText.slice(0, 100)}"`);
+
+    if (isYes && !isNo) {
+      // Confirmed — fire ZLOAD1 per SO from saved dispatchQuantity values.
+      const sos = await prisma.salesOrder.findMany({
+        where: { purchaseOrderId: email.purchaseOrderId },
+        include: {
+          materials: {
+            where: { dispatchQuantity: { gt: 0 } },
+          },
+        },
+      });
+
+      let fired = 0;
+      for (const so of sos) {
+        if (so.materials.length === 0) {
+          log(`[DispatchConfirm] SO ${so.soNumber}: no materials to dispatch — skipping`);
+          continue;
+        }
+        const items: MaterialItemPayload[] = so.materials.map((m) => ({
+          material_code: m.material,
+          batch: m.batch,
+          quantity: m.dispatchQuantity!,
+        }));
+        await prisma.salesOrder.update({
+          where: { id: so.id },
+          data: { status: 'stock_approved', releasePlan: null },
+        });
+        await triggerZload1(so.soNumber, items);
+        fired++;
+        log(`[DispatchConfirm] Fired ZLOAD1 for SO ${so.soNumber}: ${items.length} item(s)`);
+      }
+
+      await prisma.email.update({
+        where: { id: emailId },
+        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
+      });
+      log(`[DispatchConfirm] Confirmed ${fired} SO(s) for PO ${email.purchaseOrderId}`);
+      return { success: true, logs };
+    }
+
+    // Amendments / 'no' / ambiguous — operator handles on the dashboard.
+    log(`[DispatchConfirm] Reply not a clean yes — leaving in awaiting state for operator review`);
+    await prisma.email.update({
+      where: { id: emailId },
+      data: { status: 'replied', repliedAt: new Date(), replyHtml },
+    });
+    return { success: true, logs };
+  } catch (err) {
+    log(`[DispatchConfirm] error: ${err instanceof Error ? err.message : err}`);
+    return { success: false, logs };
+  }
 }
 
 export async function handleBranchReply(
@@ -621,10 +882,17 @@ export async function handleBranchReply(
             log,
           });
         } else {
-          // Under capacity — fire ZLOAD1 per SO using each plan.
-          for (const plan of plans) {
-            await fireZload1FromPlan(plan, log);
-          }
+          // Under capacity — save the plan to Material rows and ask branch
+          // to confirm before we fire ZLOAD1.
+          await sendDispatchConfirmationEmail({
+            purchaseOrderId: email.purchaseOrderId,
+            plans,
+            twoVehicles: false,
+            totalTonnes,
+            capacityTonnes,
+            threadAnchor: email,
+            log,
+          });
         }
       }
 
@@ -673,7 +941,15 @@ export async function handleBranchReply(
           log,
         });
       } else {
-        await fireZload1FromPlan(r.plan, log);
+        await sendDispatchConfirmationEmail({
+          purchaseOrderId: so!.purchaseOrderId,
+          plans: [r.plan],
+          twoVehicles: false,
+          totalTonnes,
+          capacityTonnes,
+          threadAnchor: email,
+          log,
+        });
       }
     }
 
