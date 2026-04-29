@@ -1,21 +1,23 @@
 import { prisma } from './prisma';
 
 /**
- * Compute capacity-based bundles for all LoadingSlipItems of a PurchaseOrder.
+ * Compute capacity-based bundles for a PurchaseOrder from its Material rows
+ * (the branch-confirmed dispatch plan). Run AFTER the branch confirms the
+ * dispatch — before ZLOAD1 fires — so the truck count is locked in before
+ * any LS is created.
  *
  * Algorithm:
- *  1. Collect every LSI in the PO that has a `fileUrl` (i.e. ZLOAD1 has run
- *     and the LS file is in R2).
- *  2. For each LSI, compute its weight from the matching Material rows
- *     (same SO + same material code; sum across batches).
- *     weight_kg = sum( (dispatchQuantity ?? orderQuantity) / orderQuantity * orderWeightKg )
- *  3. Greedy first-fit-decreasing pack: sort LSIs by weight desc, drop each
- *     into the first bundle with enough remaining capacity, else open a new
- *     bundle. Capacity = customer.weightage * 1000 kg (default 31000).
- *  4. Persist Bundle rows + set LoadingSlipItem.bundleId.
+ *  1. Pull all Material rows of all SOs in the PO with `dispatchQuantity > 0`
+ *     (i.e. branch chose to send them).
+ *  2. Per-Material weight = (dispatchQuantity / orderQuantity) * orderWeightKg.
+ *  3. Greedy first-fit-decreasing: sort by weight desc, drop each into the
+ *     first bundle with room, else open a new bundle. Capacity =
+ *     Customer.weightage * 1000 kg (default 31000).
+ *  4. Persist Bundle rows + set Material.bundleId.
  *
- * Bundles can mix LSIs from different SOs within the same PO (per the
- * bundling diagram).
+ * Idempotent — wipes existing Bundle rows and Material.bundleId for the PO
+ * before recomputing. LSIs created later by /zload1-data inherit bundleId
+ * from the matching Material.
  */
 export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
   bundleCount: number;
@@ -30,46 +32,37 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
 
   const capacityKg = (po.customer?.weightage ? Number(po.customer.weightage) : 31) * 1000;
 
-  // Idempotency: clear stale bundle assignments + delete unused bundles.
+  // Idempotency: detach Materials and LSIs from existing bundles, drop bundles.
+  await prisma.material.updateMany({
+    where: { salesOrder: { purchaseOrderId }, bundleId: { not: null } },
+    data: { bundleId: null },
+  });
   await prisma.loadingSlipItem.updateMany({
     where: { salesOrder: { purchaseOrderId }, bundleId: { not: null } },
     data: { bundleId: null },
   });
   await prisma.bundle.deleteMany({ where: { purchaseOrderId } });
 
-  // 1. Collect LSIs that have a file (ZLOAD1 done) for this PO.
-  const lsis = await prisma.loadingSlipItem.findMany({
+  // 1. Material rows the branch confirmed for dispatch.
+  const materials = await prisma.material.findMany({
     where: {
       salesOrder: { purchaseOrderId },
-      fileUrl: { not: null },
-    },
-    include: {
-      salesOrder: {
-        include: {
-          materials: true,
-        },
-      },
+      dispatchQuantity: { gt: 0 },
     },
   });
 
-  if (lsis.length === 0) {
+  if (materials.length === 0) {
     return { bundleCount: 0, totalKg: 0, capacityKg };
   }
 
-  // 2. Compute weight per LSI from Material rows.
-  type WeightedLsi = { id: string; weightKg: number };
-  const weighted: WeightedLsi[] = lsis.map((lsi) => {
-    let weightKg = 0;
-    const matching = lsi.salesOrder.materials.filter((m) => m.material === lsi.material);
-    for (const m of matching) {
-      const orderedQty = m.orderQuantity || 0;
-      const dispatchQty = m.dispatchQuantity ?? orderedQty;
-      const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
-      if (orderedQty > 0 && dispatchQty > 0) {
-        weightKg += (dispatchQty / orderedQty) * fullWeight;
-      }
-    }
-    return { id: lsi.id, weightKg };
+  // 2. Compute weight per Material.
+  type WeightedMat = { id: string; weightKg: number };
+  const weighted: WeightedMat[] = materials.map((m) => {
+    const dispatchQty = m.dispatchQuantity!;
+    const orderedQty = m.orderQuantity || 0;
+    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    const weightKg = orderedQty > 0 ? (dispatchQty / orderedQty) * fullWeight : 0;
+    return { id: m.id, weightKg };
   });
 
   const totalKg = weighted.reduce((s, w) => s + w.weightKg, 0);
@@ -92,9 +85,6 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
       }
     }
     if (!placed) {
-      // New bundle. If a single LSI exceeds capacity, the bundle still gets
-      // it (operator/SAP will need to handle the over-cap row separately;
-      // we don't split LSIs).
       bins.push({
         bundleNumber: bins.length + 1,
         remainingKg: Math.max(0, capacityKg - w.weightKg),
@@ -113,7 +103,7 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
         totalWeightKg: bin.totalKg,
       },
     });
-    await prisma.loadingSlipItem.updateMany({
+    await prisma.material.updateMany({
       where: { id: { in: bin.itemIds } },
       data: { bundleId: bundle.id },
     });
@@ -123,19 +113,37 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
 }
 
 /**
- * Have all SOs in this PO finished ZLOAD1?
- * (Each SO's LSIs are created by the /zload1-data callback, so once every
- * SO has at least one LSI with a fileUrl, ZLOAD1 has landed for the PO.)
+ * After ZLOAD1 lands and a LoadingSlipItem is created, copy the matching
+ * Material.bundleId onto the LSI so downstream (vehicle details, plant
+ * email, ZLOAD3-B1) can group LSIs by bundle.
+ *
+ * Match by salesOrderId + material code. If multiple Material rows match
+ * (e.g. multi-batch for the same code) we pick the one whose bundle has
+ * the smallest bundleNumber — deterministic and keeps things compact.
  */
-export async function isPoZload1Complete(purchaseOrderId: string): Promise<boolean> {
-  const sos = await prisma.salesOrder.findMany({
-    where: { purchaseOrderId },
-    include: {
-      _count: {
-        select: { items: { where: { fileUrl: { not: null } } } },
-      },
-    },
+export async function linkLsiToBundle(loadingSlipItemId: string): Promise<void> {
+  const lsi = await prisma.loadingSlipItem.findUnique({
+    where: { id: loadingSlipItemId },
+    select: { id: true, salesOrderId: true, material: true, bundleId: true },
   });
-  if (sos.length === 0) return false;
-  return sos.every((so) => so._count.items > 0);
+  if (!lsi || lsi.bundleId) return;
+
+  const candidates = await prisma.material.findMany({
+    where: {
+      salesOrderId: lsi.salesOrderId,
+      material: lsi.material,
+      bundleId: { not: null },
+    },
+    include: { bundle: { select: { bundleNumber: true } } },
+  });
+  if (candidates.length === 0) return;
+
+  candidates.sort((a, b) => (a.bundle?.bundleNumber ?? 999) - (b.bundle?.bundleNumber ?? 999));
+  const winner = candidates[0];
+  if (!winner.bundleId) return;
+
+  await prisma.loadingSlipItem.update({
+    where: { id: loadingSlipItemId },
+    data: { bundleId: winner.bundleId },
+  });
 }

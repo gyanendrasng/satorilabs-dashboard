@@ -143,6 +143,7 @@ model Bundle {
 
   purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   items         LoadingSlipItem[]
+  materials     Material[]
   emails        Email[]
 
   @@unique([purchaseOrderId, bundleNumber])
@@ -230,6 +231,7 @@ model WorkQueue {
 model Material {
   id                  String   @id @default(cuid())
   salesOrderId        String
+  bundleId            String?
   material            String   // SAP material code
   materialDescription String?
   batch               String
@@ -245,6 +247,7 @@ model Material {
   updatedAt           DateTime @updatedAt
 
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
 
   @@unique([salesOrderId, material, batch])
   @@map("material")

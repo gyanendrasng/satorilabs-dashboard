@@ -3,6 +3,7 @@ import { downloadFromS3 } from './s3';
 import { sendPlainEmail, sendReplyEmail, sendHtmlEmail, sendHtmlReplyEmail, getMessageRfc822Id } from './gmail';
 import { buildDispatchApprovalHtml, type DispatchSoSection } from './dispatch-email-template';
 import { enqueueWork, pumpQueue } from './work-queue';
+import { computeBundlesForPo } from './bundler';
 import { sendLSEmail } from './email-service';
 import OpenAI from 'openai';
 import { z } from 'zod';
@@ -557,6 +558,9 @@ export async function sendVehicleDetailsForBundle(
       items: {
         include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
       },
+      materials: {
+        include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+      },
     },
   });
   if (!bundle) {
@@ -574,9 +578,14 @@ export async function sendVehicleDetailsForBundle(
     return { sent: false, logs };
   }
 
-  const lsLines = bundle.items
-    .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
-    .join('\n');
+  // Prefer LSI lines (if ZLOAD1 has run); otherwise list Materials (pre-ZLOAD1).
+  const lsLines = bundle.items.length > 0
+    ? bundle.items
+        .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
+        .join('\n')
+    : bundle.materials
+        .map((m) => `  - SO ${m.salesOrder.soNumber} / Material ${m.material} (Batch ${m.batch}, ${m.dispatchQuantity ?? m.orderQuantity} units)`)
+        .join('\n');
   const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
 
   const subject = `Vehicle Details Required - PO ${bundle.purchaseOrder.poNumber} / Bundle ${bundle.bundleNumber}`;
@@ -597,7 +606,9 @@ export async function sendVehicleDetailsForBundle(
   ].join('\n');
 
   // Reply in the original NEW ORDER thread of any SO in this bundle, when possible.
-  const anchor = bundle.items.find((it) => it.salesOrder.originalThreadId && it.salesOrder.originalMessageId)?.salesOrder;
+  const itemAnchor = bundle.items.find((it) => it.salesOrder.originalThreadId && it.salesOrder.originalMessageId)?.salesOrder;
+  const matAnchor = bundle.materials.find((m) => m.salesOrder.originalThreadId && m.salesOrder.originalMessageId)?.salesOrder;
+  const anchor = itemAnchor ?? matAnchor;
   let sent: { messageId: string; threadId: string };
   try {
     if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
@@ -620,7 +631,7 @@ export async function sendVehicleDetailsForBundle(
       bundleId,
       purchaseOrderId: bundle.purchaseOrderId,
       // also link to the lead SO so existing reply-checker SO logging stays sane
-      salesOrderId: bundle.items[0]?.salesOrderId,
+      salesOrderId: bundle.items[0]?.salesOrderId ?? bundle.materials[0]?.salesOrderId,
       gmailMessageId: sent.messageId,
       gmailThreadId: sent.threadId,
       recipientEmail: BRANCH_EMAIL,
@@ -841,7 +852,23 @@ export async function handleDispatchConfirmation(
     log(`[DispatchConfirm] Reply intent: yes=${isYes} no=${isNo} text="${replyText.slice(0, 100)}"`);
 
     if (isYes && !isNo) {
-      // Confirmed — fire ZLOAD1 per SO from saved dispatchQuantity values.
+      // Confirmed — branch finalised the dispatch plan.
+      // Order matters: 1) compute bundles from Material rows so the truck
+      // count is locked in BEFORE any LS exists; 2) email branch the
+      // vehicle-details request per bundle; 3) fire ZLOAD1 per SO. LSIs
+      // created later by /zload1-data inherit bundleId from Material.
+      const bundleResult = await computeBundlesForPo(email.purchaseOrderId);
+      log(`[DispatchConfirm] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
+
+      const bundles = await prisma.bundle.findMany({
+        where: { purchaseOrderId: email.purchaseOrderId },
+        select: { id: true, bundleNumber: true },
+        orderBy: { bundleNumber: 'asc' },
+      });
+      for (const b of bundles) {
+        await sendVehicleDetailsForBundle(b.id);
+      }
+
       const sos = await prisma.salesOrder.findMany({
         where: { purchaseOrderId: email.purchaseOrderId },
         include: {

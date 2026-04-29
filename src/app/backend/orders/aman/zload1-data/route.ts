@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
-import { computeBundlesForPo, isPoZload1Complete } from '@/lib/bundler';
-import { sendVehicleDetailsForBundle } from '@/lib/auto-gui-trigger';
+import { linkLsiToBundle } from '@/lib/bundler';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { sendReplyEmail, sendPlainEmail, getMessageRfc822Id } from '@/lib/gmail';
@@ -116,30 +115,15 @@ export async function POST(request: Request) {
       data: { status: 'ls_created' },
     });
 
-    // Bundle gate: once every SO in the PO has at least one LSI with a
-    // fileUrl, recompute capacity-based bundles for the whole PO and send
-    // one vehicle-details email per bundle (per-truck). Idempotent —
-    // sendVehicleDetailsForBundle skips if already sent.
+    // Bundles + vehicle-details emails were created at dispatch-confirmation
+    // time (before ZLOAD1 fired) so the truck count was settled with the
+    // branch already. Just link this LSI to the matching Material's bundle.
     try {
-      const poComplete = await isPoZload1Complete(salesOrder.purchaseOrderId);
-      if (poComplete) {
-        const result = await computeBundlesForPo(salesOrder.purchaseOrderId);
-        console.log(
-          `[ZLOAD1 Data] Computed ${result.bundleCount} bundle(s) for PO ${salesOrder.purchaseOrderId}: ${result.totalKg.toFixed(0)} kg / ${result.capacityKg} kg cap`
-        );
-        const bundles = await prisma.bundle.findMany({
-          where: { purchaseOrderId: salesOrder.purchaseOrderId },
-          select: { id: true, bundleNumber: true },
-          orderBy: { bundleNumber: 'asc' },
-        });
-        for (const b of bundles) {
-          await sendVehicleDetailsForBundle(b.id);
-        }
-      }
-    } catch (bundleErr) {
+      await linkLsiToBundle(loadingSlipItem.id);
+    } catch (linkErr) {
       console.error(
-        `[ZLOAD1 Data] Bundle/vehicle-email step failed for PO ${salesOrder.purchaseOrderId}:`,
-        bundleErr
+        `[ZLOAD1 Data] Failed to link LSI ${loadingSlipItem.id} to bundle:`,
+        linkErr
       );
     }
 
