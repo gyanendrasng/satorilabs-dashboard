@@ -322,7 +322,23 @@ async function handleChat(body) {
 // ---------- /email/branch-reply --------------------------------------------
 
 function classifyBranchReply(replyHtml) {
-  const text = String(replyHtml || '').replace(/<[^>]+>/g, ' ').toLowerCase();
+  // Strip HTML, then strip Gmail-style quoted blocks (the user's NEW text
+  // sits ABOVE the quoted thread). Without this we'd classify on words
+  // from the original dispatch recommendation that the reply quotes back.
+  let text = String(replyHtml || '').replace(/<[^>]+>/g, ' ');
+
+  // Cut everything after "On <date>, <name> wrote:" markers (Gmail format)
+  text = text.replace(/On\s+.{0,120}wrote:[\s\S]*$/i, '');
+  text = text.replace(/-{2,}\s*Original Message\s*-{2,}[\s\S]*$/i, '');
+
+  // Remove lines that start with `>` (the actual quote markers)
+  text = text
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*>/.test(line))
+    .join(' ');
+
+  text = text.toLowerCase();
+
   if (/\b(wait|hold|production|not (yet )?ready)\b/.test(text)) return 'wait';
   if (/\bpartial|partly|only what (you|we) have|release.{0,12}part\b/.test(text)) return 'release_part';
   return 'release_all';
