@@ -635,7 +635,7 @@ export async function sendVehicleDetailsForBundle(
   const body = [
     `Dear Branch Team,`,
     ``,
-    `Loading slips have been created for Bundle ${bundle.bundleNumber} of Purchase Order ${bundle.purchaseOrder.poNumber} (~${totalT} t). The bundle covers the following items:`,
+    `Bundle ${bundle.bundleNumber} of Purchase Order ${bundle.purchaseOrder.poNumber} (~${totalT} t) covers the following items:`,
     ``,
     lsLines,
     ``,
