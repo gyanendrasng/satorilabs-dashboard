@@ -53,26 +53,22 @@ export async function PATCH(
       include: { invoice: true },
     });
 
-    // Trigger VTO1N-B if all shipment fields are present and invoice is ready
-    let vto1nTriggered = false;
-    if (
-      salesOrder.lrNumber &&
-      salesOrder.lrDate &&
-      salesOrder.vehicleNumber &&
-      salesOrder.invoice &&
-      salesOrder.invoice.status === 'created' &&
-      salesOrder.invoice.obdNumber
-    ) {
-      triggerVto1n(
-        salesOrder.soNumber,
-        salesOrder.invoice.obdNumber,
-        salesOrder.lrNumber,
-        salesOrder.lrDate,
-        salesOrder.vehicleNumber
-      ).catch((err) => {
-        console.error(`[VTO1N-B] Fire-and-forget error for SO ${salesOrder.soNumber}:`, err);
+    // Trigger VTO1N-B per Shipment in `created` state for this SO. Each
+    // (Bundle, SO) pair has its own Shipment with its own OBD; we fire once
+    // per Shipment when its bundle has vehicle details and the SO has LR fields.
+    let vto1nTriggered = 0;
+    if (salesOrder.lrNumber && salesOrder.lrDate) {
+      const readyShipments = await prisma.shipment.findMany({
+        where: { salesOrderId: salesOrder.id, status: 'created', obdNumber: { not: null } },
+        include: { bundle: { select: { vehicleNumber: true } } },
       });
-      vto1nTriggered = true;
+      for (const sh of readyShipments) {
+        if (!sh.bundle.vehicleNumber && !salesOrder.vehicleNumber) continue;
+        triggerVto1n(sh.id).catch((err) => {
+          console.error(`[VTO1N-B] Fire-and-forget error for Shipment ${sh.id} (SO ${salesOrder.soNumber}):`, err);
+        });
+        vto1nTriggered++;
+      }
     }
 
     return NextResponse.json({ salesOrder, vto1nTriggered });

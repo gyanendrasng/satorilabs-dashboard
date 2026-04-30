@@ -1557,53 +1557,137 @@ export async function assembleAndSendCombinedEmail(
 }
 
 /**
- * Trigger VTO1N-B (Create Shipment) transaction via auto_gui2 /chat endpoint
+ * Trigger VTO1N-B (Create Shipment) for ONE Shipment row.
  *
- * Called after user provides LR number, LR date, and vehicle number from the frontend.
- * OBD number comes from the Invoice (set by processing-data).
+ * Each (Bundle, SO) pair has its own Shipment with its own OBD; this fires
+ * VT01N once per Shipment using the bundle's vehicle details and the SO's
+ * LR fields.
+ *
+ * Idempotent on the Shipment side: flips status `created` → `shipment-triggered`
+ * before enqueueing, and rolls back to `created` if the enqueue itself throws.
+ *
+ * The legacy signature (positional args) is preserved as a thin overload via
+ * `triggerVto1nLegacy` — UI/PATCH callers can migrate when convenient.
  */
-export async function triggerVto1n(
+export async function triggerVto1n(shipmentId: string): Promise<void> {
+  const shipment = await prisma.shipment.findUnique({
+    where: { id: shipmentId },
+    include: {
+      bundle: true,
+      salesOrder: true,
+    },
+  });
+  if (!shipment) throw new Error(`Shipment ${shipmentId} not found`);
+  if (!shipment.obdNumber) throw new Error(`Shipment ${shipmentId} has no obdNumber yet`);
+
+  const so = shipment.salesOrder;
+  const bundle = shipment.bundle;
+  const lrNumber = so.lrNumber;
+  const lrDate = so.lrDate;
+  const vehicleNumber = bundle.vehicleNumber ?? so.vehicleNumber;
+
+  if (!lrNumber || !lrDate) throw new Error(`Shipment ${shipmentId} cannot fire VT01N: missing LR number / date on SO ${so.soNumber}`);
+  if (!vehicleNumber) throw new Error(`Shipment ${shipmentId} cannot fire VT01N: no vehicle number on Bundle or SO`);
+
+  const dd = String(lrDate.getUTCDate()).padStart(2, '0');
+  const mm = String(lrDate.getUTCMonth() + 1).padStart(2, '0');
+  const yyyy = lrDate.getUTCFullYear();
+  const formattedDate = `${dd}.${mm}.${yyyy}`;
+
+  // Double-trigger guard: only flip if currently 'created'.
+  const flipped = await prisma.shipment.updateMany({
+    where: { id: shipmentId, status: 'created' },
+    data: { status: 'shipment-triggered', shipmentTriggeredAt: new Date() },
+  });
+  if (flipped.count === 0) {
+    console.log(`[VTO1N-B] Shipment ${shipmentId} not in 'created' state — skipping`);
+    return;
+  }
+
+  // Mirror status onto the legacy Invoice row keyed by obdNumber for back-compat.
+  await prisma.invoice.updateMany({
+    where: { obdNumber: shipment.obdNumber, status: 'created' },
+    data: { status: 'shipment-triggered' },
+  });
+
+  try {
+    await enqueueWork({
+      salesOrderId: so.id,
+      step: 'vto1n',
+      payload: {
+        instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction VT01N. OBD number is ${shipment.obdNumber}, LR number is ${lrNumber}, LR date is ${formattedDate} and Vehicle number is ${vehicleNumber}`,
+        transaction_code: 'VTO1N-B',
+        so_number: so.soNumber,
+        extraction_context: 'Extract the OBD number, LR number, LR date and Vehicle number',
+        meta: {
+          so_number: so.soNumber,
+          shipment_id: shipmentId,
+          bundle_id: bundle.id,
+          bundle_number: bundle.bundleNumber,
+          obd_number: shipment.obdNumber,
+        },
+      },
+    });
+    await pumpQueue();
+    console.log(`[VTO1N-B] Enqueued for Shipment ${shipmentId} (SO ${so.soNumber}, Bundle ${bundle.bundleNumber})`);
+  } catch (error) {
+    console.error(`[VTO1N-B] Enqueue failed for Shipment ${shipmentId}:`, error);
+    await prisma.shipment.updateMany({
+      where: { id: shipmentId, status: 'shipment-triggered' },
+      data: { status: 'created', shipmentTriggeredAt: null },
+    });
+    await prisma.invoice.updateMany({
+      where: { obdNumber: shipment.obdNumber, status: 'shipment-triggered' },
+      data: { status: 'created' },
+    });
+    throw error;
+  }
+}
+
+/**
+ * @deprecated Pre-Shipment legacy signature. Resolves to a Shipment by OBD
+ * and forwards. New callers should pass `shipmentId` directly.
+ */
+export async function triggerVto1nLegacy(
   soNumber: string,
   obdNumber: string,
   lrNumber: string,
   lrDate: Date,
   vehicleNumber: string
 ): Promise<void> {
-  // Format lrDate as DD.MM.YYYY (SAP format) using UTC methods
+  void lrNumber;
+  void lrDate;
+  void vehicleNumber;
+  const shipment = await prisma.shipment.findFirst({
+    where: { obdNumber, salesOrder: { soNumber } },
+    select: { id: true },
+  });
+  if (shipment) {
+    return triggerVto1n(shipment.id);
+  }
+  // Fall back to the pre-Shipment path for very old data: just enqueue with whatever was passed.
+  console.warn(`[VTO1N-B] No Shipment found for OBD ${obdNumber} / SO ${soNumber} — using legacy enqueue`);
   const dd = String(lrDate.getUTCDate()).padStart(2, '0');
   const mm = String(lrDate.getUTCMonth() + 1).padStart(2, '0');
   const yyyy = lrDate.getUTCFullYear();
   const formattedDate = `${dd}.${mm}.${yyyy}`;
-
-  // Set invoice status to 'shipment-triggered' as a double-trigger guard
   await prisma.invoice.updateMany({
     where: { obdNumber, status: 'created' },
     data: { status: 'shipment-triggered' },
   });
-
-  try {
-    const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
-    await enqueueWork({
-      salesOrderId: so?.id ?? null,
-      step: 'vto1n',
-      payload: {
-        instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction VT01N. OBD number is ${obdNumber}, LR number is ${lrNumber}, LR date is ${formattedDate} and Vehicle number is ${vehicleNumber}`,
-        transaction_code: 'VTO1N-B',
-        so_number: soNumber,
-        extraction_context: 'Extract the OBD number, LR number, LR date and Vehicle number',
-      },
-    });
-    await pumpQueue();
-    console.log(`[VTO1N-B] Enqueued for SO ${soNumber}`);
-  } catch (error) {
-    console.error(`[VTO1N-B] Enqueue failed for SO ${soNumber}:`, error);
-    // Reset invoice status back to 'created' on failure
-    await prisma.invoice.updateMany({
-      where: { obdNumber, status: 'shipment-triggered' },
-      data: { status: 'created' },
-    });
-    throw error;
-  }
+  const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'vto1n',
+    payload: {
+      instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction VT01N. OBD number is ${obdNumber}, LR number is ${lrNumber}, LR date is ${formattedDate} and Vehicle number is ${vehicleNumber}`,
+      transaction_code: 'VTO1N-B',
+      so_number: soNumber,
+      extraction_context: 'Extract the OBD number, LR number, LR date and Vehicle number',
+      meta: { so_number: soNumber, obd_number: obdNumber },
+    },
+  });
+  await pumpQueue();
 }
 
 /**

@@ -145,9 +145,37 @@ model Bundle {
   items         LoadingSlipItem[]
   materials     Material[]
   emails        Email[]
+  shipments     Shipment[]
 
   @@unique([purchaseOrderId, bundleNumber])
   @@map("bundle")
+}
+
+// One Shipment per ZLOAD3-B1 request, keyed by (bundleId, salesOrderId).
+// Maps 1:1 to the "HRJ Invoice Generated" + "Dispatch Document" boxes in the
+// hierarchy diagram. SAP returns one OBD + one HRJ invoice per request, so
+// they live here once per pair (not duplicated per LS). Per-LS fields like
+// material_doc and loaded_quantity remain on LoadingSlipItem.
+model Shipment {
+  id                  String    @id @default(cuid())
+  bundleId            String
+  salesOrderId        String
+  obdNumber           String?   // delivery_no — the Outbound Delivery / Dispatch Document
+  invoiceNumber       String?   // invoice_no — the HRJ Invoice
+  invoiceDate         DateTime?
+  sapResults          String?   // JSON: full /processing-data rows for forensics
+  status              String    @default("created") // created | shipment-triggered | shipped
+  shipmentTriggeredAt DateTime?
+  shippedAt           DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  bundle     Bundle           @relation(fields: [bundleId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder       @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  items      LoadingSlipItem[]
+
+  @@unique([bundleId, salesOrderId])
+  @@map("shipment")
 }
 
 // Customer record keyed by the externally-provided customer_id from the
@@ -201,6 +229,7 @@ model SalesOrder {
   invoice       Invoice?
   materials     Material[]
   workItems     WorkQueue[]
+  shipments     Shipment[]
 
   @@map("sales_order")
 }
@@ -257,6 +286,7 @@ model LoadingSlipItem {
   id           String  @id @default(cuid())
   salesOrderId String
   bundleId     String?
+  shipmentId   String?
   lsNumber     String
   material     String
   status       String  @default("pending") // pending, in-progress, completed
@@ -267,6 +297,12 @@ model LoadingSlipItem {
   orderWeight         Decimal?
   grnNumber           String? // GRN Number (from Aman Stage 4)
   fileUrl             String? // R2 key for the LS file (XLS/PDF)
+
+  // Per-LS SAP fields populated by /processing-data (ZLOAD3-B1 callback).
+  // Material doc and loaded quantity legitimately vary per LS in a request.
+  // (OBD and HRJ Invoice Number are per-request — those live on Shipment.)
+  sapMaterialDoc      String?
+  sapLoadedQuantity   Int?
 
   // User input fields (editable via forms)
   plantInvoiceNumber   String?   // Stage 3 - Plant Invoice Number
@@ -284,6 +320,7 @@ model LoadingSlipItem {
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   emails     Email[]
   bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
+  shipment   Shipment?  @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
 
   @@unique([lsNumber, material])
   @@map("loading_slip_item")
