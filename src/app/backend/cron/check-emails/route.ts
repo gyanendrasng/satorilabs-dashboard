@@ -6,6 +6,7 @@ import {
   checkStaleVisibility,
   checkWaitRechecks,
 } from '@/lib/email-reply-checker';
+import { pumpQueue } from '@/lib/work-queue';
 
 /**
  * GET /api/cron/check-emails
@@ -33,6 +34,17 @@ export async function GET(request: Request) {
     const timerResult = await checkWorkflowTimers();
     const staleResult = await checkStaleVisibility();
     const waitResult = await checkWaitRechecks();
+
+    // Always pump the queue at the end of every cron tick — idempotent.
+    // If a row is already firing it's a no-op; otherwise the oldest queued
+    // row is fired. This is what lets manually-reset 'queued' rows advance
+    // without needing a fresh enqueue or step-status callback.
+    const pumped = await pumpQueue();
+    if (pumped) {
+      console.log(
+        `[Cron] Pumped queue → fired work ${pumped.id} (${pumped.step}, SO ${pumped.salesOrderId ?? 'n/a'})`
+      );
+    }
 
     const allLogs = [
       ...newEmailResult.logs,
