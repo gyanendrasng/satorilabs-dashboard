@@ -167,6 +167,15 @@ model Shipment {
   status              String    @default("created") // created | shipment-triggered | shipped
   shipmentTriggeredAt DateTime?
   shippedAt           DateTime?
+
+  // Per-truck operator input (one truck = one Shipment).
+  // VT01N fires once lrNumber + lrDate + bundle.vehicleNumber + obdNumber are set.
+  lrNumber            String?
+  lrDate              DateTime?
+  plantCode           String?
+  shipmentType       String?    // e.g. "FTL" | "LTL" | "container"
+  notes               String?
+
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 

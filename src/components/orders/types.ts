@@ -36,10 +36,37 @@ export interface Invoice {
   updatedAt: string;
 }
 
+export interface Shipment {
+  id: string;
+  bundleId: string;
+  salesOrderId: string;
+  obdNumber: string | null;
+  invoiceNumber: string | null;
+  invoiceDate: string | null;
+  status: string; // created | shipment-triggered | shipped
+  lrNumber: string | null;
+  lrDate: string | null;
+  plantCode: string | null;
+  shipmentType: string | null;
+  notes: string | null;
+  shipmentTriggeredAt: string | null;
+  shippedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  bundle?: {
+    id: string;
+    bundleNumber: number;
+    vehicleNumber: string | null;
+    driverMobile: string | null;
+    containerNumber: string | null;
+  };
+}
+
 export interface SalesOrder {
   id: string;
   soNumber: string;
   purchaseOrderId: string;
+  shipments?: Shipment[];
   vehicleNumber: string | null;
   transportId: string | null;
   driverMobile: string | null;

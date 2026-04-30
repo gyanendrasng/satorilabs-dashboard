@@ -31,6 +31,20 @@ export async function GET(request: Request) {
               },
             },
             invoice: true,
+            shipments: {
+              orderBy: { createdAt: 'asc' },
+              include: {
+                bundle: {
+                  select: {
+                    id: true,
+                    bundleNumber: true,
+                    vehicleNumber: true,
+                    driverMobile: true,
+                    containerNumber: true,
+                  },
+                },
+              },
+            },
           },
         },
       },

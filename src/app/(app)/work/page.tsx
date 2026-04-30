@@ -32,7 +32,7 @@ import {
   Trash2,
   ArrowDown,
 } from 'lucide-react';
-import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, groupItemsByLsNumber } from '@/components/orders/types';
+import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, groupItemsByLsNumber } from '@/components/orders/types';
 
 interface ChatMessage {
   id: string;
@@ -957,12 +957,38 @@ export default function WorkPage() {
                                         </div>
                                       </div>
 
-                                      {/* Invoice Column */}
+                                      {/* Shipments Column — per-Shipment (per-truck) form */}
                                       <div>
                                         <div className="flex items-center gap-2 mb-3 pb-2 border-b border-slate-700">
+                                          <Package className="w-4 h-4 text-orange-400" />
+                                          <h4 className="text-sm font-semibold text-slate-300">
+                                            Shipments {so.shipments && so.shipments.length > 0 && `(${so.shipments.length})`}
+                                          </h4>
+                                        </div>
+                                        {so.shipments && so.shipments.length > 0 ? (
+                                          <div className="space-y-3">
+                                            {so.shipments.map((sh) => (
+                                              <ShipmentCard
+                                                key={sh.id}
+                                                shipment={sh}
+                                                onSaved={fetchOrders}
+                                              />
+                                            ))}
+                                          </div>
+                                        ) : (
+                                          <div className="bg-slate-800/50 border border-slate-700 p-4 rounded text-center">
+                                            <Package className="w-8 h-8 mx-auto mb-2 text-slate-600" />
+                                            <p className="text-sm text-slate-500">No shipments yet</p>
+                                            <p className="text-xs text-slate-600 mt-1">
+                                              Created after ZLOAD3-B1 returns OBD numbers
+                                            </p>
+                                          </div>
+                                        )}
+
+                                        <div className="flex items-center gap-2 mt-6 mb-3 pb-2 border-b border-slate-700">
                                           <Package className="w-4 h-4 text-purple-400" />
                                           <h4 className="text-sm font-semibold text-slate-300">
-                                            Invoice
+                                            Invoice (legacy)
                                           </h4>
                                         </div>
                                         {so.invoice ? (
@@ -1956,6 +1982,167 @@ export default function WorkPage() {
             </span>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Per-Shipment (per-truck) form card. Shows OBD/HRJ from SAP, captures
+// LR / plant code / shipment type / notes from the operator, fires
+// PATCH /backend/orders/shipments/{id} which auto-triggers VT01N.
+function ShipmentCard({
+  shipment,
+  onSaved,
+}: {
+  shipment: Shipment;
+  onSaved: () => void;
+}) {
+  const [form, setForm] = useState({
+    lrNumber: shipment.lrNumber || '',
+    lrDate: shipment.lrDate ? shipment.lrDate.split('T')[0] : '',
+    plantCode: shipment.plantCode || '',
+    shipmentType: shipment.shipmentType || '',
+    notes: shipment.notes || '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const isShipped = shipment.status === 'shipped';
+  const isTriggered = shipment.status === 'shipment-triggered';
+  const locked = isShipped || isTriggered;
+  const canSubmit = !locked && !!shipment.obdNumber && !!shipment.bundle?.vehicleNumber && form.lrNumber.trim() && form.lrDate;
+
+  const statusBadge = (() => {
+    const s = shipment.status;
+    const map: Record<string, string> = {
+      created: 'bg-amber-700 text-amber-100',
+      'shipment-triggered': 'bg-blue-700 text-blue-100',
+      shipped: 'bg-green-700 text-green-100',
+    };
+    return (
+      <span className={`px-2 py-0.5 rounded text-xs ${map[s] || 'bg-slate-600 text-slate-100'}`}>
+        {s}
+      </span>
+    );
+  })();
+
+  const submit = async () => {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await fetch(`/backend/orders/shipments/${shipment.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setMsg(`Error: ${data.error || res.statusText}`);
+      } else if (data.vto1nTriggered) {
+        setMsg('VT01N enqueued ✓');
+        onSaved();
+      } else {
+        setMsg(data.reason ? `Saved (VT01N held: ${data.reason})` : 'Saved');
+        onSaved();
+      }
+    } catch (e) {
+      setMsg(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-orange-900/10 border border-orange-700/40 p-3 rounded space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-slate-400">Bundle</span>
+          <span className="text-sm font-semibold text-orange-300">
+            {shipment.bundle?.bundleNumber ?? '?'}
+          </span>
+        </div>
+        {statusBadge}
+      </div>
+      <div className="grid grid-cols-2 gap-2 text-xs">
+        <div>
+          <p className="text-slate-500">OBD</p>
+          <p className="font-mono text-slate-200">{shipment.obdNumber || '—'}</p>
+        </div>
+        <div>
+          <p className="text-slate-500">HRJ Invoice</p>
+          <p className="font-mono text-slate-200">{shipment.invoiceNumber || '—'}</p>
+        </div>
+        <div>
+          <p className="text-slate-500">Vehicle</p>
+          <p className="font-mono text-slate-200">{shipment.bundle?.vehicleNumber || '—'}</p>
+        </div>
+        <div>
+          <p className="text-slate-500">Driver</p>
+          <p className="font-mono text-slate-200">{shipment.bundle?.driverMobile || '—'}</p>
+        </div>
+      </div>
+
+      <div className="border-t border-orange-700/30 pt-2 space-y-2">
+        <div className="grid grid-cols-2 gap-2">
+          <input
+            type="text"
+            placeholder="LR Number"
+            disabled={locked}
+            value={form.lrNumber}
+            onChange={(e) => setForm({ ...form, lrNumber: e.target.value })}
+            className="px-2 py-1 text-xs bg-slate-800 border border-slate-700 rounded disabled:opacity-50"
+          />
+          <input
+            type="date"
+            disabled={locked}
+            value={form.lrDate}
+            onChange={(e) => setForm({ ...form, lrDate: e.target.value })}
+            className="px-2 py-1 text-xs bg-slate-800 border border-slate-700 rounded disabled:opacity-50"
+          />
+          <input
+            type="text"
+            placeholder="Plant Code"
+            disabled={locked}
+            value={form.plantCode}
+            onChange={(e) => setForm({ ...form, plantCode: e.target.value })}
+            className="px-2 py-1 text-xs bg-slate-800 border border-slate-700 rounded disabled:opacity-50"
+          />
+          <input
+            type="text"
+            placeholder="Shipment Type (FTL/LTL)"
+            disabled={locked}
+            value={form.shipmentType}
+            onChange={(e) => setForm({ ...form, shipmentType: e.target.value })}
+            className="px-2 py-1 text-xs bg-slate-800 border border-slate-700 rounded disabled:opacity-50"
+          />
+        </div>
+        <textarea
+          placeholder="Notes"
+          disabled={locked}
+          value={form.notes}
+          onChange={(e) => setForm({ ...form, notes: e.target.value })}
+          className="w-full px-2 py-1 text-xs bg-slate-800 border border-slate-700 rounded disabled:opacity-50 resize-none"
+          rows={2}
+        />
+        {!locked && (
+          <button
+            onClick={submit}
+            disabled={!canSubmit || saving}
+            className="w-full px-3 py-2 bg-orange-600 hover:bg-orange-700 disabled:opacity-40 disabled:cursor-not-allowed rounded text-sm font-semibold"
+          >
+            {saving ? 'Saving…' : 'Submit & Trigger VT01N'}
+          </button>
+        )}
+        {msg && <p className="text-xs text-slate-400">{msg}</p>}
+        {!canSubmit && !locked && (
+          <p className="text-xs text-slate-500">
+            {!shipment.obdNumber
+              ? 'Waiting for OBD (ZLOAD3-B1)'
+              : !shipment.bundle?.vehicleNumber
+                ? 'Waiting for vehicle details (branch reply)'
+                : 'Fill LR Number and LR Date'}
+          </p>
+        )}
       </div>
     </div>
   );
