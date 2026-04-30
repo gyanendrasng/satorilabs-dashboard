@@ -9,7 +9,9 @@ export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n';
 export interface ChatPayload {
   instruction: string;
   transaction_code: string;
-  so_number: string;
+  // so_number is optional now — preferred location is `meta.so_number`.
+  // Some legacy triggers still set both top-level and meta.
+  so_number?: string;
   attachments?: Array<{ filename: string; content_base64: string }>;
   extraction_context?: string;
   // auto_gui2 passthrough metadata. Echoed in the /chat response and

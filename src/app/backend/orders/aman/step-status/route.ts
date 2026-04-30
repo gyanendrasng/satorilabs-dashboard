@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { markDone, markFailed, pumpQueue } from '@/lib/work-queue';
+import { checkAndSendCombinedVehicleEmailForPo } from '@/lib/auto-gui-trigger';
 
 /**
  * Accepts EITHER of two body shapes:
@@ -101,6 +102,26 @@ export async function POST(request: Request) {
   console.log(
     `[WorkQueue] ← ${arrow} work ${workId} (${existing.step}, SO ${soNumber}) from auto_gui2${errorMsg ? ` — ${errorMsg}` : ''}`
   );
+
+  // ZLOAD1 completion gate: when a zload1 work row flips to `done`, check
+  // if every ZLOAD1 row for the PO is now done — if so, send the combined
+  // vehicle-details email. Idempotent.
+  if (status === 'done' && existing.step === 'zload1' && existing.salesOrderId) {
+    try {
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: existing.salesOrderId },
+        select: { purchaseOrderId: true },
+      });
+      if (so?.purchaseOrderId) {
+        await checkAndSendCombinedVehicleEmailForPo(so.purchaseOrderId);
+      }
+    } catch (gateErr) {
+      console.error(
+        `[StepStatus] Combined-vehicle-email gate error for work ${workId}:`,
+        gateErr
+      );
+    }
+  }
 
   const next = await pumpQueue();
 

@@ -3,6 +3,7 @@ import { linkLsiToBundle } from '@/lib/bundler';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { sendReplyEmail, sendPlainEmail, getMessageRfc822Id } from '@/lib/gmail';
+import { checkAndSendCombinedVehicleEmailForPo } from '@/lib/auto-gui-trigger';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
@@ -139,6 +140,22 @@ export async function POST(request: Request) {
         `[ZLOAD1 Data] Failed to link LSI ${loadingSlipItem.id} to bundle:`,
         linkErr
       );
+    }
+
+    // Gate: if every ZLOAD1 row for this PO is now `done`, send the combined
+    // vehicle-details email (idempotent — safe to call on every callback).
+    // Note: ZLOAD1 work_queue is marked `done` by the /step-status callback,
+    // not here, so this gate trips only AFTER auto_gui2 has confirmed the
+    // step succeeded.
+    if (salesOrder.purchaseOrderId) {
+      try {
+        await checkAndSendCombinedVehicleEmailForPo(salesOrder.purchaseOrderId);
+      } catch (gateErr) {
+        console.error(
+          `[ZLOAD1 Data] Combined-vehicle-email gate error for PO ${salesOrder.purchaseOrderId}:`,
+          gateErr
+        );
+      }
     }
 
     return NextResponse.json({

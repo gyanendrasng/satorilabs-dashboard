@@ -690,6 +690,197 @@ export async function sendVehicleDetailsForBundle(
   return { sent: true, logs };
 }
 
+/**
+ * Send ONE combined vehicle-details email for a whole PO, listing every
+ * bundle. Called only after every ZLOAD1 work row for the PO is `done`.
+ *
+ * Idempotent — if a `vehicle_details` email already exists for this PO,
+ * skip. The combined email is parsed by the existing handleVehicleDetailsReply,
+ * which already knows how to extract per-bundle vehicle sets.
+ */
+export async function sendCombinedVehicleDetailsEmailForPo(
+  purchaseOrderId: string
+): Promise<{ sent: boolean; logs: string[] }> {
+  const logs: string[] = [];
+  const log = (m: string) => {
+    const t = `[${new Date().toISOString()}] ${m}`;
+    console.log(t);
+    logs.push(t);
+  };
+
+  if (!BRANCH_EMAIL) {
+    log(`[VehicleDetails] BRANCH_EMAIL not configured`);
+    return { sent: false, logs };
+  }
+
+  // Idempotency — one combined email per PO.
+  const existing = await prisma.email.findFirst({
+    where: { purchaseOrderId, emailType: 'vehicle_details', status: 'sent' },
+    select: { id: true },
+  });
+  if (existing) {
+    log(`[VehicleDetails] PO ${purchaseOrderId} already has a vehicle_details email — skipping`);
+    return { sent: false, logs };
+  }
+
+  const po = await prisma.purchaseOrder.findUnique({
+    where: { id: purchaseOrderId },
+    include: {
+      bundles: {
+        orderBy: { bundleNumber: 'asc' },
+        include: {
+          items: {
+            include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+          },
+          materials: {
+            include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+          },
+        },
+      },
+    },
+  });
+  if (!po) {
+    log(`[VehicleDetails] PO ${purchaseOrderId} not found`);
+    return { sent: false, logs };
+  }
+  if (po.bundles.length === 0) {
+    log(`[VehicleDetails] PO ${po.poNumber} has no bundles — skipping`);
+    return { sent: false, logs };
+  }
+
+  // Build one section per bundle.
+  const bundleBlocks: string[] = [];
+  for (const bundle of po.bundles) {
+    const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
+    const lsLines = bundle.items.length > 0
+      ? bundle.items
+          .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
+          .join('\n')
+      : bundle.materials
+          .map((m) => `  - SO ${m.salesOrder.soNumber} / Material ${m.material} (Batch ${m.batch}, ${m.dispatchQuantity ?? m.orderQuantity} units)`)
+          .join('\n');
+    bundleBlocks.push(
+      [
+        `Bundle ${bundle.bundleNumber} (~${totalT} t):`,
+        lsLines,
+      ].join('\n')
+    );
+  }
+
+  const subject = `Vehicle Details Required - PO ${po.poNumber} (${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'})`;
+  const body = [
+    `Dear Branch Team,`,
+    ``,
+    `Loading slips for Purchase Order ${po.poNumber} are now ready in SAP. The PO is split into ${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'}:`,
+    ``,
+    ...bundleBlocks.map((b) => b + '\n'),
+    `Please reply with vehicle/transport details for each bundle in the format below:`,
+    ...po.bundles.map(
+      (b) =>
+        `  Bundle ${b.bundleNumber}: <Vehicle Number>, <Driver Mobile>, <Container Number>`
+    ),
+    ``,
+    `Best regards,`,
+    `Sales Order Dispatch Co-ordinator`,
+  ].join('\n');
+
+  // Reply in the original NEW ORDER thread of any SO in this PO, when possible.
+  const allSoAnchors = po.bundles
+    .flatMap((b) => [...b.items.map((it) => it.salesOrder), ...b.materials.map((m) => m.salesOrder)])
+    .filter((so) => so.originalThreadId && so.originalMessageId);
+  const anchor = allSoAnchors[0];
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
+      const rfc822Id = await getMessageRfc822Id(anchor.originalMessageId);
+      if (rfc822Id) {
+        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.originalThreadId, rfc822Id);
+      } else {
+        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      }
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[VehicleDetails] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  // Use lead SO for legacy `salesOrderId` linkage so reply-checker keeps logs sane.
+  const leadSoId =
+    po.bundles[0]?.items[0]?.salesOrderId ?? po.bundles[0]?.materials[0]?.salesOrderId;
+
+  await prisma.email.create({
+    data: {
+      purchaseOrderId,
+      salesOrderId: leadSoId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'vehicle_details',
+      workflowState: 'awaiting_reply',
+      sentBody: body,
+    },
+  });
+
+  log(`[VehicleDetails] Sent combined vehicle-details email for PO ${po.poNumber} (${po.bundles.length} bundle(s))`);
+  return { sent: true, logs };
+}
+
+/**
+ * Gate function — call after every /zload1-data callback. Sends the combined
+ * vehicle-details email if every ZLOAD1 work row for the PO's SOs is `done`.
+ * Strict: any `failed` or `firing` row blocks the email (operator handles
+ * failed rows from the dashboard).
+ */
+export async function checkAndSendCombinedVehicleEmailForPo(
+  purchaseOrderId: string
+): Promise<{ sent: boolean; logs: string[] }> {
+  const logs: string[] = [];
+  const log = (m: string) => {
+    const t = `[${new Date().toISOString()}] ${m}`;
+    console.log(t);
+    logs.push(t);
+  };
+
+  const sos = await prisma.salesOrder.findMany({
+    where: { purchaseOrderId },
+    select: { id: true, soNumber: true },
+  });
+  if (sos.length === 0) {
+    log(`[VehicleDetails] Gate: PO ${purchaseOrderId} has no SOs`);
+    return { sent: false, logs };
+  }
+
+  const zload1Rows = await prisma.workQueue.findMany({
+    where: {
+      step: 'zload1',
+      salesOrderId: { in: sos.map((s) => s.id) },
+    },
+    select: { id: true, state: true, salesOrderId: true },
+  });
+
+  if (zload1Rows.length === 0) {
+    log(`[VehicleDetails] Gate: PO ${purchaseOrderId} has no ZLOAD1 rows yet`);
+    return { sent: false, logs };
+  }
+
+  const notDone = zload1Rows.filter((r) => r.state !== 'done');
+  if (notDone.length > 0) {
+    log(
+      `[VehicleDetails] Gate: PO ${purchaseOrderId} not ready — ${notDone.length}/${zload1Rows.length} ZLOAD1 row(s) still ${[...new Set(notDone.map((r) => r.state))].join('/')}`
+    );
+    return { sent: false, logs };
+  }
+
+  log(`[VehicleDetails] Gate: PO ${purchaseOrderId} all ${zload1Rows.length} ZLOAD1 row(s) done — sending combined email`);
+  const result = await sendCombinedVehicleDetailsEmailForPo(purchaseOrderId);
+  logs.push(...result.logs);
+  return result;
+}
+
 async function fireZload1FromPlan(plan: SoReleasePlan, log: (msg: string) => void): Promise<void> {
   await prisma.salesOrder.update({
     where: { id: plan.salesOrderId },
@@ -905,21 +1096,13 @@ export async function handleDispatchConfirmation(
 
     if (intent === 'yes') {
       // Confirmed — branch finalised the dispatch plan.
-      // Order matters: 1) compute bundles from Material rows so the truck
-      // count is locked in BEFORE any LS exists; 2) email branch the
-      // vehicle-details request per bundle; 3) fire ZLOAD1 per SO. LSIs
-      // created later by /zload1-data inherit bundleId from Material.
+      // Order: 1) compute bundles from Material rows so the truck count is
+      // locked in; 2) fire ZLOAD1 per (Bundle, SO) pair to create LSs in SAP.
+      // Vehicle-details email is sent later by checkAndSendCombinedVehicleEmailForPo
+      // once every ZLOAD1 work row for the PO is `done` — that runs from the
+      // /zload1-data callback. LSIs created later inherit bundleId from Material.
       const bundleResult = await computeBundlesForPo(email.purchaseOrderId);
       log(`[DispatchConfirm] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
-
-      const bundles = await prisma.bundle.findMany({
-        where: { purchaseOrderId: email.purchaseOrderId },
-        select: { id: true, bundleNumber: true },
-        orderBy: { bundleNumber: 'asc' },
-      });
-      for (const b of bundles) {
-        await sendVehicleDetailsForBundle(b.id);
-      }
 
       // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that
       // SO that live in that bundle. An SO that spans bundles gets multiple
