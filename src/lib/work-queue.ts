@@ -78,6 +78,10 @@ export async function pumpQueue(): Promise<WorkQueue | null> {
     meta: { ...(payload.meta ?? {}), work_id: next.id },
   };
 
+  const soNumber = (payload.meta?.so_number as string | undefined) ?? payload.so_number ?? 'unknown';
+
+  console.log(`[WorkQueue] → SEND work ${next.id} (${next.step}, SO ${soNumber}) → auto_gui2`);
+
   fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -85,14 +89,14 @@ export async function pumpQueue(): Promise<WorkQueue | null> {
   })
     .then((res) => {
       if (!res.ok) {
-        console.error(`[WorkQueue] /chat returned ${res.status} for work ${next.id} (${next.step}, SO ${payload.so_number})`);
+        console.error(`[WorkQueue] /chat returned ${res.status} for work ${next.id} (${next.step}, SO ${soNumber})`);
       } else {
-        console.log(`[WorkQueue] Fired work ${next.id} (${next.step}, SO ${payload.so_number})`);
+        console.log(`[WorkQueue] ✓ ACCEPTED work ${next.id} (${next.step}, SO ${soNumber}) — auto_gui2 running`);
       }
     })
     .catch((err) => {
       console.error(
-        `[WorkQueue] /chat unreachable for work ${next.id}: ${err instanceof Error ? err.message : String(err)}`
+        `[WorkQueue] /chat unreachable for work ${next.id} (${next.step}, SO ${soNumber}): ${err instanceof Error ? err.message : String(err)}`
       );
     });
 
