@@ -1383,7 +1383,9 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
     payload: {
       instruction: `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZSO-VISIBILITY for Sales order number ${soNumber}.`,
       transaction_code: 'ZSO-VISIBILITY',
-      so_number: soNumber,
+      meta: {
+        so_number: soNumber,
+      },
     },
   });
   await pumpQueue();

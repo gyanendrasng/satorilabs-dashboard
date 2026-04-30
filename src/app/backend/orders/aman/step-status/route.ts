@@ -95,21 +95,24 @@ export async function POST(request: Request) {
     );
   }
 
+  const payload = JSON.parse(existing.payload);
+  const soNumber = payload.meta?.so_number ?? payload.so_number ?? 'unknown';
+  const arrow = status === 'done' ? '✓ DONE' : '✗ FAILED';
   console.log(
-    `[StepStatus] work ${workId} (${existing.step}) → ${status}${errorMsg ? ` (${errorMsg})` : ''}`
+    `[WorkQueue] ← ${arrow} work ${workId} (${existing.step}, SO ${soNumber}) from auto_gui2${errorMsg ? ` — ${errorMsg}` : ''}`
   );
 
   const next = await pumpQueue();
 
   if (next) {
-    const payload = JSON.parse(next.payload);
+    const nextPayload = JSON.parse(next.payload);
     return NextResponse.json({
       success: true,
       marked_state: status,
       next_fired: {
         work_id: next.id,
         step: next.step,
-        so_number: payload.so_number,
+        so_number: nextPayload.meta?.so_number ?? nextPayload.so_number,
       },
     });
   }
