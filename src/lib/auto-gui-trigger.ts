@@ -5,6 +5,7 @@ import { buildDispatchApprovalHtml, type DispatchSoSection } from './dispatch-em
 import { enqueueWork, pumpQueue } from './work-queue';
 import { computeBundlesForPo } from './bundler';
 import { sendLSEmail } from './email-service';
+import { classifyDispatchConfirmation } from './dispatch-confirmation-classifier';
 import OpenAI from 'openai';
 import { z } from 'zod';
 
@@ -887,13 +888,22 @@ export async function handleDispatchConfirmation(
       return { success: false, logs };
     }
 
-    const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-    const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
-    const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
+    let intent: 'yes' | 'no' | 'ambiguous';
+    try {
+      const ai = await classifyDispatchConfirmation(replyHtml);
+      intent = ai.intent;
+      log(`[DispatchConfirm] AI intent=${intent} reason="${ai.reason}"`);
+    } catch (aiErr) {
+      // Fallback to regex if AI is unreachable / errors. Quoted-text bug
+      // remains here, but at least we keep the system moving.
+      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+      const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
+      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
+      intent = isYes && !isNo ? 'yes' : isNo ? 'no' : 'ambiguous';
+      log(`[DispatchConfirm] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+    }
 
-    log(`[DispatchConfirm] Reply intent: yes=${isYes} no=${isNo} text="${replyText.slice(0, 100)}"`);
-
-    if (isYes && !isNo) {
+    if (intent === 'yes') {
       // Confirmed — branch finalised the dispatch plan.
       // Order matters: 1) compute bundles from Material rows so the truck
       // count is locked in BEFORE any LS exists; 2) email branch the
