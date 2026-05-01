@@ -339,9 +339,11 @@ async function classifyAndPlanForSo(args: {
   }
 
   if (result.intent === 'release_all' || result.intent === 'release_part') {
-    // Source release plan from the canonical Material rows (fresh DB read)
-    // rather than echoing back the LLM's parsed list — Material has the
-    // weight per row needed for the truck-capacity gate.
+    // Source release plan from the canonical Material rows (fresh DB read).
+    // Always clamp per-line quantity at availability — we can never
+    // physically ship more than what's in stock, regardless of intent.
+    // Lines with zero available stock are skipped (cannot dispatch on
+    // this run; branch may choose to wait via the dispatch_confirmation).
     const materials = await prisma.material.findMany({
       where: { salesOrderId },
       orderBy: { createdAt: 'asc' },
@@ -352,10 +354,7 @@ async function classifyAndPlanForSo(args: {
     for (const m of materials) {
       const requested = m.orderQuantity;
       const available = m.availableStock ?? requested;
-      // release_all → full requested qty; release_part → cap at availability
-      const qty = result.intent === 'release_all'
-        ? requested
-        : Math.min(requested, Math.max(available, 0));
+      const qty = Math.min(requested, Math.max(available, 0));
       if (qty <= 0) continue;
       const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
       const perUnit = requested > 0 ? fullWeight / requested : 0;
