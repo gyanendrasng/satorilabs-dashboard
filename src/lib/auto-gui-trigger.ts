@@ -339,19 +339,33 @@ async function classifyAndPlanForSo(args: {
   }
 
   if (result.intent === 'release_all' || result.intent === 'release_part') {
-    // Source release plan from the canonical Material rows (fresh DB read).
-    // Always clamp per-line quantity at availability — we can never
-    // physically ship more than what's in stock, regardless of intent.
-    // Lines with zero available stock are skipped (cannot dispatch on
-    // this run; branch may choose to wait via the dispatch_confirmation).
+    // Source the release plan from the canonical Material rows (fresh DB read).
+    // Always clamp per-line quantity at availability — we cannot physically
+    // ship more than what's in stock, regardless of intent.
+    // Honor explicit exclusions: if the classifier returns a `materials`
+    // list, only include DB rows that match (by material+batch). When the
+    // classifier omits a row the branch wanted dropped, it stays out.
+    // If the classifier didn't return a list, default to all DB materials.
     const materials = await prisma.material.findMany({
       where: { salesOrderId },
       orderBy: { createdAt: 'asc' },
     });
 
+    const allowed = new Set<string>(
+      (Array.isArray(result.materials) ? result.materials : [])
+        .map((r: { material_code?: string; material?: string; batch?: string }) =>
+          `${r.material_code ?? r.material ?? ''}|${r.batch ?? ''}`
+        )
+    );
+    const useAllowList = allowed.size > 0;
+
     const items: ReleaseItem[] = [];
     let totalWeightKg = 0;
     for (const m of materials) {
+      if (useAllowList && !allowed.has(`${m.material}|${m.batch}`)) {
+        log(`[BranchReply] SO ${soNumber} excluding ${m.material}/${m.batch} — not in classifier list`);
+        continue;
+      }
       const requested = m.orderQuantity;
       const available = m.availableStock ?? requested;
       const qty = Math.min(requested, Math.max(available, 0));
