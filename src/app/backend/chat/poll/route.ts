@@ -3,6 +3,11 @@ import { auth } from '@/lib/auth';
 import { responseStore } from '@/lib/response-store';
 import { prisma } from '@/lib/prisma';
 
+// Long-polling chunk feed — must run at request time (auth + DB), never
+// prerendered. Without this, Next 15.5 + Turbopack tries to statically
+// analyse the route and fails with "Cannot find module for page".
+export const dynamic = 'force-dynamic';
+
 export async function GET(request: Request) {
   try {
     const session = await auth.api.getSession({
