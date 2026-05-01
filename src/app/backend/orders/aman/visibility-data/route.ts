@@ -107,13 +107,20 @@ export async function POST(request: Request) {
 
     // Step 1b: persist materials in the dedicated Material table (queryable).
     // Normalize legacy field names so old auto_gui2 payloads still work.
+    // Out-of-stock items often arrive with batch='' — store them with the
+    // 'N/A' sentinel so they remain queryable and surface in the dispatch
+    // email (matches existing convention, e.g. YOGRFL0000000SMP|N/A|10|0).
+    let persisted = 0;
+    let skipped = 0;
     for (const raw of materials) {
       const materialCode = raw.material ?? raw.material_code ?? '';
-      const batch = raw.batch ?? raw.batch_number ?? '';
-      if (!materialCode || !batch) {
-        console.warn(`[VisibilityData] Skipping material row missing code/batch:`, raw);
+      if (!materialCode) {
+        console.warn(`[VisibilityData] Skipping material row missing code:`, raw);
+        skipped++;
         continue;
       }
+      const rawBatch = raw.batch ?? raw.batch_number ?? '';
+      const batch = rawBatch || 'N/A';
       await prisma.material.upsert({
         where: {
           salesOrderId_material_batch: {
@@ -138,8 +145,11 @@ export async function POST(request: Request) {
           orderWeightKg: raw.order_weight_kg ?? null,
         },
       });
+      persisted++;
     }
-    console.log(`[VisibilityData] Persisted ${materials.length} Material row(s) for SO ${soNumber}`);
+    console.log(
+      `[VisibilityData] Persisted ${persisted}/${materials.length} Material row(s) for SO ${soNumber}${skipped > 0 ? ` (${skipped} skipped — missing code)` : ''}`
+    );
 
     // Step 2: buffer the per-SO email body + materials (raw JSON, for combined-email assembly).
     const materialsJson = JSON.stringify(materials);
