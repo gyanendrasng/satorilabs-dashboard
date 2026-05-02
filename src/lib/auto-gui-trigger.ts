@@ -6,6 +6,7 @@ import { enqueueWork, pumpQueue } from './work-queue';
 import { computeBundlesForPo } from './bundler';
 import { sendLSEmail } from './email-service';
 import { classifyDispatchConfirmation } from './dispatch-confirmation-classifier';
+import { classifyVehicleSplitReply } from './vehicle-split-classifier';
 import OpenAI from 'openai';
 import { z } from 'zod';
 
@@ -520,38 +521,54 @@ export async function handleVehicleSplitConfirmation(
       return { success: false, logs };
     }
 
-    // Light-weight yes/no detection. Reply text is short and structured here.
-    const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-    const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(
-      replyText
-    );
-    const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
-
-    log(`[VehicleSplit] Reply intent: yes=${isYes} no=${isNo} text="${replyText.slice(0, 80)}"`);
-
-    if (isYes && !isNo) {
-      // Confirmed: load each SO's stored plan and send a dispatch-confirmation
-      // email (text). ZLOAD1 only fires after that final confirmation arrives.
-      const sos = await prisma.salesOrder.findMany({
-        where: { purchaseOrderId: email.purchaseOrderId, releasePlan: { not: null } },
-      });
-      const plans: SoReleasePlan[] = [];
-      for (const so of sos) {
-        if (!so.releasePlan) continue;
-        try {
-          plans.push(JSON.parse(so.releasePlan) as SoReleasePlan);
-        } catch {
-          log(`[VehicleSplit] could not parse stored plan for SO ${so.soNumber}`);
-        }
+    // Load each SO's stored plan up-front — the classifier wants the list
+    // of valid material codes, and every branch reaches the plan loader.
+    const sos = await prisma.salesOrder.findMany({
+      where: { purchaseOrderId: email.purchaseOrderId, releasePlan: { not: null } },
+    });
+    const plans: SoReleasePlan[] = [];
+    for (const so of sos) {
+      if (!so.releasePlan) continue;
+      try {
+        plans.push(JSON.parse(so.releasePlan) as SoReleasePlan);
+      } catch {
+        log(`[VehicleSplit] could not parse stored plan for SO ${so.soNumber}`);
       }
+    }
+    const knownMaterialCodes = Array.from(
+      new Set(plans.flatMap((p) => p.items.map((i) => i.material_code)))
+    );
+
+    const po = await prisma.purchaseOrder.findUnique({
+      where: { id: email.purchaseOrderId },
+      include: { customer: true },
+    });
+    const capacityTonnes = po?.customer?.weightage ? Number(po.customer.weightage) : 31;
+
+    let intent: 'split' | 'cancel' | 'amend' | 'ambiguous';
+    let removeCodes: string[] = [];
+    let adjustItems: { material_code: string; quantity: number }[] = [];
+    try {
+      const ai = await classifyVehicleSplitReply({ replyHtml, knownMaterialCodes });
+      intent = ai.intent;
+      if (ai.intent === 'amend') {
+        removeCodes = ai.remove;
+        adjustItems = ai.adjust;
+      }
+      log(`[VehicleSplit] AI intent=${intent}${ai.intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''} reason="${ai.reason}"`);
+    } catch (aiErr) {
+      // Fall back to the legacy regex if the local classifier errors. Same
+      // capabilities as before (yes/no), no amend support.
+      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+      const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(replyText);
+      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
+      intent = isYes && !isNo ? 'split' : isNo ? 'cancel' : 'ambiguous';
+      log(`[VehicleSplit] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+    }
+
+    if (intent === 'split') {
       const totalKg = plans.reduce((s, p) => s + p.totalWeightKg, 0);
       const totalTonnes = totalKg / 1000;
-      const po = await prisma.purchaseOrder.findUnique({
-        where: { id: email.purchaseOrderId },
-        include: { customer: true },
-      });
-      const capacityTonnes = po?.customer?.weightage ? Number(po.customer.weightage) : 31;
-
       log(`[VehicleSplit] Confirmed split — sending dispatch confirmation email for ${plans.length} SO(s)`);
       await sendDispatchConfirmationEmail({
         purchaseOrderId: email.purchaseOrderId,
@@ -562,7 +579,6 @@ export async function handleVehicleSplitConfirmation(
         threadAnchor: email,
         log,
       });
-
       await prisma.email.update({
         where: { id: emailId },
         data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
@@ -570,12 +586,102 @@ export async function handleVehicleSplitConfirmation(
       return { success: true, logs };
     }
 
-    if (isNo) {
+    if (intent === 'cancel') {
       log(`[VehicleSplit] Branch declined split — keeping plans on hold`);
       await prisma.email.update({
         where: { id: emailId },
         data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
       });
+      return { success: true, logs };
+    }
+
+    if (intent === 'amend') {
+      // Mutate each SO's plan: drop items in removeCodes; clamp items in
+      // adjustItems at availability; recompute weight; persist.
+      const removeSet = new Set(removeCodes);
+      const adjustMap = new Map(adjustItems.map((a) => [a.material_code, a.quantity]));
+
+      for (const plan of plans) {
+        const so = sos.find((s) => s.id === plan.salesOrderId);
+        if (!so) continue;
+        const dbMaterials = await prisma.material.findMany({ where: { salesOrderId: so.id } });
+        const dbByCode = new Map(dbMaterials.map((m) => [m.material, m]));
+
+        const newItems: typeof plan.items = [];
+        for (const item of plan.items) {
+          if (removeSet.has(item.material_code)) {
+            log(`[VehicleSplit] SO ${plan.soNumber}: removing ${item.material_code} (${item.weight_kg.toFixed(0)} kg)`);
+            continue;
+          }
+          if (adjustMap.has(item.material_code)) {
+            const dbRow = dbByCode.get(item.material_code);
+            const requested = dbRow?.orderQuantity ?? item.quantity;
+            const available = dbRow?.availableStock ?? requested;
+            const target = adjustMap.get(item.material_code)!;
+            const newQty = Math.min(target, requested, Math.max(available, 0));
+            if (newQty <= 0) {
+              log(`[VehicleSplit] SO ${plan.soNumber}: adjust ${item.material_code} → 0 (clamped); dropping line`);
+              continue;
+            }
+            const fullWeight = dbRow?.orderWeightKg ? Number(dbRow.orderWeightKg) : 0;
+            const perUnit = requested > 0 ? fullWeight / requested : item.weight_kg / Math.max(item.quantity, 1);
+            const newWeight = perUnit * newQty;
+            log(`[VehicleSplit] SO ${plan.soNumber}: adjust ${item.material_code} ${item.quantity}→${newQty} (${item.weight_kg.toFixed(0)}→${newWeight.toFixed(0)} kg)`);
+            newItems.push({ ...item, quantity: newQty, weight_kg: newWeight });
+            continue;
+          }
+          newItems.push(item);
+        }
+
+        plan.items = newItems;
+        plan.totalWeightKg = newItems.reduce((s, i) => s + i.weight_kg, 0);
+
+        await prisma.salesOrder.update({
+          where: { id: so.id },
+          data: { releasePlan: JSON.stringify(plan) },
+        });
+      }
+
+      const newTotalKg = plans.reduce((s, p) => s + p.totalWeightKg, 0);
+      const newTotalTonnes = newTotalKg / 1000;
+      const survivingPlans = plans.filter((p) => p.items.length > 0);
+
+      log(`[VehicleSplit] PO ${po?.poNumber}: amended total ${newTotalTonnes.toFixed(2)} t (capacity ${capacityTonnes} t), ${survivingPlans.length} SO(s) with items`);
+
+      // Mark the current vehicle-split email completed regardless — it has
+      // been answered with an amendment and is producing a follow-up email.
+      await prisma.email.update({
+        where: { id: emailId },
+        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
+      });
+
+      if (survivingPlans.length === 0) {
+        log(`[VehicleSplit] Amendment removed all items — leaving for operator review`);
+        return { success: true, logs };
+      }
+
+      if (newTotalTonnes <= capacityTonnes) {
+        log(`[VehicleSplit] Amended load fits 1 truck — sending dispatch_confirmation`);
+        await sendDispatchConfirmationEmail({
+          purchaseOrderId: email.purchaseOrderId,
+          plans: survivingPlans,
+          twoVehicles: false,
+          totalTonnes: newTotalTonnes,
+          capacityTonnes,
+          threadAnchor: email,
+          log,
+        });
+      } else {
+        log(`[VehicleSplit] Still over capacity by ${(newTotalTonnes - capacityTonnes).toFixed(2)} t — sending fresh vehicle-split inquiry`);
+        await sendVehicleSplitInquiry({
+          purchaseOrderId: email.purchaseOrderId,
+          plans: survivingPlans,
+          totalTonnes: newTotalTonnes,
+          capacityTonnes,
+          originalCombinedEmail: email,
+          log,
+        });
+      }
       return { success: true, logs };
     }
 
