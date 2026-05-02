@@ -43,7 +43,7 @@ export async function classifyVehicleSplitReply(args: {
 
   const openai = new OpenAI();
   const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: 'gpt-5.5',
     temperature: 0.1,
     response_format: { type: 'json_object' },
     messages: [
