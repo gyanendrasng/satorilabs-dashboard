@@ -1117,7 +1117,7 @@ function renderDispatchConfirmationBody(args: {
  *
  * Does NOT fire ZLOAD1 — that happens after the branch confirms.
  */
-async function sendDispatchConfirmationEmail(args: {
+export async function sendDispatchConfirmationEmail(args: {
   purchaseOrderId: string;
   plans: SoReleasePlan[];
   twoVehicles: boolean;
