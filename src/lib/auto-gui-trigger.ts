@@ -1039,33 +1039,52 @@ async function persistDispatchPlan(plan: SoReleasePlan): Promise<void> {
 }
 
 /**
- * Compose the prose dispatch-confirmation email body for the whole PO.
- * Lists each SO's planned items with quantities; asks branch to reply
- * 'yes' to confirm or describe changes in plain English.
+ * Compose the prose dispatch-confirmation email body, grouped TRUCK-WISE
+ * (per Bundle), with each item annotated with its source SO. Weights are
+ * rendered to 3 decimals (kg precision) so the totals don't drift from
+ * rounding.
  */
+type BundleForEmail = {
+  bundleNumber: number;
+  totalWeightKg: import('@prisma/client').Prisma.Decimal | number;
+  materials: Array<{
+    material: string;
+    batch: string;
+    dispatchQuantity: number | null;
+    orderQuantity: number;
+    orderWeightKg: import('@prisma/client').Prisma.Decimal | number | null;
+    salesOrder: { soNumber: string };
+  }>;
+};
+
 function renderDispatchConfirmationBody(args: {
   poNumber: string;
   customerName: string;
   twoVehicles: boolean;
   totalTonnes: number;
   capacityTonnes: number;
-  plans: SoReleasePlan[];
+  bundles: BundleForEmail[];
 }): string {
-  const { poNumber, customerName, twoVehicles, totalTonnes, capacityTonnes, plans } = args;
+  const { poNumber, customerName, twoVehicles, totalTonnes, capacityTonnes, bundles } = args;
 
-  const totalStr = totalTonnes.toFixed(2).replace(/\.00$/, '');
+  const fmtT = (n: number) => n.toFixed(3);
+  const totalStr = fmtT(totalTonnes);
+  const vehicleCount = bundles.length;
   const intro = twoVehicles
-    ? `Vehicle split confirmed for Purchase Order ${poNumber} (${customerName}). Total dispatch ${totalStr} t across 2 vehicles (capacity ${capacityTonnes} t each).`
+    ? `Vehicle split confirmed for Purchase Order ${poNumber} (${customerName}). Total dispatch ${totalStr} t across ${vehicleCount} vehicles (capacity ${capacityTonnes} t each).`
     : `Dispatch plan ready for Purchase Order ${poNumber} (${customerName}). Total ${totalStr} t — fits in 1 vehicle (capacity ${capacityTonnes} t).`;
 
-  const sections = plans
-    .map((p) => {
-      const lines = p.items.map((i) => {
-        const w = (i.weight_kg / 1000).toFixed(2).replace(/\.00$/, '');
-        return `  - ${i.material_code} (Batch ${i.batch}): ${i.quantity} units, ~${w} t`;
+  const sections = bundles
+    .map((b) => {
+      const bundleT = fmtT(Number(b.totalWeightKg) / 1000);
+      const lines = b.materials.map((m) => {
+        const dispatchQty = m.dispatchQuantity ?? 0;
+        const orderedQty = m.orderQuantity || 0;
+        const fullWeightKg = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+        const itemKg = orderedQty > 0 ? (dispatchQty / orderedQty) * fullWeightKg : 0;
+        return `  - SO ${m.salesOrder.soNumber} / ${m.material} (Batch ${m.batch}): ${dispatchQty} units, ${fmtT(itemKg / 1000)} t`;
       });
-      const t = (p.totalWeightKg / 1000).toFixed(2).replace(/\.00$/, '');
-      return `Sales Order ${p.soNumber} — ${t} t:\n${lines.join('\n')}`;
+      return `Bundle ${b.bundleNumber} — ${bundleT} t (of ${capacityTonnes} t capacity):\n${lines.join('\n')}`;
     })
     .join('\n\n');
 
@@ -1074,7 +1093,7 @@ function renderDispatchConfirmationBody(args: {
     '',
     intro,
     '',
-    'Proposed dispatch:',
+    'Proposed dispatch (grouped by bundle):',
     '',
     sections,
     '',
@@ -1119,7 +1138,25 @@ async function sendDispatchConfirmationEmail(args: {
     await persistDispatchPlan(plan);
   }
 
-  // 2) Compose body.
+  // 2) Compute bundles now (FFD bin-pack into trucks of customer.weightage*1000 kg)
+  //    so the email can list items truck-by-truck. Bundler is idempotent, so
+  //    handleDispatchConfirmation re-running it later produces the same result.
+  const bundleResult = await computeBundlesForPo(purchaseOrderId);
+  log(`[DispatchConfirm] Pre-email bundling: ${bundleResult.bundleCount} bundle(s), total ${(bundleResult.totalKg / 1000).toFixed(3)} t / ${bundleResult.capacityKg / 1000} t per truck`);
+
+  const bundlesForEmail = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    orderBy: { bundleNumber: 'asc' },
+    include: {
+      materials: {
+        where: { dispatchQuantity: { gt: 0 } },
+        include: { salesOrder: { select: { soNumber: true } } },
+        orderBy: [{ material: 'asc' }],
+      },
+    },
+  });
+
+  // 3) Compose body.
   const po = await prisma.purchaseOrder.findUnique({
     where: { id: purchaseOrderId },
     include: { customer: true },
@@ -1134,7 +1171,7 @@ async function sendDispatchConfirmationEmail(args: {
     twoVehicles,
     totalTonnes,
     capacityTonnes,
-    plans,
+    bundles: bundlesForEmail,
   });
   const subject = `Dispatch Confirmation - PO ${po.poNumber}`;
 
