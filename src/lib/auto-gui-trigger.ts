@@ -345,27 +345,43 @@ async function classifyAndPlanForSo(args: {
       orderBy: { createdAt: 'asc' },
     });
 
-    const allowed = new Set<string>(
-      (Array.isArray(result.materials) ? result.materials : [])
-        .map((r: { material_code?: string; material?: string; batch?: string }) =>
-          `${r.material_code ?? r.material ?? ''}|${r.batch ?? ''}`
-        )
-    );
-    const useAllowList = allowed.size > 0;
+    const classifierMaterials = (Array.isArray(result.materials) ? result.materials : []) as Array<{
+      material_code?: string;
+      material?: string;
+      batch?: string;
+      quantity?: number;
+    }>;
+    const classifierByKey = new Map<string, { quantity?: number }>();
+    for (const r of classifierMaterials) {
+      const code = r.material_code ?? r.material ?? '';
+      const batch = r.batch ?? '';
+      classifierByKey.set(`${code}|${batch}`, { quantity: r.quantity });
+    }
+    const useAllowList = classifierByKey.size > 0;
 
     const items: ReleaseItem[] = [];
     let totalWeightKg = 0;
     for (const m of materials) {
-      if (useAllowList && !allowed.has(`${m.material}|${m.batch}`)) {
+      const key = `${m.material}|${m.batch}`;
+      if (useAllowList && !classifierByKey.has(key)) {
         log(`[BranchReply] SO ${soNumber} excluding ${m.material}/${m.batch} — not in classifier list`);
         continue;
       }
-      const requested = m.orderQuantity;
-      const available = m.availableStock ?? requested;
-      const qty = Math.min(requested, Math.max(available, 0));
+      // Honor branch-requested quantity (e.g. "send only 50 of X") when the
+      // classifier returns a positive integer for this material — clamp at
+      // orderQuantity so the branch can shrink but never inflate the order.
+      const classifierQty = classifierByKey.get(key)?.quantity;
+      const branchRequested = typeof classifierQty === 'number' && classifierQty > 0
+        ? Math.min(classifierQty, m.orderQuantity)
+        : m.orderQuantity;
+      const available = m.availableStock ?? branchRequested;
+      const qty = Math.min(branchRequested, Math.max(available, 0));
       if (qty <= 0) continue;
+      if (qty < m.orderQuantity) {
+        log(`[BranchReply] SO ${soNumber} ${m.material}/${m.batch}: shipping ${qty} (ordered ${m.orderQuantity}, branch asked ${classifierQty ?? 'n/a'}, stock ${m.availableStock ?? 'n/a'})`);
+      }
       const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
-      const perUnit = requested > 0 ? fullWeight / requested : 0;
+      const perUnit = m.orderQuantity > 0 ? fullWeight / m.orderQuantity : 0;
       const itemWeight = perUnit * qty;
       items.push({
         material_code: m.material,
