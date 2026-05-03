@@ -313,6 +313,11 @@ async function classifyAndPlanForSo(args: {
 
   log(`[BranchReply] Classifying for SO ${soNumber}`);
 
+  const replyPreview = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const previewMax = 800;
+  const previewSuffix = replyPreview.length > previewMax ? ` ...(truncated, full length=${replyPreview.length})` : '';
+  log(`[BranchReply] SO ${soNumber} reply text fed to classifier: "${replyPreview.slice(0, previewMax)}${previewSuffix}"`);
+
   let result: { intent: string; materials?: Array<{ material_code?: string; batch?: string }> };
   try {
     result = await classifyBranchReply({
@@ -432,6 +437,11 @@ async function sendVehicleSplitInquiry(args: {
 
   const overBy = (totalTonnes - capacityTonnes).toFixed(2).replace(/\.00$/, '');
   const totalStr = totalTonnes.toFixed(2).replace(/\.00$/, '');
+  const vehicleCount = capacityTonnes > 0 ? Math.max(2, Math.ceil(totalTonnes / capacityTonnes)) : 2;
+  const vehicleWord = (n: number) => {
+    const words = ['', '', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN', 'EIGHT', 'NINE', 'TEN'];
+    return words[n] ?? String(n);
+  };
 
   const breakdown = plans
     .map((p) => {
@@ -449,7 +459,7 @@ async function sendVehicleSplitInquiry(args: {
     `Per-SO breakdown:`,
     breakdown,
     ``,
-    `Please confirm whether to proceed with TWO vehicles. Reply "yes" to split into 2 vehicles, or "no" to revise the dispatch.`,
+    `At least ${vehicleCount} vehicles (${vehicleWord(vehicleCount)}) will be required to ship the full load. Reply "yes" to split into ${vehicleCount} vehicles, or "no" to revise the dispatch.`,
     ``,
     `Best regards,`,
     `Sales Order Dispatch Co-ordinator`,
