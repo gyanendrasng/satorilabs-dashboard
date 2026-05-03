@@ -7,6 +7,7 @@ import { computeBundlesForPo } from './bundler';
 import { sendLSEmail } from './email-service';
 import { classifyDispatchConfirmation } from './dispatch-confirmation-classifier';
 import { classifyVehicleSplitReply } from './vehicle-split-classifier';
+import { classifyBranchReply } from './branch-reply-classifier';
 import OpenAI from 'openai';
 import { z } from 'zod';
 
@@ -225,8 +226,8 @@ interface MaterialItemPayload {
 }
 
 /**
- * Handle a branch reply by classifying intent via /email/branch-reply
- * and acting accordingly (release materials or start production inquiry loop)
+ * Handle a branch reply by classifying intent locally (branch-reply-classifier)
+ * and acting accordingly (release materials or schedule a wait recheck)
  */
 type StoredMaterial = {
   // New shape (current auto_gui2 payload)
@@ -312,32 +313,19 @@ async function classifyAndPlanForSo(args: {
 
   log(`[BranchReply] Classifying for SO ${soNumber}`);
 
-  let result: any;
+  let result: { intent: string; materials?: Array<{ material_code?: string; batch?: string }> };
   try {
-    const response = await fetch(
-      `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/branch-reply`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          original_email_html: originalEmailHtml,
-          branch_reply_html: replyHtml,
-          sales_order: soNumber,
-        }),
-      }
-    );
-    result = await response.json();
+    result = await classifyBranchReply({
+      originalEmailHtml,
+      branchReplyHtml: replyHtml,
+      salesOrder: soNumber,
+    });
   } catch (err) {
-    log(`[BranchReply] /email/branch-reply call failed for SO ${soNumber}: ${err instanceof Error ? err.message : String(err)}`);
+    log(`[BranchReply] local classifier failed for SO ${soNumber}: ${err instanceof Error ? err.message : String(err)}`);
     return { success: false };
   }
 
   log(`[BranchReply] SO ${soNumber} intent=${result.intent}`);
-
-  if (!result.success) {
-    log(`[BranchReply] SO ${soNumber} classification failed: ${result.error}`);
-    return { success: false };
-  }
 
   if (result.intent === 'release_all' || result.intent === 'release_part') {
     // Source the release plan from the canonical Material rows (fresh DB read).
@@ -1478,7 +1466,7 @@ export async function handleBranchReply(
   } catch (error) {
     const cause = error instanceof Error && (error as any).cause ? ` | cause: ${String((error as any).cause)}` : '';
     log(
-      `[BranchReply] Error: ${error instanceof Error ? error.message : String(error)}${cause} | endpoint: http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/branch-reply`
+      `[BranchReply] Error: ${error instanceof Error ? error.message : String(error)}${cause}`
     );
     return { success: false, logs };
   }
