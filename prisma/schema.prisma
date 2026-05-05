@@ -230,6 +230,7 @@ model SalesOrder {
   materials     Material[]
   workItems     WorkQueue[]
   shipments     Shipment[]
+  shortages     MaterialShortage[]
 
   @@map("sales_order")
 }
@@ -372,6 +373,57 @@ model CurrentSO {
   soNumber String @id
 
   @@map("current_so")
+}
+
+// Per-material shortage snapshot recorded when branch replies 'wait'. The
+// FCFS reactivator (driven by daily MB51) compares accumulated MaterialReceipt
+// arrivals (postingDate >= recordedAt) against open shortages and re-fires
+// ZSO-VISIBILITY for SOs whose every shortage is now covered. Append-only:
+// resolution sets resolvedAt rather than deleting the row, so we keep history
+// across multiple wait events for the same SO.
+model MaterialShortage {
+  id           String    @id @default(cuid())
+  salesOrderId String
+  material     String    // SAP code — material-level (sum across batches)
+  shortQty     Int       // boxes still needed
+  recordedAt   DateTime  @default(now())
+  resolvedAt   DateTime?
+  emailId      String?   // the branch-wait reply Email row that caused it
+
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@index([salesOrderId, resolvedAt])
+  @@index([recordedAt])
+  @@map("material_shortage")
+}
+
+// One row per MB51 line item — daily goods-receipt feed for plant 7651.
+// auto-gui2 runs MB51 at 11am IST and POSTs parsed rows to
+// /backend/material-receipts/upload. Unique on (materialDocument, material,
+// batch) so re-uploading the same posting date is idempotent.
+model MaterialReceipt {
+  id                  String   @id @default(cuid())
+  materialDocument    String   // SAP MIGO doc (e.g. "5000000131")
+  postingDate         DateTime // production day this receipt counts toward
+  entryDate           DateTime // when posted in SAP
+  material            String   // Y* SKU code
+  materialDescription String?
+  movementType        String   // typically "101"
+  quantity            Int      // boxes
+  batch               String
+  baseUnit            String   @default("BOX")
+  plant               String
+  userName            String?
+  documentHeaderText  String?
+  timeOfEntry         String?  // "HH:MM:SS"
+  purchaseOrder       String?  // SAP production order (5300000xxx)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([materialDocument, material, batch])
+  @@index([postingDate])
+  @@index([material])
+  @@map("material_receipt")
 }
 
 model Invoice {

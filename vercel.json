@@ -3,6 +3,10 @@
     {
       "path": "/backend/cron/check-emails",
       "schedule": "* * * * *"
+    },
+    {
+      "path": "/backend/cron/daily-mb51",
+      "schedule": "30 5 * * *"
     }
   ]
 }

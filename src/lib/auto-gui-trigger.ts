@@ -318,7 +318,11 @@ async function classifyAndPlanForSo(args: {
   const previewSuffix = replyPreview.length > previewMax ? ` ...(truncated, full length=${replyPreview.length})` : '';
   log(`[BranchReply] SO ${soNumber} reply text fed to classifier: "${replyPreview.slice(0, previewMax)}${previewSuffix}"`);
 
-  let result: { intent: string; materials?: Array<{ material_code?: string; batch?: string }> };
+  let result: {
+    intent: string;
+    materials?: Array<{ material_code?: string; batch?: string }>;
+    missing_materials?: string[];
+  };
   try {
     result = await classifyBranchReply({
       originalEmailHtml,
@@ -394,6 +398,16 @@ async function classifyAndPlanForSo(args: {
 
     log(`[BranchReply] SO ${soNumber} plan: ${items.length} item(s), ${(totalWeightKg / 1000).toFixed(2)} t`);
 
+    // Branch is releasing — clear any open shortages for this SO so they
+    // don't pollute future MB51 FCFS runs.
+    const cleared = await prisma.materialShortage.updateMany({
+      where: { salesOrderId, resolvedAt: null },
+      data: { resolvedAt: new Date() },
+    });
+    if (cleared.count > 0) {
+      log(`[BranchReply] SO ${soNumber} resolved ${cleared.count} open shortage row(s)`);
+    }
+
     return {
       success: true,
       intent: result.intent,
@@ -415,6 +429,39 @@ async function classifyAndPlanForSo(args: {
         waitRechecks: { increment: 1 },
       },
     });
+
+    // Persist per-material shortage so the daily MB51 FCFS reactivator can
+    // tell when fresh production covers this SO. Use the classifier's
+    // missing_materials (material codes only) when present; otherwise fall
+    // back to every Material row where availableStock < orderQuantity.
+    const allMaterials = await prisma.material.findMany({ where: { salesOrderId } });
+    const missingSet = new Set((result.missing_materials ?? []).map((m) => m.toUpperCase()));
+    const shortByMaterial = new Map<string, number>();
+    for (const m of allMaterials) {
+      const inMissing = missingSet.size === 0
+        ? (m.availableStock ?? 0) < m.orderQuantity
+        : missingSet.has(m.material.toUpperCase());
+      if (!inMissing) continue;
+      const shortQty = Math.max(0, m.orderQuantity - (m.availableStock ?? 0));
+      if (shortQty <= 0) continue;
+      shortByMaterial.set(m.material, (shortByMaterial.get(m.material) ?? 0) + shortQty);
+    }
+
+    if (shortByMaterial.size > 0) {
+      await prisma.materialShortage.createMany({
+        data: [...shortByMaterial.entries()].map(([material, shortQty]) => ({
+          salesOrderId,
+          material,
+          shortQty,
+        })),
+      });
+      const summary = [...shortByMaterial.entries()]
+        .map(([m, q]) => `${m}=${q}`)
+        .join(', ');
+      log(`[BranchReply] SO ${soNumber} recorded shortages: ${summary}`);
+    } else {
+      log(`[BranchReply] SO ${soNumber} 'wait' but no per-material shortage derivable`);
+    }
 
     log(`[BranchReply] SO ${soNumber} 'wait' → recheck scheduled at ${waitUntil.toISOString()} (${waitDays} day${waitDays === 1 ? '' : 's'})`);
     return { success: true, intent: 'wait' };
@@ -1856,7 +1903,18 @@ export async function assembleAndSendCombinedEmail(
     })),
   };
 
-  const subject = `Dispatch Approval Request - PO ${purchaseOrder.poNumber}`;
+  // If any SO in the PO had a recently-resolved MaterialShortage, this is a
+  // reactivation triggered by the daily MB51 FCFS check — flag it in the
+  // subject so the branch knows fresh stock is now available.
+  const recentResolveCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const recentlyResolved = await prisma.materialShortage.findFirst({
+    where: {
+      salesOrderId: { in: includedSOs.map((so) => so.id) },
+      resolvedAt: { gte: recentResolveCutoff },
+    },
+  });
+  const subjectPrefix = recentlyResolved ? 'Stock Available — ' : '';
+  const subject = `${subjectPrefix}Dispatch Approval Request - PO ${purchaseOrder.poNumber}`;
   const leadSO = includedSOs[0];
   const failureNote = failedSOs.length > 0
     ? ` (visibility failed for: ${failedSOs.map((so) => so.soNumber).join(', ')})`
