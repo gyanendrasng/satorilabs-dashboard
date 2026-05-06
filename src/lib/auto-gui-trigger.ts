@@ -1085,10 +1085,13 @@ async function fireZload1FromPlan(plan: SoReleasePlan, log: (msg: string) => voi
 async function persistDispatchPlan(plan: SoReleasePlan): Promise<void> {
   // First reset all Material rows for this SO to 0 (excluded), then bump
   // each plan item up to its decided qty. Anything not in the plan stays 0.
+  // releasedAt is stamped only on rows we actually commit to ship (qty > 0)
+  // — that's the signal the FCFS reactivator subtracts from inflow.
   await prisma.material.updateMany({
     where: { salesOrderId: plan.salesOrderId },
     data: { dispatchQuantity: 0 },
   });
+  const now = new Date();
   for (const item of plan.items) {
     await prisma.material.updateMany({
       where: {
@@ -1096,7 +1099,7 @@ async function persistDispatchPlan(plan: SoReleasePlan): Promise<void> {
         material: item.material_code,
         batch: item.batch,
       },
-      data: { dispatchQuantity: item.quantity },
+      data: { dispatchQuantity: item.quantity, releasedAt: now },
     });
   }
 }

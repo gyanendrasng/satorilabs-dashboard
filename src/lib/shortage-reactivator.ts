@@ -89,17 +89,32 @@ export async function reactivateCoveredShortages(): Promise<ReactivationResult> 
     }
   }
 
+  // Pool = inflow (MB51 receipts since `since`) − outflow (our own committed
+  // releases since `since`). Subtracting our outflow keeps the FCFS pre-filter
+  // accurate when fresh new orders consume incoming production stock between
+  // shortage-record-time and now. ZSO-VISIBILITY remains the truth check —
+  // pool is only the "is it worth re-firing visibility?" gate.
   const pool = new Map<string, number>();
   for (const [material, since] of earliestByMaterial) {
-    const agg = await prisma.materialReceipt.aggregate({
+    const inflowAgg = await prisma.materialReceipt.aggregate({
       where: { material, postingDate: { gte: since } },
       _sum: { quantity: true },
     });
-    pool.set(material, agg._sum.quantity ?? 0);
+    const outflowAgg = await prisma.material.aggregate({
+      where: {
+        material,
+        dispatchQuantity: { gt: 0 },
+        releasedAt: { gte: since },
+      },
+      _sum: { dispatchQuantity: true },
+    });
+    const inflow = inflowAgg._sum.quantity ?? 0;
+    const outflow = outflowAgg._sum.dispatchQuantity ?? 0;
+    pool.set(material, inflow - outflow);
   }
 
   log(
-    `[Reactivator] Pool snapshot: ${[...pool.entries()]
+    `[Reactivator] Pool snapshot (inflow − our outflow): ${[...pool.entries()]
       .map(([m, q]) => `${m}=${q}`)
       .join(', ') || '(empty)'}`
   );
