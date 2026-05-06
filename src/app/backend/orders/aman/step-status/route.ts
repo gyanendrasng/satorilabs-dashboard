@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { markDone, markFailed, pumpQueue } from '@/lib/work-queue';
-import { checkAndSendCombinedVehicleEmailForPo } from '@/lib/auto-gui-trigger';
+import { checkAndSendCombinedVehicleEmailForPo, updatePurchaseOrderStage } from '@/lib/auto-gui-trigger';
 
 /**
  * Accepts EITHER of two body shapes:
@@ -118,6 +118,65 @@ export async function POST(request: Request) {
     } catch (gateErr) {
       console.error(
         `[StepStatus] Combined-vehicle-email gate error for work ${workId}:`,
+        gateErr
+      );
+    }
+  }
+
+  // VTO1N completion gate: flip Shipment to 'shipped'; if all shipments for
+  // the SO are shipped, mark SO completed; if all SOs in the PO are completed,
+  // bump the PO stage. This is the single source of "PO is done" — not the
+  // earlier ZLOAD3-B1 callback.
+  if (existing.step === 'vto1n' && existing.salesOrderId) {
+    try {
+      const shipmentId = (payload.meta?.shipment_id as string | undefined) ?? null;
+      if (status === 'done' && shipmentId) {
+        await prisma.shipment.updateMany({
+          where: { id: shipmentId, status: 'shipment-triggered' },
+          data: { status: 'shipped', shippedAt: new Date() },
+        });
+        // Mirror onto legacy Invoice row keyed by obdNumber for back-compat.
+        const sh = await prisma.shipment.findUnique({
+          where: { id: shipmentId },
+          select: { obdNumber: true },
+        });
+        if (sh?.obdNumber) {
+          await prisma.invoice.updateMany({
+            where: { obdNumber: sh.obdNumber, status: 'shipment-triggered' },
+            data: { status: 'shipped' },
+          });
+        }
+      } else if (status === 'failed' && shipmentId) {
+        // Roll back so the user can retry the form.
+        await prisma.shipment.updateMany({
+          where: { id: shipmentId, status: 'shipment-triggered' },
+          data: { status: 'created', shipmentTriggeredAt: null },
+        });
+      }
+
+      if (status === 'done') {
+        // Did this complete every Shipment for the SO?
+        const remainingShipments = await prisma.shipment.count({
+          where: { salesOrderId: existing.salesOrderId, status: { not: 'shipped' } },
+        });
+        if (remainingShipments === 0) {
+          await prisma.salesOrder.update({
+            where: { id: existing.salesOrderId },
+            data: { status: 'completed' },
+          });
+          const so = await prisma.salesOrder.findUnique({
+            where: { id: existing.salesOrderId },
+            select: { purchaseOrderId: true, soNumber: true },
+          });
+          if (so?.purchaseOrderId) {
+            console.log(`[StepStatus] SO ${so.soNumber} all shipments shipped — marking completed and checking PO stage`);
+            await updatePurchaseOrderStage(so.purchaseOrderId);
+          }
+        }
+      }
+    } catch (gateErr) {
+      console.error(
+        `[StepStatus] VTO1N completion gate error for work ${workId}:`,
         gateErr
       );
     }

@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { updatePurchaseOrderStage } from '@/lib/auto-gui-trigger';
 
 interface SAPResultRow {
   sales_order: string;
@@ -175,14 +174,11 @@ export async function POST(request: Request) {
       await prisma.loadingSlipItem.update({ where: { id: item.id }, data: { status: 'completed' } });
     }
 
-    // Mark SO completed only when ALL its LSIs (across bundles) are completed.
-    const remaining = await prisma.loadingSlipItem.count({
-      where: { salesOrderId: salesOrder.id, status: { not: 'completed' } },
-    });
-    if (remaining === 0) {
-      await prisma.salesOrder.update({ where: { id: salesOrder.id }, data: { status: 'completed' } });
-      await updatePurchaseOrderStage(salesOrder.purchaseOrderId);
-    }
+    // SO/PO completion is gated on VTO1N-B success, not on ZLOAD3-B1 result.
+    // ZLOAD3-B1 only produces the OBD + invoice; the shipment hasn't been
+    // created in SAP yet. The vto1n step-status callback flips the Shipment
+    // to 'shipped' and, when ALL shipments for the SO are shipped, marks
+    // the SO completed and bumps PO stage.
 
     return NextResponse.json({
       success: true,
