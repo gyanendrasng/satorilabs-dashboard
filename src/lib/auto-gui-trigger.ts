@@ -2005,8 +2005,8 @@ export async function triggerVto1n(shipmentId: string): Promise<void> {
 
   const so = shipment.salesOrder;
   const bundle = shipment.bundle;
-  const lrNumber = so.lrNumber;
-  const lrDate = so.lrDate;
+  const lrNumber = shipment.lrNumber ?? so.lrNumber;
+  const lrDate = shipment.lrDate ?? so.lrDate;
   const vehicleNumber = bundle.vehicleNumber ?? so.vehicleNumber;
 
   if (!lrNumber || !lrDate) throw new Error(`Shipment ${shipmentId} cannot fire VT01N: missing LR number / date on SO ${so.soNumber}`);

@@ -47,6 +47,8 @@ export interface Shipment {
   invoiceNumber: string | null;
   invoiceDate: string | null;
   status: string; // created | shipment-triggered | shipped
+  lrNumber: string | null;
+  lrDate: string | null;
   bundle: {
     id: string;
     bundleNumber: number;

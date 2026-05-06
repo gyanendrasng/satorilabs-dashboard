@@ -32,7 +32,7 @@ import {
   Trash2,
   ArrowDown,
 } from 'lucide-react';
-import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, groupItemsByLsNumber } from '@/components/orders/types';
+import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, groupItemsByLsNumber } from '@/components/orders/types';
 
 interface ChatMessage {
   id: string;
@@ -72,6 +72,7 @@ export default function WorkPage() {
   const [selectedPO, setSelectedPO] = useState<PurchaseOrder | null>(null);
   const [selectedSO, setSelectedSO] = useState<SalesOrder | null>(null);
   const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
+  const [selectedShipment, setSelectedShipment] = useState<Shipment | null>(null);
 
   // Form state for new PO
   const [newPOForm, setNewPOForm] = useState({ customerName: '', poNumber: '' });
@@ -296,7 +297,7 @@ export default function WorkPage() {
     });
   };
 
-  // Check if invoice shipment details can be provided
+  // Check if invoice shipment details can be provided (legacy SO-level path)
   const canProvideShipmentDetails = (so: SalesOrder) => {
     const allLSCompleted = so.items.every((ls) => ls.status === 'completed');
     const soCompleted = so.status === 'completed';
@@ -305,6 +306,11 @@ export default function WorkPage() {
     const notAlreadyTriggered = !so.invoice || (so.invoice.status !== 'shipment-triggered' && so.invoice.status !== 'shipped');
     return allLSCompleted && soCompleted && invoiceCreated && noShipmentYet && notAlreadyTriggered;
   };
+
+  // Per-shipment gate: enabled while the Shipment is still in 'created' state
+  // (OBD generated, but VTO1N hasn't fired yet for this bundle).
+  const canProvideShipmentDetailsForShipment = (sh: Shipment) =>
+    sh.status === 'created' && !!sh.obdNumber;
 
   // Open modals
   const openNewPOModal = () => {
@@ -366,6 +372,7 @@ export default function WorkPage() {
     setInputType('shipment-details');
     setSelectedSO(so);
     setSelectedInvoice(so.invoice);
+    setSelectedShipment(null);
     setShipmentForm({
       lrNumber: so.lrNumber || '',
       lrDate: so.lrDate ? so.lrDate.split('T')[0] : '',
@@ -373,6 +380,24 @@ export default function WorkPage() {
       shipmentType: so.invoice.shipmentType || '',
       plantCode: so.invoice.plantCode || '',
       notes: so.invoice.notes || '',
+    });
+    setShowInputModal(true);
+  };
+
+  // Per-shipment modal opener: scoped to ONE Shipment (Bundle, SO) row.
+  // Submit fires VTO1N-B for only this shipment via the new per-shipment endpoint.
+  const openShipmentModalForShipment = (so: SalesOrder, sh: Shipment) => {
+    setInputType('shipment-details');
+    setSelectedSO(so);
+    setSelectedInvoice(null);
+    setSelectedShipment(sh);
+    setShipmentForm({
+      lrNumber: sh.lrNumber || '',
+      lrDate: sh.lrDate ? sh.lrDate.split('T')[0] : '',
+      vehicleNumber: '',
+      shipmentType: '',
+      plantCode: '',
+      notes: '',
     });
     setShowInputModal(true);
   };
@@ -493,9 +518,36 @@ export default function WorkPage() {
   };
 
   const handleUpdateShipment = async () => {
+    // Per-shipment path: PATCH the new shipments endpoint, which writes LR
+    // onto Shipment, mirrors metadata to legacy Invoice, and fires VTO1N-B
+    // for only that one shipment.
+    if (selectedShipment) {
+      try {
+        const res = await fetch(`/backend/orders/shipments/${selectedShipment.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            lrNumber: shipmentForm.lrNumber,
+            lrDate: shipmentForm.lrDate,
+            vehicleNumber: shipmentForm.vehicleNumber || undefined,
+            shipmentType: shipmentForm.shipmentType || undefined,
+            plantCode: shipmentForm.plantCode || undefined,
+            notes: shipmentForm.notes || undefined,
+          }),
+        });
+        if (res.ok) {
+          setShowInputModal(false);
+          fetchOrders();
+        }
+      } catch (err) {
+        console.error('Failed to update shipment:', err);
+      }
+      return;
+    }
+
+    // Legacy SO-level path (kept for older POs without Shipment rows).
     if (!selectedSO || !selectedInvoice) return;
     try {
-      // 1. PATCH SalesOrder with LR fields — this triggers VTO1N-B on the backend
       const soRes = await fetch(`/backend/orders/sales-orders/${selectedSO.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -506,7 +558,6 @@ export default function WorkPage() {
         }),
       });
 
-      // 2. PATCH Invoice with shipment metadata (no status override — VTO1N flow manages status)
       const invRes = await fetch(`/backend/orders/invoices/${selectedInvoice.id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -992,9 +1043,9 @@ export default function WorkPage() {
                                                     </span>
                                                   </div>
                                                 )}
-                                                {sh.status === 'created' && canProvideShipmentDetails(so) && (
+                                                {canProvideShipmentDetailsForShipment(sh) && (
                                                   <button
-                                                    onClick={() => openShipmentModal(so)}
+                                                    onClick={() => openShipmentModalForShipment(so, sh)}
                                                     className="w-full mt-2 px-3 py-2 bg-orange-600 hover:bg-orange-700 rounded text-sm flex items-center justify-center gap-1.5"
                                                   >
                                                     <Edit className="w-3.5 h-3.5" />
@@ -1373,6 +1424,8 @@ export default function WorkPage() {
                     ? 'Add Sales Order'
                     : inputType === 'so-details'
                     ? 'Sales Order Details Required'
+                    : selectedShipment
+                    ? `Shipment Details — Bundle ${selectedShipment.bundle.bundleNumber}`
                     : 'Shipment Details Required'}
                 </h2>
                 <p className="text-sm text-slate-400 mt-1">
@@ -1382,6 +1435,8 @@ export default function WorkPage() {
                     ? `Add a new Sales Order to ${selectedPO?.poNumber || 'PO'}`
                     : inputType === 'so-details'
                     ? `Provide details for ${selectedSO?.soNumber} to continue workflow`
+                    : selectedShipment
+                    ? `Provide shipment details for SO ${selectedSO?.soNumber}, Bundle ${selectedShipment.bundle.bundleNumber} (Invoice ${selectedShipment.invoiceNumber ?? '—'}, OBD ${selectedShipment.obdNumber ?? '—'})`
                     : `Provide shipment details for invoice ${selectedInvoice?.invoiceNumber}`}
                 </p>
               </div>

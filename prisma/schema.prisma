@@ -165,6 +165,10 @@ model Shipment {
   invoiceDate         DateTime?
   sapResults          String?   // JSON: full /processing-data rows for forensics
   status              String    @default("created") // created | shipment-triggered | shipped
+  // Per-shipment Lorry Receipt — falls back to SalesOrder.lrNumber/lrDate
+  // when null (back-compat for older Shipments + SO-wide LR scenarios).
+  lrNumber            String?
+  lrDate              DateTime?
   shipmentTriggeredAt DateTime?
   shippedAt           DateTime?
   createdAt           DateTime  @default(now())

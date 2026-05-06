@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { auth } from '@/lib/auth';
 import { prisma } from '@/lib/prisma';
-import { triggerVto1n } from '@/lib/auto-gui-trigger';
 
 // PATCH - Update a sales order
 export async function PATCH(
@@ -53,25 +52,9 @@ export async function PATCH(
       include: { invoice: true },
     });
 
-    // Trigger VTO1N-B per Shipment in `created` state for this SO. Each
-    // (Bundle, SO) pair has its own Shipment with its own OBD; we fire once
-    // per Shipment when its bundle has vehicle details and the SO has LR fields.
-    let vto1nTriggered = 0;
-    if (salesOrder.lrNumber && salesOrder.lrDate) {
-      const readyShipments = await prisma.shipment.findMany({
-        where: { salesOrderId: salesOrder.id, status: 'created', obdNumber: { not: null } },
-        include: { bundle: { select: { vehicleNumber: true } } },
-      });
-      for (const sh of readyShipments) {
-        if (!sh.bundle.vehicleNumber && !salesOrder.vehicleNumber) continue;
-        triggerVto1n(sh.id).catch((err) => {
-          console.error(`[VTO1N-B] Fire-and-forget error for Shipment ${sh.id} (SO ${salesOrder.soNumber}):`, err);
-        });
-        vto1nTriggered++;
-      }
-    }
-
-    return NextResponse.json({ salesOrder, vto1nTriggered });
+    // VTO1N-B firing is now per-shipment via PATCH /backend/orders/shipments/[id].
+    // This endpoint only edits SO metadata.
+    return NextResponse.json({ salesOrder });
   } catch (error) {
     console.error('[/backend/orders/sales-orders/[soId]] PATCH Error:', error);
     return NextResponse.json(
