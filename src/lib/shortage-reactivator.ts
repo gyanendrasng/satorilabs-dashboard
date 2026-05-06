@@ -95,6 +95,8 @@ export async function reactivateCoveredShortages(): Promise<ReactivationResult> 
   // shortage-record-time and now. ZSO-VISIBILITY remains the truth check —
   // pool is only the "is it worth re-firing visibility?" gate.
   const pool = new Map<string, number>();
+  const inflowByMat = new Map<string, number>();
+  const outflowByMat = new Map<string, number>();
   for (const [material, since] of earliestByMaterial) {
     const inflowAgg = await prisma.materialReceipt.aggregate({
       where: { material, postingDate: { gte: since } },
@@ -110,7 +112,14 @@ export async function reactivateCoveredShortages(): Promise<ReactivationResult> 
     });
     const inflow = inflowAgg._sum.quantity ?? 0;
     const outflow = outflowAgg._sum.dispatchQuantity ?? 0;
+    inflowByMat.set(material, inflow);
+    outflowByMat.set(material, outflow);
     pool.set(material, inflow - outflow);
+    if (outflow > 0) {
+      log(
+        `[Reactivator] ${material}: inflow=${inflow} − outflow=${outflow} (our releases since shortage) = pool ${inflow - outflow}`
+      );
+    }
   }
 
   log(
