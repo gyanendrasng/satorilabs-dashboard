@@ -965,7 +965,54 @@ export default function WorkPage() {
                                             Invoice
                                           </h4>
                                         </div>
-                                        {so.invoice ? (
+                                        {so.shipments && so.shipments.length > 0 ? (
+                                          <div className="space-y-2">
+                                            {so.shipments.map((sh) => (
+                                              <div
+                                                key={sh.id}
+                                                className="bg-purple-900/20 border border-purple-700/50 p-3 rounded"
+                                              >
+                                                <div className="flex items-center justify-between mb-2">
+                                                  <div className="flex items-center gap-2">
+                                                    <Package className="w-4 h-4 text-purple-400" />
+                                                    <span className="text-sm font-medium">
+                                                      {sh.invoiceNumber ?? '—'}
+                                                    </span>
+                                                    <span className="text-xs text-slate-400">
+                                                      Bundle {sh.bundle.bundleNumber}
+                                                    </span>
+                                                  </div>
+                                                  {getStatusBadge(sh.status)}
+                                                </div>
+                                                {sh.obdNumber && (
+                                                  <div className="flex items-center justify-between text-sm mb-2">
+                                                    <span className="text-slate-400">OBD:</span>
+                                                    <span className="text-slate-300">
+                                                      {sh.obdNumber}
+                                                    </span>
+                                                  </div>
+                                                )}
+                                                {sh.status === 'created' && canProvideShipmentDetails(so) && (
+                                                  <button
+                                                    onClick={() => openShipmentModal(so)}
+                                                    className="w-full mt-2 px-3 py-2 bg-orange-600 hover:bg-orange-700 rounded text-sm flex items-center justify-center gap-1.5"
+                                                  >
+                                                    <Edit className="w-3.5 h-3.5" />
+                                                    Provide Shipment Details
+                                                  </button>
+                                                )}
+                                              </div>
+                                            ))}
+                                            {so.lrNumber && (
+                                              <div className="px-3 py-2 text-xs text-slate-400 border border-slate-700 rounded">
+                                                <p>LR: {so.lrNumber}</p>
+                                                {so.vehicleNumber && (
+                                                  <p>Vehicle: {so.vehicleNumber}</p>
+                                                )}
+                                              </div>
+                                            )}
+                                          </div>
+                                        ) : so.invoice ? (
                                           <div className="bg-purple-900/20 border border-purple-700/50 p-3 rounded">
                                             <div className="flex items-center justify-between mb-2">
                                               <div className="flex items-center gap-2">

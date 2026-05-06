@@ -36,6 +36,25 @@ export interface Invoice {
   updatedAt: string;
 }
 
+// One Shipment per (Bundle, SO) pair — created by ZLOAD3-B1 callback.
+// Carries per-bundle OBD + HRJ invoice. Replaces the legacy one-per-SO Invoice
+// for display purposes (kept on SalesOrder for back-compat).
+export interface Shipment {
+  id: string;
+  bundleId: string;
+  salesOrderId: string;
+  obdNumber: string | null;
+  invoiceNumber: string | null;
+  invoiceDate: string | null;
+  status: string; // created | shipment-triggered | shipped
+  bundle: {
+    id: string;
+    bundleNumber: number;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface SalesOrder {
   id: string;
   soNumber: string;
@@ -59,6 +78,7 @@ export interface SalesOrder {
   updatedAt: string;
   items: LoadingSlipItem[];
   invoice: Invoice | null;
+  shipments: Shipment[];
 }
 
 export interface Customer {

@@ -31,6 +31,14 @@ export async function GET(request: Request) {
               },
             },
             invoice: true,
+            shipments: {
+              include: {
+                bundle: {
+                  select: { id: true, bundleNumber: true },
+                },
+              },
+              orderBy: { createdAt: 'asc' },
+            },
           },
         },
       },
