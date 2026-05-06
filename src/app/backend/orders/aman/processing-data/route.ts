@@ -65,8 +65,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: `Sales Order with soNumber '${soNumber}' not found` }, { status: 404 });
     }
 
-    // Resolve bundle. Priority: meta.bundle_id → SO's only bundle (if exactly one).
-    let bundleId: string | null = (meta?.bundle_id as string | undefined) ?? null;
+    // Resolve bundle. Priority: body.bundle_id (auto-gui2 send_data flat-spreads
+    // meta keys at the top level when `data` is a list — see gui_service.py:629)
+    // → meta.bundle_id (kept for forward compat if it ever sends nested) → SO's
+    // only bundle (if exactly one).
+    let bundleId: string | null =
+      ((body.bundle_id as string | undefined) ?? (meta?.bundle_id as string | undefined)) ?? null;
     if (!bundleId) {
       const bundles = await prisma.bundle.findMany({
         where: {
