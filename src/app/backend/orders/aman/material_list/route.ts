@@ -167,11 +167,29 @@ function normalizeRow(r: Record<string, unknown>, idx: number): NormalizedReceip
     }
     return String(v).trim() || null;
   };
+  // Excel exports the Entry Date column as date-only at midnight, with the
+  // actual SAP posting time in a separate Time of Entry column. Splice them
+  // into one timestamp so the FCFS reactivator's `entryDate >= recordedAt`
+  // window is precise to the second — otherwise same-day MB51 uploads taken
+  // shortly after a wait reply will never count, since midnight < the wait's
+  // recordedAt.
+  const mergeDateAndTime = (date: Date, time: string | null): Date => {
+    if (!time) return date;
+    const [h, m, s] = time.split(':').map((p) => Number.parseInt(p, 10));
+    if (Number.isNaN(h)) return date;
+    const merged = new Date(date);
+    merged.setUTCHours(h, Number.isFinite(m) ? m : 0, Number.isFinite(s) ? s : 0, 0);
+    return merged;
+  };
+
+  const rawEntryDate = dateField('Entry Date', 'Entry Date', 'entry_date');
+  const entryTime = timeField('Time of Entry', 'time_of_entry');
+  const entryDate = mergeDateAndTime(rawEntryDate, entryTime);
 
   return {
     materialDocument: required('Material Document', 'Material Document', 'material_document'),
     postingDate: dateField('Posting Date', 'Posting Date', 'posting_date'),
-    entryDate: dateField('Entry Date', 'Entry Date', 'entry_date'),
+    entryDate,
     material: required('Material', 'Material', 'material'),
     materialDescription: optional('Material Description', 'material_description'),
     movementType: required('Movement Type', 'Movement Type', 'movement_type'),

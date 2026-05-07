@@ -85,10 +85,21 @@ function normalize(r, idx) {
     }
     return String(v).trim() || null;
   };
+  // Mirror route: merge Entry Date + Time of Entry into one timestamp
+  const rawEntryDate = dateField('Entry Date', 'Entry Date');
+  const entryTime = timeField('Time of Entry');
+  const entryDateMerged = (() => {
+    if (!entryTime) return rawEntryDate;
+    const [h, m, s] = entryTime.split(':').map((p) => Number.parseInt(p, 10));
+    if (Number.isNaN(h)) return rawEntryDate;
+    const merged = new Date(rawEntryDate);
+    merged.setUTCHours(h, Number.isFinite(m) ? m : 0, Number.isFinite(s) ? s : 0, 0);
+    return merged;
+  })();
   return {
     materialDocument: required('Material Document', 'Material Document'),
     postingDate: dateField('Posting Date', 'Posting Date'),
-    entryDate: dateField('Entry Date', 'Entry Date'),
+    entryDate: entryDateMerged,
     material: required('Material', 'Material'),
     materialDescription: optional('Material Description'),
     movementType: required('Movement Type', 'Movement Type'),
