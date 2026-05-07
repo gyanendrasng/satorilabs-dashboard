@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
-import { markDone, markFailed, pumpQueue } from '@/lib/work-queue';
+import { markDone, markFailed, pumpQueue, MAX_ATTEMPTS } from '@/lib/work-queue';
 import { checkAndSendCombinedVehicleEmailForPo, updatePurchaseOrderStage } from '@/lib/auto-gui-trigger';
 
 /**
@@ -84,21 +84,38 @@ export async function POST(request: Request) {
     );
   }
 
-  const matched = status === 'done'
-    ? await markDone(workId)
-    : await markFailed(workId, errorMsg);
-
-  if (!matched) {
-    // Someone else marked it between our findUnique and updateMany.
-    return NextResponse.json(
-      { error: `work_id ${workId} could not be transitioned (race)` },
-      { status: 409 }
-    );
+  // Apply the state transition. For failures, markFailed handles retry logic
+  // internally — it may re-queue the row instead of marking it terminal.
+  let terminal = true; // 'done' is always terminal; failure may not be.
+  let attemptCount = 0;
+  if (status === 'done') {
+    const matched = await markDone(workId);
+    if (!matched) {
+      return NextResponse.json(
+        { error: `work_id ${workId} could not be transitioned (race)` },
+        { status: 409 }
+      );
+    }
+  } else {
+    const result = await markFailed(workId, errorMsg);
+    if (!result.matched) {
+      return NextResponse.json(
+        { error: `work_id ${workId} could not be transitioned (race)` },
+        { status: 409 }
+      );
+    }
+    terminal = result.terminal;
+    attemptCount = result.attemptCount;
   }
 
   const payload = JSON.parse(existing.payload);
   const soNumber = payload.meta?.so_number ?? payload.so_number ?? 'unknown';
-  const arrow = status === 'done' ? '✓ DONE' : '✗ FAILED';
+  const arrow =
+    status === 'done'
+      ? '✓ DONE'
+      : terminal
+      ? `✗ FAILED (terminal, ${attemptCount}/${MAX_ATTEMPTS})`
+      : `↻ RETRY (${attemptCount}/${MAX_ATTEMPTS})`;
   console.log(
     `[WorkQueue] ← ${arrow} work ${workId} (${existing.step}, SO ${soNumber}) from auto_gui2${errorMsg ? ` — ${errorMsg}` : ''}`
   );
@@ -146,8 +163,10 @@ export async function POST(request: Request) {
             data: { status: 'shipped' },
           });
         }
-      } else if (status === 'failed' && shipmentId) {
-        // Roll back so the user can retry the form.
+      } else if (status === 'failed' && terminal && shipmentId) {
+        // Only roll back on terminal failure — while we're still retrying,
+        // keep Shipment in 'shipment-triggered' so the UI doesn't offer the
+        // form again (the queue will re-fire automatically).
         await prisma.shipment.updateMany({
           where: { id: shipmentId, status: 'shipment-triggered' },
           data: { status: 'created', shipmentTriggeredAt: null },

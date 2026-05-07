@@ -242,17 +242,25 @@ model SalesOrder {
 // Global FIFO work queue. One row per pending /chat fire to auto_gui2.
 // Invariant: at most one row in `state='firing'` at a time, system-wide.
 // auto_gui2 acknowledges completion via POST /backend/orders/aman/step-status
-// with the row's id as `work_id`. No retries — failed rows are skipped.
+// with the row's id as `work_id`. On failure, markFailed re-queues the row
+// up to MAX_ATTEMPTS - 1 times with a backoff (see work-queue.ts). After
+// MAX_ATTEMPTS the row stays failed.
 model WorkQueue {
-  id           String    @id @default(cuid())
-  salesOrderId String?
-  step         String    // 'visibility' | 'zload1' | 'zload3b1' | 'vto1n'
-  payload      String    // JSON of the /chat body (so_number, instruction, attachments, etc.)
-  state        String    @default("queued") // queued | firing | done | failed
-  error        String?
-  createdAt    DateTime  @default(now())
-  startedAt    DateTime?
-  finishedAt   DateTime?
+  id            String    @id @default(cuid())
+  salesOrderId  String?
+  step          String    // 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51'
+  payload       String    // JSON of the /chat body (so_number, instruction, attachments, etc.)
+  state         String    @default("queued") // queued | firing | done | failed
+  // Number of times this row has FAILED (and been retried). 0 = never failed.
+  // When nextCount would equal MAX_ATTEMPTS, the row stays failed (terminal).
+  attemptCount  Int       @default(0)
+  // For backoff between retries. null = available now; set after a retry to
+  // gate pumpQueue from re-firing too quickly. Cleared on terminal failure.
+  nextAttemptAt DateTime?
+  error         String?
+  createdAt     DateTime  @default(now())
+  startedAt     DateTime?
+  finishedAt    DateTime?
 
   salesOrder   SalesOrder? @relation(fields: [salesOrderId], references: [id], onDelete: SetNull)
 

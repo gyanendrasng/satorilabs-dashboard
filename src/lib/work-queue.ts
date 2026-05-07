@@ -6,6 +6,14 @@ const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 
 export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51';
 
+/**
+ * Retry policy: 1 initial attempt + 3 retries = 4 total. Uniform across all
+ * steps. Backoff between retries gives auto-gui2 / SAP a chance to recover
+ * from transient failures (process restart, network blip) before we re-thrash.
+ */
+export const MAX_ATTEMPTS = 4;
+export const RETRY_BACKOFF_MS = 30_000;
+
 export interface ChatPayload {
   instruction: string;
   transaction_code: string;
@@ -54,8 +62,14 @@ export async function pumpQueue(): Promise<WorkQueue | null> {
   const firing = await prisma.workQueue.findFirst({ where: { state: 'firing' } });
   if (firing) return null;
 
+  // Filter out rows that were just re-queued for retry but whose backoff hasn't
+  // elapsed yet — they'll become eligible on a later pump tick (the per-minute
+  // cron at /backend/cron/check-emails calls pumpQueue every tick).
   const next = await prisma.workQueue.findFirst({
-    where: { state: 'queued' },
+    where: {
+      state: 'queued',
+      OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }],
+    },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   });
   if (!next) return null;
@@ -118,14 +132,53 @@ export async function markDone(workId: string): Promise<boolean> {
 }
 
 /**
- * Mark a firing work row as `failed`. Returns true if a row was matched.
+ * Mark a firing work row as failed, with bounded retry. If this is not yet
+ * the MAX_ATTEMPTS-th failure, the row is re-queued with a backoff
+ * (`nextAttemptAt = now + RETRY_BACKOFF_MS`) and `terminal=false` is returned.
+ * If it IS the final attempt, the row stays `failed` with `terminal=true`.
+ *
+ * Callers (step-status route) should branch on `terminal` for downstream
+ * cleanup — e.g. only roll back a Shipment to `created` when the VTO1N
+ * failure is terminal, not while we're still retrying.
  */
-export async function markFailed(workId: string, error?: string): Promise<boolean> {
+export async function markFailed(
+  workId: string,
+  error?: string,
+): Promise<{ matched: boolean; terminal: boolean; attemptCount: number }> {
+  const row = await prisma.workQueue.findUnique({ where: { id: workId } });
+  if (!row || row.state !== 'firing') {
+    return { matched: false, terminal: false, attemptCount: row?.attemptCount ?? 0 };
+  }
+
+  const nextCount = row.attemptCount + 1;
+  if (nextCount < MAX_ATTEMPTS) {
+    // Retry: re-queue with backoff
+    const result = await prisma.workQueue.updateMany({
+      where: { id: workId, state: 'firing' },
+      data: {
+        state: 'queued',
+        startedAt: null,
+        finishedAt: null,
+        attemptCount: nextCount,
+        nextAttemptAt: new Date(Date.now() + RETRY_BACKOFF_MS),
+        error: error ?? null,
+      },
+    });
+    return { matched: result.count > 0, terminal: false, attemptCount: nextCount };
+  }
+
+  // Terminal failure — give up
   const result = await prisma.workQueue.updateMany({
     where: { id: workId, state: 'firing' },
-    data: { state: 'failed', finishedAt: new Date(), error: error ?? null },
+    data: {
+      state: 'failed',
+      finishedAt: new Date(),
+      attemptCount: nextCount,
+      nextAttemptAt: null,
+      error: error ?? null,
+    },
   });
-  return result.count > 0;
+  return { matched: result.count > 0, terminal: true, attemptCount: nextCount };
 }
 
 /**
