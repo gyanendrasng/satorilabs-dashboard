@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
-import { reactivateCoveredShortages } from '@/lib/shortage-reactivator';
+import {
+  ingestMaterialReceipts,
+  type NormalizedReceiptRow,
+} from '@/lib/material-receipts-ingest';
 
 const WEBHOOK_API_KEY =
   process.env.WEBHOOK_API_KEY || 'dummy-webhook-api-key-12345';
@@ -14,23 +16,6 @@ function validateApiKey(request: Request): boolean {
 }
 
 type RawRow = Record<string, unknown>;
-
-interface NormalizedRow {
-  materialDocument: string;
-  postingDate: Date;
-  entryDate: Date;
-  material: string;
-  materialDescription: string | null;
-  movementType: string;
-  quantity: number;
-  batch: string;
-  baseUnit: string;
-  plant: string;
-  userName: string | null;
-  documentHeaderText: string | null;
-  timeOfEntry: string | null;
-  purchaseOrder: string | null;
-}
 
 function asString(v: unknown): string | null {
   if (v === null || v === undefined) return null;
@@ -46,7 +31,7 @@ function parseDate(v: unknown, field: string): Date {
   return d;
 }
 
-function normalize(r: RawRow, idx: number): NormalizedRow {
+function normalize(r: RawRow, idx: number): NormalizedReceiptRow {
   const required = (k: string) => {
     const v = asString(r[k]);
     if (!v) throw new Error(`row ${idx}: missing ${k}`);
@@ -108,7 +93,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'rows must be non-empty' }, { status: 400 });
   }
 
-  let normalized: NormalizedRow[];
+  let normalized: NormalizedReceiptRow[];
   try {
     normalized = rawRows.map(normalize);
   } catch (err) {
@@ -118,34 +103,6 @@ export async function POST(request: Request) {
     );
   }
 
-  const postingDates = new Set<string>();
-  let inserted = 0;
-  let updated = 0;
-
-  for (const row of normalized) {
-    postingDates.add(row.postingDate.toISOString().slice(0, 10));
-    const result = await prisma.materialReceipt.upsert({
-      where: {
-        materialDocument_material_batch: {
-          materialDocument: row.materialDocument,
-          material: row.material,
-          batch: row.batch,
-        },
-      },
-      create: row,
-      update: row,
-    });
-    if (result.createdAt.getTime() === result.updatedAt.getTime()) inserted++;
-    else updated++;
-  }
-
-  const reactivation = await reactivateCoveredShortages();
-
-  return NextResponse.json({
-    rowsInserted: inserted,
-    rowsUpdated: updated,
-    postingDates: [...postingDates].sort(),
-    reactivatedSos: reactivation.reactivatedSos,
-    shortagesConsidered: reactivation.considered,
-  });
+  const result = await ingestMaterialReceipts(normalized);
+  return NextResponse.json(result);
 }
