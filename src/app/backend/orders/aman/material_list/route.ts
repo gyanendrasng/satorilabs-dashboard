@@ -20,18 +20,31 @@ import { ingestMaterialReceipts, type NormalizedReceiptRow } from '@/lib/materia
  * posting date is safe.
  */
 export async function POST(request: Request) {
+  console.log('[MaterialList] POST received, content-type:', request.headers.get('content-type'));
+
   let formData: FormData;
   try {
     formData = await request.formData();
   } catch (err) {
+    console.error('[MaterialList] formData parse failed:', err);
     return NextResponse.json(
       { error: 'Expected multipart/form-data with a `file` field', details: String(err) },
       { status: 400 }
     );
   }
 
+  // Log every field we got so we can see what auto-gui2 actually sent.
+  for (const [k, v] of formData.entries()) {
+    if (v instanceof Blob) {
+      console.log(`[MaterialList] field "${k}": Blob size=${v.size} type=${v.type}`);
+    } else {
+      console.log(`[MaterialList] field "${k}":`, String(v).slice(0, 200));
+    }
+  }
+
   const file = formData.get('file');
   if (!(file instanceof Blob)) {
+    console.error('[MaterialList] no Blob under "file" key');
     return NextResponse.json(
       { error: 'No `file` in form data — auto-gui2 should send the .XLSX as the file field' },
       { status: 400 }
