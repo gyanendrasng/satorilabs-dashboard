@@ -96,8 +96,13 @@ export async function POST(request: Request) {
     );
   }
 
+  // Empty MB51 (no production that day) is a legitimate state, not an error.
+  // Skip ingest but still run the reactivator — it's idempotent and may
+  // resolve shortages from prior days' accumulated receipts.
   if (rows.length === 0) {
-    return NextResponse.json({ error: 'No rows found in sheet' }, { status: 400 });
+    console.log('[MaterialList] sheet has no data rows — likely a no-production day');
+    const result = await ingestMaterialReceipts([]);
+    return NextResponse.json({ ...result, note: 'no rows in sheet — reactivator ran anyway' });
   }
 
   const result = await ingestMaterialReceipts(rows);
