@@ -94,10 +94,16 @@ export async function reactivateCoveredShortages(): Promise<ReactivationResult> 
   // accurate when fresh new orders consume incoming production stock between
   // shortage-record-time and now. ZSO-VISIBILITY remains the truth check —
   // pool is only the "is it worth re-firing visibility?" gate.
+  //
+  // We compare against `entryDate` (when SAP recorded the goods receipt) and
+  // not `postingDate` (the production day, which Excel exports as date-only at
+  // 00:00 and would be earlier than a same-day shortage's recordedAt). entryDate
+  // is the actual moment the inflow became visible to anyone, so any receipt
+  // with entryDate >= recordedAt is genuinely "new since the shortage was logged".
   const pool = new Map<string, number>();
   for (const [material, since] of earliestByMaterial) {
     const inflowAgg = await prisma.materialReceipt.aggregate({
-      where: { material, postingDate: { gte: since } },
+      where: { material, entryDate: { gte: since } },
       _sum: { quantity: true },
     });
     const outflowAgg = await prisma.material.aggregate({
