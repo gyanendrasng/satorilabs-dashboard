@@ -1,4 +1,6 @@
 import { NextResponse } from 'next/server';
+import { writeFile, mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import * as XLSX from 'xlsx';
 import { ingestMaterialReceipts, type NormalizedReceiptRow } from '@/lib/material-receipts-ingest';
 
@@ -54,6 +56,22 @@ export async function POST(request: Request) {
   let rows: NormalizedReceiptRow[];
   try {
     const buf = Buffer.from(await file.arrayBuffer());
+
+    // Dump every upload to /tmp/mb51-uploads/ so we can inspect what auto-gui2
+    // actually sent. Filename includes timestamp + original name when present.
+    try {
+      const dumpDir = '/tmp/mb51-uploads';
+      await mkdir(dumpDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const origName = (file as { name?: string }).name || 'upload.xlsx';
+      const safeName = origName.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const dumpPath = join(dumpDir, `${stamp}_${safeName}`);
+      await writeFile(dumpPath, buf);
+      console.log(`[MaterialList] dumped upload to ${dumpPath} (${buf.length} bytes)`);
+    } catch (dumpErr) {
+      console.warn('[MaterialList] failed to dump upload to disk:', dumpErr);
+    }
+
     const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
     const sheetName = wb.SheetNames[0];
     if (!sheetName) {
