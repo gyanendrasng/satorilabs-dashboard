@@ -184,11 +184,11 @@ model Shipment {
 
 // Customer record keyed by the externally-provided customer_id from the
 // NEW ORDER email. Auto-created on first sight with a generic name.
-// `weightage` is the customer's truck capacity in tonnes (default 31).
+// `weightage` is the customer's truck capacity in tonnes (default 45).
 model Customer {
   id        String   @id
   name      String   @default("New Customer")
-  weightage Decimal  @default(31)
+  weightage Decimal  @default(45)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
