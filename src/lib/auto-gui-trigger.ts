@@ -604,7 +604,7 @@ export async function handleVehicleSplitConfirmation(
       where: { id: email.purchaseOrderId },
       include: { customer: true },
     });
-    const capacityTonnes = po?.customer?.weightage ? Number(po.customer.weightage) : 31;
+    const capacityTonnes = po?.customer?.weightage ? Number(po.customer.weightage) : 45;
 
     let intent: 'split' | 'cancel' | 'amend' | 'ambiguous';
     let removeCodes: string[] = [];
@@ -1475,7 +1475,7 @@ export async function handleBranchReply(
         });
         const capacityTonnes = po?.customer?.weightage
           ? Number(po.customer.weightage)
-          : 31;
+          : 45;
 
         log(`[BranchReply] PO ${po?.poNumber}: total release weight ${totalTonnes.toFixed(2)} t (capacity ${capacityTonnes} t)`);
 
@@ -1541,7 +1541,7 @@ export async function handleBranchReply(
       });
       const capacityTonnes = so?.purchaseOrder.customer?.weightage
         ? Number(so.purchaseOrder.customer.weightage)
-        : 31;
+        : 45;
 
       if (totalTonnes > capacityTonnes) {
         log(`[BranchReply] Single-SO over capacity (${totalTonnes.toFixed(2)} t > ${capacityTonnes} t) — sending split inquiry`);
@@ -1886,7 +1886,7 @@ export async function assembleAndSendCombinedEmail(
   }));
   const capacityTonnes = purchaseOrder.customer?.weightage
     ? Number(purchaseOrder.customer.weightage)
-    : 31;
+    : 45;
   const combinedBody = buildDispatchApprovalHtml(purchaseOrder.poNumber, sections, capacityTonnes);
 
   // Aggregated v2 materials JSON (used by handleBranchReply to reconstruct per-SO context)
