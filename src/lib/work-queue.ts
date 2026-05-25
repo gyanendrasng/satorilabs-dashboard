@@ -4,7 +4,7 @@ import type { WorkQueue } from '@prisma/client';
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 
-export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51';
+export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51' | 'zloading_close' | 'va02' | 'zload2';
 
 /**
  * Retry policy: 1 initial attempt + 3 retries = 4 total. Uniform across all

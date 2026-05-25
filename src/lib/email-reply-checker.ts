@@ -166,6 +166,16 @@ export async function checkForReplies(): Promise<{
         continue;
       }
 
+      if (emailType === '2nd_release') {
+        // Branch replied to a 2nd-release confirmation email — scenario engine advances on 'yes'
+        log(`[EmailChecker] Routing to handleSecondReleaseReply for SO ${soNumber}`);
+        const { handleSecondReleaseReply } = await import('./scenario-engine');
+        const srResult = await handleSecondReleaseReply(email.id, replyBodyHtml || '');
+        logs.push(...srResult.logs);
+        processed++;
+        continue;
+      }
+
       if (emailType === 'plant_ls') {
         // Plant replied to LS email — only care about PDF attachment (invoice)
         log(`[EmailChecker] Plant reply for SO ${soNumber} / LS ${lsNumber}`);
@@ -204,6 +214,33 @@ export async function checkForReplies(): Promise<{
             repliedAt: new Date(),
           },
         });
+
+        // Plant-modification fork: a plant_ls reply with text but no invoice
+        // PDF means the plant is asking for an LS modification (qty change /
+        // shortage / line removal). Route to the scenario engine when the
+        // flag is on. If the engine matches a scenario, skip the legacy
+        // BatchSender call below.
+        if (
+          emailType === 'plant_ls' &&
+          replyBodyHtml &&
+          email.salesOrderId &&
+          (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
+        ) {
+          const { handleReplyV2 } = await import('./scenario-engine');
+          const originalEmailHtml = await getMessageBody(email.gmailMessageId);
+          const r = await handleReplyV2({
+            emailId: email.id,
+            replyHtml: replyBodyHtml,
+            originalEmailHtml,
+            sourceEmailType: 'plant',
+          });
+          logs.push(...r.logs);
+          if (r.matched) {
+            processed++;
+            continue;
+          }
+          // Fall through to legacy BatchSender if the engine didn't match.
+        }
 
         // Check if all emails for this (Bundle, SO) pair now have replies.
         // bundleId comes from the LSI the email is tied to; null = legacy

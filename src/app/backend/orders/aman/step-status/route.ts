@@ -201,6 +201,26 @@ export async function POST(request: Request) {
     }
   }
 
+  // Scenario engine: when a SAP step completes successfully, advance any
+  // active ScenarioProgress whose current step matches this work step. Safe
+  // no-op when the engine is disabled, no progress row exists, or the
+  // current step doesn't match. `existing.step` is the same WorkStep union
+  // literal used at enqueue time, so narrow it to that type for the call.
+  if (status === 'done' && existing.salesOrderId) {
+    try {
+      const { maybeAdvanceScenario } = await import('@/lib/scenario-engine');
+      await maybeAdvanceScenario(
+        existing.salesOrderId,
+        existing.step as import('@/lib/work-queue').WorkStep,
+      );
+    } catch (engineErr) {
+      console.error(
+        `[StepStatus] maybeAdvanceScenario warning for work ${workId}:`,
+        engineErr
+      );
+    }
+  }
+
   const next = await pumpQueue();
 
   if (next) {

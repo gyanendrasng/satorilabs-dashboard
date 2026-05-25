@@ -169,6 +169,16 @@ export async function checkAndSendBatchToAman(
     await pumpQueue();
 
     log(`[BatchSender] Enqueued ZLOAD3-B1 for ${scopeLabel} with ${attachments.length} attachment(s)`);
+
+    // Advance any active scenario past 'await_plant_invoice'. Safe no-op when
+    // engine is disabled or no scenario is in flight.
+    try {
+      const { maybeAdvanceScenario } = await import('./scenario-engine');
+      await maybeAdvanceScenario(salesOrderId, 'zload3b1');
+    } catch (advErr) {
+      log(`[BatchSender] maybeAdvanceScenario warning: ${advErr instanceof Error ? advErr.message : advErr}`);
+    }
+
     return { success: true, logs };
   } catch (error) {
     log(
@@ -1276,6 +1286,80 @@ export async function sendDispatchConfirmationEmail(args: {
 }
 
 /**
+ * Compute bundles for a PO (idempotent) and fire ZLOAD1 once per (Bundle, SO)
+ * pair using each Material's saved dispatchQuantity. Flips touched SOs to
+ * `stock_approved`. Two callers: handleDispatchConfirmation when the branch
+ * confirms the dispatch plan, and the scenario engine when its `zload1` step
+ * is reached on a modification scenario.
+ */
+export async function fanOutZload1ForPo(
+  purchaseOrderId: string,
+  log: (msg: string) => void,
+): Promise<{ fired: number; bundleCount: number }> {
+  const bundleResult = await computeBundlesForPo(purchaseOrderId);
+  log(`[ZLOAD1-Fanout] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
+
+  // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that SO
+  // that live in that bundle. An SO that spans bundles gets multiple fires;
+  // a bundle that holds multiple SOs also gets multiple fires. The global
+  // WorkQueue serializes everything; we just control enqueue order:
+  // bundleNumber asc, then SO createdAt asc within a bundle.
+  const bundlesWithMaterials = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    orderBy: { bundleNumber: 'asc' },
+    include: {
+      materials: {
+        where: { dispatchQuantity: { gt: 0 } },
+        include: {
+          salesOrder: { select: { id: true, soNumber: true, createdAt: true } },
+        },
+      },
+    },
+  });
+
+  let fired = 0;
+  const stockApprovedSoIds = new Set<string>();
+
+  for (const bundle of bundlesWithMaterials) {
+    type Slot = { soNumber: string; salesOrderId: string; createdAt: Date; items: MaterialItemPayload[] };
+    const bySo = new Map<string, Slot>();
+    for (const m of bundle.materials) {
+      const slot = bySo.get(m.salesOrderId) ?? {
+        soNumber: m.salesOrder.soNumber,
+        salesOrderId: m.salesOrderId,
+        createdAt: m.salesOrder.createdAt,
+        items: [],
+      };
+      slot.items.push({
+        material_code: m.material,
+        batch: m.batch,
+        quantity: m.dispatchQuantity!,
+      });
+      bySo.set(m.salesOrderId, slot);
+    }
+
+    const slots = Array.from(bySo.values()).sort(
+      (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
+    );
+
+    for (const slot of slots) {
+      if (!stockApprovedSoIds.has(slot.salesOrderId)) {
+        await prisma.salesOrder.update({
+          where: { id: slot.salesOrderId },
+          data: { status: 'stock_approved', releasePlan: null },
+        });
+        stockApprovedSoIds.add(slot.salesOrderId);
+      }
+      await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
+      fired++;
+      log(`[ZLOAD1-Fanout] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
+    }
+  }
+
+  return { fired, bundleCount: bundleResult.bundleCount };
+}
+
+/**
  * Branch replied to the dispatch confirmation email.
  * Light parsing: 'yes/confirm/proceed' → fire ZLOAD1 per SO from the saved
  * Material.dispatchQuantity values. Anything else (changes, 'no') is left
@@ -1316,77 +1400,19 @@ export async function handleDispatchConfirmation(
 
     if (intent === 'yes') {
       // Confirmed — branch finalised the dispatch plan.
-      // Order: 1) compute bundles from Material rows so the truck count is
-      // locked in; 2) fire ZLOAD1 per (Bundle, SO) pair to create LSs in SAP.
-      // Vehicle-details email is sent later by checkAndSendCombinedVehicleEmailForPo
-      // once every ZLOAD1 work row for the PO is `done` — that runs from the
-      // /zload1-data callback. LSIs created later inherit bundleId from Material.
-      const bundleResult = await computeBundlesForPo(email.purchaseOrderId);
-      log(`[DispatchConfirm] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
-
-      // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that
-      // SO that live in that bundle. An SO that spans bundles gets multiple
-      // fires; a bundle that holds multiple SOs also gets multiple fires.
-      // The global WorkQueue serializes everything; we just control enqueue
-      // order: bundleNumber asc, then SO createdAt asc within a bundle.
-      const bundlesWithMaterials = await prisma.bundle.findMany({
-        where: { purchaseOrderId: email.purchaseOrderId },
-        orderBy: { bundleNumber: 'asc' },
-        include: {
-          materials: {
-            where: { dispatchQuantity: { gt: 0 } },
-            include: {
-              salesOrder: { select: { id: true, soNumber: true, createdAt: true } },
-            },
-          },
-        },
-      });
-
-      let fired = 0;
-      const stockApprovedSoIds = new Set<string>();
-
-      for (const bundle of bundlesWithMaterials) {
-        // Group this bundle's materials by SO.
-        type Slot = { soNumber: string; salesOrderId: string; createdAt: Date; items: MaterialItemPayload[] };
-        const bySo = new Map<string, Slot>();
-        for (const m of bundle.materials) {
-          const slot = bySo.get(m.salesOrderId) ?? {
-            soNumber: m.salesOrder.soNumber,
-            salesOrderId: m.salesOrderId,
-            createdAt: m.salesOrder.createdAt,
-            items: [],
-          };
-          slot.items.push({
-            material_code: m.material,
-            batch: m.batch,
-            quantity: m.dispatchQuantity!,
-          });
-          bySo.set(m.salesOrderId, slot);
-        }
-
-        const slots = Array.from(bySo.values()).sort(
-          (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
-        );
-
-        for (const slot of slots) {
-          if (!stockApprovedSoIds.has(slot.salesOrderId)) {
-            await prisma.salesOrder.update({
-              where: { id: slot.salesOrderId },
-              data: { status: 'stock_approved', releasePlan: null },
-            });
-            stockApprovedSoIds.add(slot.salesOrderId);
-          }
-          await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
-          fired++;
-          log(`[DispatchConfirm] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
-        }
-      }
+      // Bundle + per-(Bundle, SO) ZLOAD1 fan-out is in fanOutZload1ForPo so
+      // the scenario engine can drive the same code path for modification
+      // scenarios. Vehicle-details email is sent later by
+      // checkAndSendCombinedVehicleEmailForPo once every ZLOAD1 work row for
+      // the PO is `done` — that runs from the /zload1-data callback. LSIs
+      // created later inherit bundleId from Material.
+      const fanOut = await fanOutZload1ForPo(email.purchaseOrderId, log);
 
       await prisma.email.update({
         where: { id: emailId },
         data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
       });
-      log(`[DispatchConfirm] Confirmed ${fired} SO(s) for PO ${email.purchaseOrderId}`);
+      log(`[DispatchConfirm] Confirmed ${fanOut.fired} SO(s) for PO ${email.purchaseOrderId}`);
       return { success: true, logs };
     }
 
@@ -1409,6 +1435,25 @@ export async function handleBranchReply(
   originalEmailHtml: string,
   _salesOrderId: string
 ): Promise<{ success: boolean; logs: string[] }> {
+  // Scenario engine (feature-flag gated). When the engine matches a scenario,
+  // it returns success+matched and we short-circuit. When it can't match
+  // (e.g. SCENARIOS lookup misses), we fall through to the legacy body below.
+  if (
+    (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
+  ) {
+    // Dynamic import keeps the legacy hot path free of the engine module when
+    // the flag is off (no extra parsing on flag-off requests).
+    const { handleReplyV2 } = await import('./scenario-engine');
+    const r = await handleReplyV2({
+      emailId,
+      replyHtml,
+      originalEmailHtml,
+      sourceEmailType: 'branch',
+    });
+    if (r.matched) return { success: r.success, logs: r.logs };
+    // No matching scenario — fall through to the legacy classifier path.
+  }
+
   const logs: string[] = [];
   const log = (msg: string) => {
     const logMsg = `[${new Date().toISOString()}] ${msg}`;
@@ -1806,6 +1851,243 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
 }
 
 /**
+ * Trigger ZLOADING_CLOSE for one or more materials on a sales order.
+ *
+ * Builds an instruction of the form:
+ *   "VPN is connected and SAP is logged in. Just go ahead and run the SAP
+ *    Transaction ZLOADING_CLOSE for Sales Order number <soNumber>.
+ *    Close material X, Close material Y."
+ *
+ * Idempotent: dedups on (soNumber + sorted materials) by scanning WorkQueue
+ * for an existing zloading_close row in queued/firing/done state with the
+ * same materials_key in the payload.
+ */
+export async function triggerZloadingClose(
+  soNumber: string,
+  materials: string[]
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[ZLOADING_CLOSE] No materials provided for SO ${soNumber} — skipping`);
+    return;
+  }
+
+  const normalized = Array.from(new Set(materials)).sort();
+  const materialsKey = JSON.stringify(normalized);
+
+  // JSON substring match is robust to key ordering because we search for the
+  // canonical materials_key value, which is itself a stable JSON string.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zloading_close',
+      state: { in: ['queued', 'firing', 'done'] },
+      payload: { contains: `"materials_key":${JSON.stringify(materialsKey)}` },
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOADING_CLOSE] Already exists for SO ${soNumber} materials=${materialsKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const closeClauses = normalized.map((m) => `Close material ${m}`).join(', ');
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction ZLOADING_CLOSE for Sales Order number ${soNumber}. ${closeClauses}.`;
+
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'zloading_close',
+    payload: {
+      instruction,
+      transaction_code: 'ZLOADING_CLOSE',
+      so_number: soNumber,
+      meta: {
+        so_number: soNumber,
+        materials: normalized,
+        materials_key: materialsKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(
+    `[ZLOADING_CLOSE] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${normalized.join(', ')})`
+  );
+}
+
+/**
+ * Trigger VA02 to set order quantities on one or more materials of a sales order.
+ *
+ * Builds an instruction like:
+ *   "...VA02 for Sales Order number <soNumber>. For material X set the order
+ *    quantity to N, for material Y set the order quantity to M"
+ *
+ * Idempotent on the full payload: dedups against existing queued/firing/done
+ * va02 rows with the exact same SO + sorted material→quantity map. A later
+ * call with different quantities fires normally — supports legitimate
+ * sequential edits.
+ */
+export async function triggerVa02(
+  soNumber: string,
+  materials: Array<{ material: string; orderQuantity: number }>
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[VA02] No materials provided for SO ${soNumber} — skipping`);
+    return;
+  }
+
+  const byMaterial = new Map<string, number>();
+  for (const m of materials) byMaterial.set(m.material, m.orderQuantity);
+  const normalized = Array.from(byMaterial.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([material, orderQuantity]) => ({ material, orderQuantity }));
+  const payloadKey = JSON.stringify({ soNumber, materials: normalized });
+
+  // Dedup is scoped to VA02 via both `step` and a payload substring match on
+  // `"transaction_code":"VA02"` — prevents any cross-transaction collision.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'va02',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"VA02"` } },
+        { payload: { contains: `"payload_key":${JSON.stringify(payloadKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[VA02] Already exists for SO ${soNumber} payload_key=${payloadKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const clauses = normalized
+    .map((m) => `for material ${m.material} set the order quantity to ${m.orderQuantity}`)
+    .join(', ');
+  const clausesSentence = clauses.charAt(0).toUpperCase() + clauses.slice(1);
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction VA02 for Sales Order number ${soNumber}. ${clausesSentence}`;
+
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'va02',
+    payload: {
+      instruction,
+      transaction_code: 'VA02',
+      so_number: soNumber,
+      meta: {
+        so_number: soNumber,
+        materials: normalized,
+        payload_key: payloadKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(`[VA02] Enqueued for SO ${soNumber} (${normalized.length} material(s))`);
+}
+
+/**
+ * Trigger ZLOAD2 for a loading slip with per-material batch + quantity.
+ *
+ * Builds an instruction like:
+ *   "...ZLOAD2 for Loading Slip number <lsNumber>. For material X batch <B>
+ *    order quantity is N, for material Y batch <B2> order quantity is M"
+ *
+ * Resolves salesOrderId from a LoadingSlipItem with the given lsNumber so the
+ * WorkQueue row is linked to the SO.
+ *
+ * Idempotent on the full payload: dedups against existing queued/firing/done
+ * zload2 rows with the exact same LS + sorted (material, batch, quantity).
+ */
+export async function triggerZload2(
+  lsNumber: string,
+  materials: Array<{ material: string; batch: string; orderQuantity: number }>
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[ZLOAD2] No materials provided for LS ${lsNumber} — skipping`);
+    return;
+  }
+
+  const missingBatch = materials.find((m) => !m.batch);
+  if (missingBatch) {
+    throw new Error(
+      `[ZLOAD2] Material ${missingBatch.material} has no batch — batch is required for ZLOAD2`
+    );
+  }
+
+  const byKey = new Map<string, { material: string; batch: string; orderQuantity: number }>();
+  for (const m of materials) byKey.set(`${m.material}|${m.batch}`, { ...m });
+  const normalized = Array.from(byKey.values()).sort((a, b) =>
+    a.material === b.material ? a.batch.localeCompare(b.batch) : a.material.localeCompare(b.material)
+  );
+  const payloadKey = JSON.stringify({ lsNumber, materials: normalized });
+
+  // Dedup is scoped to ZLOAD2 via both `step` and a payload substring match on
+  // `"transaction_code":"ZLOAD2"` — prevents any cross-transaction collision.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zload2',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"ZLOAD2"` } },
+        { payload: { contains: `"payload_key":${JSON.stringify(payloadKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOAD2] Already exists for LS ${lsNumber} payload_key=${payloadKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const clauses = normalized
+    .map((m) => `for material ${m.material} batch ${m.batch} order quantity is ${m.orderQuantity}`)
+    .join(', ');
+  const clausesSentence = clauses.charAt(0).toUpperCase() + clauses.slice(1);
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction ZLOAD2 for Loading Slip number ${lsNumber}. ${clausesSentence}`;
+
+  // Any item for this lsNumber works — all items of a single LS share the same SO.
+  const lsi = await prisma.loadingSlipItem.findFirst({
+    where: { lsNumber },
+    select: { salesOrderId: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: lsi?.salesOrderId ?? null,
+    step: 'zload2',
+    payload: {
+      instruction,
+      transaction_code: 'ZLOAD2',
+      meta: {
+        ls_number: lsNumber,
+        materials: normalized,
+        payload_key: payloadKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(`[ZLOAD2] Enqueued for LS ${lsNumber} (${normalized.length} material(s))`);
+}
+
+/**
  * Aggregated dispatch email for a multi-SO PurchaseOrder.
  *
  * Each SO's `/visibility-data` callback buffers a per-SO Email row
@@ -2056,6 +2338,15 @@ export async function triggerVto1n(shipmentId: string): Promise<void> {
     });
     await pumpQueue();
     console.log(`[VTO1N-B] Enqueued for Shipment ${shipmentId} (SO ${so.soNumber}, Bundle ${bundle.bundleNumber})`);
+
+    // Advance any active scenario past 'await_vt01n'. Safe no-op when engine
+    // is disabled or no scenario is in flight.
+    try {
+      const { maybeAdvanceScenario } = await import('./scenario-engine');
+      await maybeAdvanceScenario(so.id, 'vto1n');
+    } catch (advErr) {
+      console.error('[VTO1N-B] maybeAdvanceScenario warning:', advErr);
+    }
   } catch (error) {
     console.error(`[VTO1N-B] Enqueue failed for Shipment ${shipmentId}:`, error);
     await prisma.shipment.updateMany({
@@ -2192,6 +2483,36 @@ export async function handleVehicleDetailsReply(
   }
 
   const soNumber = email.salesOrder!.soNumber;
+
+  // Scenario-engine intercept: branch may piggyback a modification request on
+  // a vehicle-details reply ("vehicle is GJ12X, but please reduce X to 50").
+  // When the flag is on, classify intent first. If 'modify', hand off to the
+  // engine and bail out of vehicle-extraction entirely. The engine drives the
+  // appropriate post-LS modification scenario.
+  if (
+    (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
+  ) {
+    try {
+      const { handleReplyV2 } = await import('./scenario-engine');
+      const r = await handleReplyV2({
+        emailId,
+        replyHtml,
+        originalEmailHtml: email.sentBody ?? '',
+        sourceEmailType: 'branch',
+      });
+      if (r.matched) {
+        log(`[VehicleDetails] Reply was a modification request — handed off to scenario engine for SO ${soNumber}`);
+        logs.push(...r.logs);
+        return { success: r.success, logs };
+      }
+      // Engine returned matched=false (intent wasn't 'modify' or no scenario
+      // matched). Fall through to the existing vehicle-extraction path.
+    } catch (engineErr) {
+      log(`[VehicleDetails] Engine pre-classifier warning: ${engineErr instanceof Error ? engineErr.message : engineErr}`);
+      // Fall through on engine error — never block vehicle extraction.
+    }
+  }
+
   log(`[VehicleDetails] Extracting vehicle details from reply for SO ${soNumber}`);
 
   // Strip HTML tags for cleaner text
