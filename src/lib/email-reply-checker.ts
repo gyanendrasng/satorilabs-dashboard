@@ -632,6 +632,35 @@ export async function checkForNewEmails(): Promise<{
         }
         log(`[NewEmail] PO ${poNumber}: ${createdSoNumbers.length} new SO(s), ${soNumbers.length - createdSoNumbers.length} already existed (total ${soNumbers.length})`);
 
+        // Persist the classifier decision as a `classifier_decision` event
+        // per SO, mirroring what handleReplyV2 does for replies. Lets the
+        // dashboard / audit queries surface the classifier output uniformly
+        // across all email types.
+        if (unifiedFlag && soNumbers.length > 0) {
+          try {
+            const { emitEvent } = await import('./scenario-events');
+            const allSos = await prisma.salesOrder.findMany({
+              where: { purchaseOrderId: purchaseOrder.id, soNumber: { in: soNumbers } },
+              select: { id: true, soNumber: true },
+            });
+            for (const so of allSos) {
+              await emitEvent({
+                salesOrderId: so.id,
+                type: 'classifier_decision',
+                payload: {
+                  action: 'new_order',
+                  customer_id: customerId,
+                  so_numbers: soNumbers,
+                  gmail_message_id: msg.id,
+                  via: 'checkForNewEmails',
+                },
+              });
+            }
+          } catch (evErr) {
+            log(`[NewEmail] classifier_decision event emit warning: ${evErr instanceof Error ? evErr.message : evErr}`);
+          }
+        }
+
         // Enqueue ZSO-VISIBILITY for every queued SO of this PO. The global
         // WorkQueue ensures only one fires at a time across the whole system,
         // even when multiple POs land at once.
