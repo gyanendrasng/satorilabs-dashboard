@@ -576,7 +576,17 @@ async function sendVehicleSplitInquiry(args: {
  */
 export async function handleVehicleSplitConfirmation(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the upstream dispatcher has already
+   * classified the reply via `classifyReply`, it passes the decision (and
+   * amendments) here. Skips the internal `classifyVehicleSplitReply` call.
+   * Falls back to the in-handler classifier when omitted.
+   */
+  preClassified?: {
+    decision: 'split' | 'cancel' | 'amend' | 'ambiguous';
+    amendments?: Array<{ material_code: string; operation?: string; quantity: number }>;
+  }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (msg: string) => {
@@ -619,22 +629,35 @@ export async function handleVehicleSplitConfirmation(
     let intent: 'split' | 'cancel' | 'amend' | 'ambiguous';
     let removeCodes: string[] = [];
     let adjustItems: { material_code: string; quantity: number }[] = [];
-    try {
-      const ai = await classifyVehicleSplitReply({ replyHtml, knownMaterialCodes });
-      intent = ai.intent;
-      if (ai.intent === 'amend') {
-        removeCodes = ai.remove;
-        adjustItems = ai.adjust;
+    if (preClassified) {
+      intent = preClassified.decision;
+      if (intent === 'amend' && preClassified.amendments) {
+        removeCodes = preClassified.amendments
+          .filter((a) => a.operation === 'delete' || a.quantity === 0)
+          .map((a) => a.material_code);
+        adjustItems = preClassified.amendments
+          .filter((a) => a.operation !== 'delete' && a.quantity > 0)
+          .map((a) => ({ material_code: a.material_code, quantity: a.quantity }));
       }
-      log(`[VehicleSplit] AI intent=${intent}${ai.intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''} reason="${ai.reason}"`);
-    } catch (aiErr) {
-      // Fall back to the legacy regex if the local classifier errors. Same
-      // capabilities as before (yes/no), no amend support.
-      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(replyText);
-      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
-      intent = isYes && !isNo ? 'split' : isNo ? 'cancel' : 'ambiguous';
-      log(`[VehicleSplit] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+      log(`[VehicleSplit] using pre-classified decision=${intent}${intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''}`);
+    } else {
+      try {
+        const ai = await classifyVehicleSplitReply({ replyHtml, knownMaterialCodes });
+        intent = ai.intent;
+        if (ai.intent === 'amend') {
+          removeCodes = ai.remove;
+          adjustItems = ai.adjust;
+        }
+        log(`[VehicleSplit] AI intent=${intent}${ai.intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''} reason="${ai.reason}"`);
+      } catch (aiErr) {
+        // Fall back to the legacy regex if the local classifier errors. Same
+        // capabilities as before (yes/no), no amend support.
+        const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(replyText);
+        const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
+        intent = isYes && !isNo ? 'split' : isNo ? 'cancel' : 'ambiguous';
+        log(`[VehicleSplit] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+      }
     }
 
     if (intent === 'split') {
@@ -1367,7 +1390,15 @@ export async function fanOutZload1ForPo(
  */
 export async function handleDispatchConfirmation(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the upstream dispatcher has already
+   * classified the reply, it passes the decision here. Skips the internal
+   * LLM call. Falls back to `classifyDispatchConfirmation` when omitted
+   * (legacy callers, e.g. the email-reply-checker switch with the unified
+   * flag off).
+   */
+  preClassified?: { decision: 'yes' | 'no' | 'ambiguous' }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (m: string) => {
@@ -1384,18 +1415,23 @@ export async function handleDispatchConfirmation(
     }
 
     let intent: 'yes' | 'no' | 'ambiguous';
-    try {
-      const ai = await classifyDispatchConfirmation(replyHtml);
-      intent = ai.intent;
-      log(`[DispatchConfirm] AI intent=${intent} reason="${ai.reason}"`);
-    } catch (aiErr) {
-      // Fallback to regex if AI is unreachable / errors. Quoted-text bug
-      // remains here, but at least we keep the system moving.
-      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
-      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
-      intent = isYes && !isNo ? 'yes' : isNo ? 'no' : 'ambiguous';
-      log(`[DispatchConfirm] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+    if (preClassified) {
+      intent = preClassified.decision;
+      log(`[DispatchConfirm] using pre-classified decision=${intent}`);
+    } else {
+      try {
+        const ai = await classifyDispatchConfirmation(replyHtml);
+        intent = ai.intent;
+        log(`[DispatchConfirm] AI intent=${intent} reason="${ai.reason}"`);
+      } catch (aiErr) {
+        // Fallback to regex if AI is unreachable / errors. Quoted-text bug
+        // remains here, but at least we keep the system moving.
+        const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
+        const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
+        intent = isYes && !isNo ? 'yes' : isNo ? 'no' : 'ambiguous';
+        log(`[DispatchConfirm] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+      }
     }
 
     if (intent === 'yes') {
@@ -1635,7 +1671,14 @@ export async function handleBranchReply(
  */
 export async function handleProductionReply(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the dispatcher has already parsed
+   * the days via `classifyReply` (action='production_timeline'), it passes
+   * the number here. Skips the auto_gui2 `/email/production-reply` round
+   * trip. Falls back to that endpoint when omitted.
+   */
+  preClassified?: { days: number }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (msg: string) => {
@@ -1669,29 +1712,36 @@ export async function handleProductionReply(
 
     log(`[ProductionReply] Parsing production reply for SO ${soNumber}`);
 
-    const response = await fetch(
-      `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-reply`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          production_reply_html: replyHtml,
-          sales_order: soNumber,
-          materials: materialCodes,
-        }),
+    let days: number;
+    if (preClassified) {
+      days = preClassified.days;
+      log(`[ProductionReply] using pre-classified days=${days}`);
+    } else {
+      const response = await fetch(
+        `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-reply`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            production_reply_html: replyHtml,
+            sales_order: soNumber,
+            materials: materialCodes,
+          }),
+        }
+      );
+
+      const result = await response.json();
+      log(`[ProductionReply] Extracted days: ${result.days}`);
+
+      if (!result.success || result.days <= 0) {
+        log(`[ProductionReply] Failed to extract days: ${result.error}`);
+        return { success: false, logs };
       }
-    );
-
-    const result = await response.json();
-    log(`[ProductionReply] Extracted days: ${result.days}`);
-
-    if (!result.success || result.days <= 0) {
-      log(`[ProductionReply] Failed to extract days: ${result.error}`);
-      return { success: false, logs };
+      days = result.days;
     }
 
     // Set wait timer
-    const waitUntil = new Date(Date.now() + result.days * 86400000);
+    const waitUntil = new Date(Date.now() + days * 86400000);
     await prisma.email.update({
       where: { id: emailId },
       data: {
@@ -1704,7 +1754,7 @@ export async function handleProductionReply(
     });
 
     log(
-      `[ProductionReply] Timer set: wait until ${waitUntil.toISOString()} (${result.days} days)`
+      `[ProductionReply] Timer set: wait until ${waitUntil.toISOString()} (${days} days)`
     );
     return { success: true, logs };
   } catch (error) {
@@ -1720,7 +1770,14 @@ export async function handleProductionReply(
  */
 export async function handleProductionConfirmation(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the dispatcher has already classified
+   * via `classifyReply` (action='production_confirmation'), it passes the
+   * decision (+ optional additionalDays) here. Skips the auto_gui2
+   * `/email/production-confirmation` round trip.
+   */
+  preClassified?: { decision: 'ready' | 'wait_more'; additionalDays?: number }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (msg: string) => {
@@ -1754,29 +1811,39 @@ export async function handleProductionConfirmation(
 
     log(`[ProductionConfirmation] Classifying confirmation for SO ${soNumber}`);
 
-    const response = await fetch(
-      `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-confirmation`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          reply_html: replyHtml,
-          sales_order: soNumber,
-          materials: materialCodes,
-          context: 'production_confirmation',
-        }),
+    let status: 'ready' | 'wait_more';
+    let additionalDaysRaw: number | undefined;
+    if (preClassified) {
+      status = preClassified.decision;
+      additionalDaysRaw = preClassified.additionalDays;
+      log(`[ProductionConfirmation] using pre-classified status=${status}`);
+    } else {
+      const response = await fetch(
+        `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-confirmation`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            reply_html: replyHtml,
+            sales_order: soNumber,
+            materials: materialCodes,
+            context: 'production_confirmation',
+          }),
+        }
+      );
+
+      const result = await response.json();
+      log(`[ProductionConfirmation] Status: ${result.status}`);
+
+      if (!result.success) {
+        log(`[ProductionConfirmation] Classification failed: ${result.error}`);
+        return { success: false, logs };
       }
-    );
-
-    const result = await response.json();
-    log(`[ProductionConfirmation] Status: ${result.status}`);
-
-    if (!result.success) {
-      log(`[ProductionConfirmation] Classification failed: ${result.error}`);
-      return { success: false, logs };
+      status = result.status;
+      additionalDaysRaw = result.additional_days;
     }
 
-    if (result.status === 'ready') {
+    if (status === 'ready') {
       // Re-trigger ZSO-VISIBILITY to get fresh batch/material data
       // Pipeline: ZSO-VISIBILITY → Zmatana → Policy Run → Email to Branch → Branch decides
       await triggerZsoVisibility(soNumber);
@@ -1792,8 +1859,8 @@ export async function handleProductionConfirmation(
       });
 
       log(`[ProductionConfirmation] Materials ready, ZSO-VISIBILITY re-triggered for SO ${soNumber}`);
-    } else if (result.status === 'wait_more') {
-      const additionalDays = result.additional_days || 3;
+    } else if (status === 'wait_more') {
+      const additionalDays = additionalDaysRaw && additionalDaysRaw > 0 ? additionalDaysRaw : 3;
       const waitUntil = new Date(Date.now() + additionalDays * 86400000);
 
       await prisma.email.update({
@@ -2459,7 +2526,21 @@ async function triggerZload1(
 export async function handleVehicleDetailsReply(
   emailId: string,
   replyHtml: string,
-  salesOrderId: string
+  salesOrderId: string,
+  /**
+   * Phase 2 (unified classifier): when the upstream dispatcher has already
+   * extracted vehicles via `classifyReply` (action='vehicle_details_extraction'),
+   * it passes the array here. Skips the engine-modification intercept AND
+   * the internal OpenAI extraction. Falls back to both when omitted.
+   */
+  preExtracted?: {
+    vehicles: Array<{
+      bundleNumber?: number;
+      vehicleNumber: string;
+      driverMobile: string;
+      containerNumber: string;
+    }>;
+  }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (message: string) => {
@@ -2484,12 +2565,23 @@ export async function handleVehicleDetailsReply(
 
   const soNumber = email.salesOrder!.soNumber;
 
+  // Phase 2: when the unified dispatcher has already extracted vehicle data,
+  // skip the legacy modification-intercept + OpenAI extraction below and jump
+  // straight to the per-vehicle save logic.
+  if (preExtracted) {
+    log(`[VehicleDetails] using pre-extracted vehicles (${preExtracted.vehicles.length} set(s))`);
+  }
+
   // Scenario-engine intercept: branch may piggyback a modification request on
   // a vehicle-details reply ("vehicle is GJ12X, but please reduce X to 50").
   // When the flag is on, classify intent first. If 'modify', hand off to the
   // engine and bail out of vehicle-extraction entirely. The engine drives the
   // appropriate post-LS modification scenario.
+  // Skipped when pre-extracted (dispatcher already classified as
+  // vehicle_details_extraction — if it were a modification, dispatcher would
+  // have routed to action='scenario' instead).
   if (
+    !preExtracted &&
     (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
   ) {
     try {
@@ -2544,44 +2636,53 @@ export async function handleVehicleDetailsReply(
     : '';
 
   try {
-    const openai = new OpenAI();
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You extract vehicle/transport details from email replies. The reply may cover ONE truck or MULTIPLE trucks (when the dispatch is split into bundles). Return strict JSON of the form {"vehicles": [{"bundleNumber": <int or null>, "vehicleNumber": "<reg no>", "driverMobile": "<10-digit>", "containerNumber": "<container>"}, ...]}. ' +
-            'For each vehicle/truck mentioned, output one entry. ' +
-            'If the reply explicitly references "Bundle 1", "Bundle 2", "truck 1", "vehicle 1" etc., set bundleNumber to that integer. ' +
-            'If only one set of details is given without a bundle reference, set bundleNumber=null. ' +
-            'If a field is not mentioned, set it to an empty string "".',
-        },
-        {
-          role: 'user',
-          content: `Extract vehicle details from this email reply.${bundleContext}\n\n${replyText}`,
-        },
-      ],
-    });
-
-    const rawJson = completion.choices[0]?.message?.content;
     let extractedSets: Array<{ bundleNumber?: number | null; vehicleNumber: string; driverMobile: string; containerNumber: string }> = [];
 
-    if (rawJson) {
-      try {
-        const parsed = ExtractionSchema.safeParse(JSON.parse(rawJson));
-        if (parsed.success) {
-          extractedSets = parsed.data.vehicles;
-        } else {
-          log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
-        }
-      } catch (parseErr) {
-        log(`[VehicleDetails] JSON parse failed: ${parseErr instanceof Error ? parseErr.message : parseErr}`);
-      }
+    if (preExtracted) {
+      extractedSets = preExtracted.vehicles.map((v) => ({
+        bundleNumber: v.bundleNumber ?? null,
+        vehicleNumber: v.vehicleNumber,
+        driverMobile: v.driverMobile,
+        containerNumber: v.containerNumber,
+      }));
     } else {
-      log(`[VehicleDetails] OpenAI returned empty response`);
+      const openai = new OpenAI();
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You extract vehicle/transport details from email replies. The reply may cover ONE truck or MULTIPLE trucks (when the dispatch is split into bundles). Return strict JSON of the form {"vehicles": [{"bundleNumber": <int or null>, "vehicleNumber": "<reg no>", "driverMobile": "<10-digit>", "containerNumber": "<container>"}, ...]}. ' +
+              'For each vehicle/truck mentioned, output one entry. ' +
+              'If the reply explicitly references "Bundle 1", "Bundle 2", "truck 1", "vehicle 1" etc., set bundleNumber to that integer. ' +
+              'If only one set of details is given without a bundle reference, set bundleNumber=null. ' +
+              'If a field is not mentioned, set it to an empty string "".',
+          },
+          {
+            role: 'user',
+            content: `Extract vehicle details from this email reply.${bundleContext}\n\n${replyText}`,
+          },
+        ],
+      });
+
+      const rawJson = completion.choices[0]?.message?.content;
+      if (rawJson) {
+        try {
+          const parsed = ExtractionSchema.safeParse(JSON.parse(rawJson));
+          if (parsed.success) {
+            extractedSets = parsed.data.vehicles;
+          } else {
+            log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
+          }
+        } catch (parseErr) {
+          log(`[VehicleDetails] JSON parse failed: ${parseErr instanceof Error ? parseErr.message : parseErr}`);
+        }
+      } else {
+        log(`[VehicleDetails] OpenAI returned empty response`);
+      }
     }
     log(`[VehicleDetails] Extracted ${extractedSets.length} vehicle set(s) for PO ${email.purchaseOrderId ?? '(legacy)'}`);
 

@@ -45,6 +45,20 @@ export function isScenarioEngineEnabled(): boolean {
   return (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true';
 }
 
+/**
+ * Phase 2 unified-classifier flag. When true, handleReplyV2 dispatches non-
+ * scenario LLM actions (dispatch_confirmation_decision, vehicle_details_extraction,
+ * etc.) to the appropriate refactored handler with pre-classified fields,
+ * instead of coercing them to 'unknown' (today's behavior).
+ *
+ * Defaults to false — until Phase 3 collapses the email-reply-checker switch,
+ * the only callers of handleReplyV2 are scenario-shaped emails, so the
+ * dispatcher's non-scenario branches stay dormant.
+ */
+export function isUnifiedClassifierEnabled(): boolean {
+  return (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
+}
+
 // -----------------------------------------------------------------------------
 // Plant-reply classifier — same shape as classifyBranchReply but tighter prompt.
 // Plants only send `modify` (a quantity correction) or an invoice PDF.
@@ -170,6 +184,12 @@ export async function sendSecondReleaseEmail(args: {
 export async function handleSecondReleaseReply(
   emailId: string,
   replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the dispatcher has already classified
+   * via `classifyReply` (action='2nd_release_decision'), it passes the
+   * decision here. Skips the internal `classifyDispatchConfirmation` call.
+   */
+  preClassified?: { decision: 'yes' | 'no' | 'ambiguous' },
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (m: string) => {
@@ -185,13 +205,18 @@ export async function handleSecondReleaseReply(
   }
 
   let intent: 'yes' | 'no' | 'ambiguous';
-  try {
-    const ai = await classifyDispatchConfirmation(replyHtml);
-    intent = ai.intent;
-    log(`[2ndRelease] AI intent=${intent} reason="${ai.reason}"`);
-  } catch (aiErr) {
-    log(`[2ndRelease] classifier failed: ${aiErr instanceof Error ? aiErr.message : String(aiErr)}`);
-    intent = 'ambiguous';
+  if (preClassified) {
+    intent = preClassified.decision;
+    log(`[2ndRelease] using pre-classified decision=${intent}`);
+  } else {
+    try {
+      const ai = await classifyDispatchConfirmation(replyHtml);
+      intent = ai.intent;
+      log(`[2ndRelease] AI intent=${intent} reason="${ai.reason}"`);
+    } catch (aiErr) {
+      log(`[2ndRelease] classifier failed: ${aiErr instanceof Error ? aiErr.message : String(aiErr)}`);
+      intent = 'ambiguous';
+    }
   }
 
   await prisma.email.update({
@@ -258,7 +283,9 @@ export async function handleReplyV2(args: {
     logs.push(t);
   };
 
-  const { selectScenarioForReply } = await import('./scenario-selector');
+  const { classifyReply } = await import('./reply-classifier');
+  type ReplyClsModule = typeof import('./reply-classifier');
+  type ReplyCls = Awaited<ReturnType<ReplyClsModule['classifyReply']>>;
   const { renderEmailThreadForSO } = await import('./email-thread');
   const { getValidScenarioKeys } = await import('./dispatch-scenarios');
   const { emitEvent, getRecentEventsForSO } = await import('./scenario-events');
@@ -314,7 +341,7 @@ export async function handleReplyV2(args: {
   });
 
   // Build active-scenario context for the selector if applicable.
-  let activeScenarioContext: Parameters<typeof selectScenarioForReply>[0]['activeScenario'] = null;
+  let activeScenarioContext: Parameters<ReplyClsModule['classifyReply']>[0]['activeScenario'] = null;
   if (activeProgress) {
     const scenarioDef = SCENARIOS[activeProgress.scenarioKey];
     if (scenarioDef) {
@@ -338,10 +365,10 @@ export async function handleReplyV2(args: {
     }
   }
 
-  // Call the LLM Manager.
-  let selection: Awaited<ReturnType<typeof selectScenarioForReply>>;
+  // Call the unified LLM classifier.
+  let cls: ReplyCls;
   try {
-    selection = await selectScenarioForReply({
+    cls = await classifyReply({
       soNumber: email.salesOrder.soNumber,
       sender: args.sourceEmailType,
       stage,
@@ -349,16 +376,58 @@ export async function handleReplyV2(args: {
       materials: materialRows,
       validKeys,
       activeScenario: activeScenarioContext,
+      triggerEmailType: email.emailType ?? null,
     });
   } catch (err) {
-    log(`[ENGINE] Selector failed: ${err instanceof Error ? err.message : err}`);
+    log(`[ENGINE] Classifier failed: ${err instanceof Error ? err.message : err}`);
     await emitEvent({
       salesOrderId: email.salesOrderId,
       type: 'scenario_aborted',
-      payload: { reason: `selector_error: ${err instanceof Error ? err.message : String(err)}` },
+      payload: { reason: `classifier_error: ${err instanceof Error ? err.message : String(err)}` },
     });
     return { success: false, matched: false, logs };
   }
+
+  // ─── Phase 2 dispatcher (gated by UNIFIED_CLASSIFIER_ENABLED) ───────
+  // When the flag is on AND the LLM picked a non-scenario action, route to
+  // the appropriate refactored handler with pre-classified fields. When the
+  // flag is off, OR the action is 'scenario', fall through to the existing
+  // scenario logic below (which projects scenario fields out of `cls`).
+  if (isUnifiedClassifierEnabled() && cls.action !== 'scenario') {
+    return dispatchNonScenarioAction(cls, {
+      emailId: args.emailId,
+      salesOrderId: email.salesOrderId,
+      replyHtml: args.replyHtml,
+      log,
+      logs,
+    });
+  }
+
+  // Project the union → legacy ScenarioSelection shape so the existing
+  // scenario logic compiles unchanged. Non-scenario actions reaching here
+  // (i.e. unified flag OFF) are coerced to 'unknown' so the engine uses its
+  // existing escalation path.
+  const selection: {
+    scenario_key: string;
+    reasoning: string;
+    escalate_reason?: string;
+    materials: Array<{ material_code: string; batch: string; operation?: 'keep' | 'increase' | 'decrease' | 'delete'; quantity: number }>;
+    action_on_active?: 'abort_and_replace' | 'escalate' | null;
+  } = cls.action === 'scenario'
+    ? {
+        scenario_key: cls.scenario_key,
+        reasoning: cls.reasoning,
+        escalate_reason: cls.escalate_reason,
+        materials: cls.materials,
+        action_on_active: cls.action_on_active ?? null,
+      }
+    : {
+        scenario_key: 'unknown',
+        reasoning: 'reasoning' in cls ? (cls as { reasoning?: string }).reasoning ?? '' : '',
+        escalate_reason: `Classifier picked action="${cls.action}" but unified flag is off; coerced to unknown`,
+        materials: [],
+        action_on_active: activeProgress ? 'escalate' : null,
+      };
 
   log(
     `[ENGINE] SO ${email.salesOrder.soNumber}: stage=${stage} scenario_key=${selection.scenario_key}` +
@@ -496,6 +565,147 @@ export async function handleReplyV2(args: {
   await executeScenario({ salesOrderId: email.salesOrderId, log });
 
   return { success: true, matched: true, logs };
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2: dispatcher for non-scenario classifier actions. Called from
+// handleReplyV2 when UNIFIED_CLASSIFIER_ENABLED=true and the LLM picked
+// something other than 'scenario'. Routes to the refactored handlers with
+// pre-classified fields so each handler skips its own classifier call.
+// -----------------------------------------------------------------------------
+
+async function dispatchNonScenarioAction(
+  cls: Exclude<Awaited<ReturnType<typeof import('./reply-classifier').classifyReply>>, { action: 'scenario' }>,
+  ctx: {
+    emailId: string;
+    salesOrderId: string;
+    replyHtml: string;
+    log: (m: string) => void;
+    logs: string[];
+  },
+): Promise<{ success: boolean; matched: boolean; logs: string[] }> {
+  const { emailId, replyHtml, log, logs } = ctx;
+  log(`[ENGINE] dispatching non-scenario action=${cls.action}`);
+
+  const {
+    handleDispatchConfirmation,
+    handleVehicleSplitConfirmation,
+    handleVehicleDetailsReply,
+    handleProductionReply,
+    handleProductionConfirmation,
+  } = await import('./auto-gui-trigger');
+  const { emitEvent } = await import('./scenario-events');
+
+  await emitEvent({
+    salesOrderId: ctx.salesOrderId,
+    type: 'classifier_decision',
+    payload: {
+      action: cls.action,
+      reasoning: 'reasoning' in cls ? cls.reasoning : undefined,
+    },
+  });
+
+  switch (cls.action) {
+    case 'dispatch_confirmation_decision': {
+      const r = await handleDispatchConfirmation(emailId, replyHtml, { decision: cls.decision });
+      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
+    }
+    case '2nd_release_decision': {
+      const r = await handleSecondReleaseReply(emailId, replyHtml, { decision: cls.decision });
+      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
+    }
+    case 'vehicle_split_decision': {
+      const r = await handleVehicleSplitConfirmation(emailId, replyHtml, {
+        decision: cls.decision,
+        amendments: cls.amendments,
+      });
+      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
+    }
+    case 'vehicle_details_extraction': {
+      const r = await handleVehicleDetailsReply(emailId, replyHtml, ctx.salesOrderId, {
+        vehicles: cls.vehicles.map((v) => ({
+          bundleNumber: v.bundleNumber,
+          vehicleNumber: v.vehicleNumber,
+          driverMobile: v.driverMobile,
+          containerNumber: v.containerNumber,
+        })),
+      });
+      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
+    }
+    case 'production_timeline': {
+      const r = await handleProductionReply(emailId, replyHtml, { days: cls.days });
+      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
+    }
+    case 'production_confirmation': {
+      const r = await handleProductionConfirmation(emailId, replyHtml, {
+        decision: cls.decision,
+        additionalDays: cls.additionalDays,
+      });
+      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
+    }
+    case 'invoice_pdf': {
+      // Delegate to the legacy invoice-batching path. Same code today's
+      // email-reply-checker would have run after PDF extraction.
+      const { checkAndSendBatchToAman } = await import('./auto-gui-trigger');
+      const email = await prisma.email.findUnique({
+        where: { id: emailId },
+        include: { loadingSlipItem: true },
+      });
+      const bundleId = email?.loadingSlipItem?.bundleId ?? null;
+      const r = await checkAndSendBatchToAman(ctx.salesOrderId, bundleId);
+      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
+    }
+    case 'new_order': {
+      // NEW ORDER emails shouldn't reach handleReplyV2 — they go through the
+      // separate checkForNewEmails cron path. Flag as a bug.
+      log(`[ENGINE] BUG: new_order action reached handleReplyV2 (emailId=${emailId})`);
+      await emitEvent({
+        salesOrderId: ctx.salesOrderId,
+        type: 'scenario_aborted',
+        payload: { reason: 'new_order_in_reply_path' },
+      });
+      return { success: false, matched: false, logs };
+    }
+    case 'other': {
+      log(
+        `[ENGINE] LLM classified as 'other' — description="${cls.description}" question="${cls.suggested_question_for_supervisor}"`,
+      );
+      const { escalateToSupervisor } = await import('./supervisor-escalation');
+      const result = await escalateToSupervisor({
+        salesOrderId: ctx.salesOrderId,
+        triggerEmailId: emailId,
+        description: cls.description,
+        suggested_question_for_supervisor: cls.suggested_question_for_supervisor,
+        reasoning: cls.reasoning,
+        log,
+      });
+
+      if (!result.sent && result.reason === 'hop_limit_exceeded') {
+        // Mark the active scenario (if any) aborted so the dashboard reflects
+        // the dead-end and operators stop seeing the SO as "in flight."
+        const activeProgress = await prisma.scenarioProgress.findFirst({
+          where: {
+            salesOrderId: ctx.salesOrderId,
+            state: { notIn: ['completed', 'aborted', 'failed'] },
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+        if (activeProgress) {
+          await prisma.scenarioProgress.update({
+            where: { id: activeProgress.id },
+            data: { state: 'aborted', error: 'supervisor_hop_limit_exceeded' },
+          });
+        }
+        await emitEvent({
+          salesOrderId: ctx.salesOrderId,
+          type: 'scenario_aborted',
+          payload: { reason: 'supervisor_hop_limit_exceeded', hops: result.hops },
+        });
+        return { success: false, matched: false, logs };
+      }
+      return { success: result.sent, matched: !result.sent ? false : true, logs };
+    }
+  }
 }
 
 // Helper used above for compact email excerpts in event payloads.

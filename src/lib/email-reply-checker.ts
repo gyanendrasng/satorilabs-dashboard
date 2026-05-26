@@ -123,6 +123,29 @@ export async function checkForReplies(): Promise<{
       // Route based on emailType
       const emailType = (email as any).emailType as string | null;
 
+      // ─── Unified classifier (Phase 3) ──────────────────────────────────
+      // When UNIFIED_CLASSIFIER_ENABLED=true, route ALL replies through
+      // handleReplyV2. The dispatcher inside scenario-engine maps the LLM's
+      // classification (scenario / dispatch_confirmation_decision / etc.) to
+      // the appropriate refactored handler with pre-classified fields.
+      // Per-type branches below stay as the flag-off fallback.
+      const unifiedFlag = (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
+      if (unifiedFlag && email.salesOrderId) {
+        log(`[EmailChecker] Unified classifier → handleReplyV2 for emailType=${emailType ?? 'null'} SO ${soNumber}`);
+        const sender: 'branch' | 'plant' = emailType === 'plant_ls' ? 'plant' : 'branch';
+        const { handleReplyV2 } = await import('./scenario-engine');
+        const originalEmailHtml = await getMessageBody(email.gmailMessageId);
+        const r = await handleReplyV2({
+          emailId: email.id,
+          replyHtml: replyBodyHtml || '',
+          originalEmailHtml,
+          sourceEmailType: sender,
+        });
+        logs.push(...r.logs);
+        processed++;
+        continue;
+      }
+
       if (emailType === 'vehicle_split_inquiry') {
         log(`[EmailChecker] Routing to handleVehicleSplitConfirmation for PO email ${email.id}`);
         const splitResult = await handleVehicleSplitConfirmation(email.id, replyBodyHtml);
@@ -487,21 +510,52 @@ export async function checkForNewEmails(): Promise<{
 
         const stripped = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        // Extract customer_id + SO numbers via AI; fall back to regex on failure.
+        // Extract customer_id + SO numbers. When the unified classifier flag
+        // is on, route through `classifyReply` (action='new_order'). The
+        // legacy path (`extractOrderInfoWithAI` + regex fallback) stays
+        // available for flag-off behavior.
         let customerId: string | null = null;
         let soNumbers: string[] = [];
-        try {
-          const extracted = await extractOrderInfoWithAI(stripped);
-          customerId = extracted.customerId;
-          soNumbers = extracted.soNumbers;
-          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
-        } catch (aiErr) {
-          log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
-          const fb = extractOrderInfoFallback(stripped);
-          customerId = fb.customerId;
-          soNumbers = fb.soNumbers;
-          if (soNumbers.length > 0) {
-            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+        const unifiedFlag = (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
+        if (unifiedFlag) {
+          try {
+            const { classifyReply } = await import('./reply-classifier');
+            const cls = await classifyReply({
+              soNumber: null,
+              sender: null,
+              stage: null,
+              emailThread: stripped,
+              materials: [],
+              validKeys: [],
+              triggerEmailType: null,
+            });
+            if (cls.action === 'new_order') {
+              customerId = cls.customer_id;
+              soNumbers = cls.so_numbers;
+              log(`[NewEmail] unified classifier extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+            } else {
+              log(`[NewEmail] unified classifier returned action="${cls.action}" — no SO numbers extracted`);
+            }
+          } catch (clsErr) {
+            log(`[NewEmail] classifyReply failed (${clsErr instanceof Error ? clsErr.message : String(clsErr)}), falling back to regex`);
+            const fb = extractOrderInfoFallback(stripped);
+            customerId = fb.customerId;
+            soNumbers = fb.soNumbers;
+          }
+        } else {
+          try {
+            const extracted = await extractOrderInfoWithAI(stripped);
+            customerId = extracted.customerId;
+            soNumbers = extracted.soNumbers;
+            log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+          } catch (aiErr) {
+            log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
+            const fb = extractOrderInfoFallback(stripped);
+            customerId = fb.customerId;
+            soNumbers = fb.soNumbers;
+            if (soNumbers.length > 0) {
+              log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+            }
           }
         }
 
