@@ -25,6 +25,13 @@ export interface DispatchConfirmationIntent {
  *   yes        — branch approves the dispatch plan as-is, fire ZLOAD1
  *   no         — branch wants changes, holds, cancels — operator handles
  *   ambiguous  — model not confident; treat like 'no' (operator review)
+ *
+ * @deprecated Phase 4 rollout (UNIFIED_CLASSIFIER_ENABLED): the unified
+ * `classifyReply` in src/lib/reply-classifier.ts now returns
+ * action='dispatch_confirmation_decision' or '2nd_release_decision' with the
+ * same yes/no/ambiguous semantics. This function is kept as the flag-off
+ * fallback inside `handleDispatchConfirmation` and `handleSecondReleaseReply`.
+ * Remove once the unified flag is the default everywhere.
  */
 export async function classifyDispatchConfirmation(
   replyHtml: string
