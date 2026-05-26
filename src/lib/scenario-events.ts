@@ -19,7 +19,10 @@ export type ScenarioEventType =
   | 'email_sent'
   | 'scenario_completed'
   | 'scenario_aborted'
-  | 'scenario_failed';
+  | 'scenario_failed'
+  // Phase 2 (unified classifier): emitted when classifyReply returns
+  // action='other' and the reply is escalated to a human supervisor.
+  | 'email_escalated';
 
 export interface EmitEventArgs {
   salesOrderId: string;
