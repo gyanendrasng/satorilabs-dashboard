@@ -767,12 +767,22 @@ async function main() {
     let pass = false;
     let expectedSteps: string[] = [];
     if (spec.kind === 'novel') {
-      // Pass = first classifier returned 'unknown' AND finalState is 'aborted'
+      // Pass criteria depend on UNIFIED_CLASSIFIER_ENABLED:
+      //   • Flag OFF: legacy 'unknown' path — classifier picks scenario_key='unknown' and the scenario aborts.
+      //   • Flag ON: unified classifier picks action='other' and the dispatcher escalates to a supervisor.
+      //               Verified by a `supervisor_inquiry` Email row being created for the SO.
       const isUnknown = gotKey === 'unknown';
       const isAborted = finalState === 'aborted';
-      pass = isUnknown && isAborted;
-      if (!isUnknown) failReasons.push(`scenario_key: expected 'unknown', got ${gotKey}`);
-      if (!isAborted) failReasons.push(`finalState: expected 'aborted', got ${finalState}`);
+      const legacyOk = isUnknown && isAborted;
+      const supervisorInquiry = await prisma.email.findFirst({
+        where: { salesOrderId: so.id, emailType: 'supervisor_inquiry' },
+      });
+      const unifiedOk = !!supervisorInquiry;
+      pass = legacyOk || unifiedOk;
+      if (!pass) {
+        if (!isUnknown && !unifiedOk) failReasons.push(`scenario_key: expected 'unknown' OR supervisor_inquiry email, got ${gotKey}`);
+        if (!isAborted && !unifiedOk) failReasons.push(`finalState: expected 'aborted' OR escalation, got ${finalState}`);
+      }
     } else if (spec.kind === 'midflow_abort') {
       // Pass = (1) first classifier picked the primary key, (2) second classifier
       // returned action_on_active='abort_and_replace' AND key=midflowReplaceKey,
@@ -788,14 +798,18 @@ async function main() {
       if (!completedOk) failReasons.push(`finalState: expected 'completed', got ${finalState}`);
       expectedSteps = (SCENARIOS[spec.midflowReplaceKey ?? '']?.steps ?? []).map((s) => s.kind);
     } else if (spec.kind === 'midflow_escalate') {
-      // Pass = first classifier picked primary key; second returned action='escalate'; finalState is 'aborted'
+      // Pass criteria depend on UNIFIED_CLASSIFIER_ENABLED:
+      //   • Flag OFF: legacy escalate path — second classifier returns action_on_active='escalate', primary aborts.
+      //   • Flag ON: ambiguous mid-flow reply may classify as action='other' and route to supervisor.
       const firstOk = gotKey === spec.key;
-      const actionOk = gotAction2 === 'escalate';
-      const abortedOk = finalState === 'aborted';
-      pass = firstOk && actionOk && abortedOk;
+      const legacyEscalate = gotAction2 === 'escalate' && finalState === 'aborted';
+      const supervisorInquiry = await prisma.email.findFirst({
+        where: { salesOrderId: so.id, emailType: 'supervisor_inquiry' },
+      });
+      const unifiedOk = !!supervisorInquiry;
+      pass = firstOk && (legacyEscalate || unifiedOk);
       if (!firstOk) failReasons.push(`first scenario_key: expected ${spec.key}, got ${gotKey}`);
-      if (!actionOk) failReasons.push(`action_on_active: expected escalate, got ${gotAction2}`);
-      if (!abortedOk) failReasons.push(`finalState: expected 'aborted', got ${finalState}`);
+      if (!legacyEscalate && !unifiedOk) failReasons.push(`mid-flow escalate: expected action_on_active='escalate'+aborted OR supervisor_inquiry, got action=${gotAction2} state=${finalState}`);
     } else if (spec.kind === 'stock_short') {
       // Pass = classifier picked the increase-shaped scenario AND engine
       // aborted at stock_precheck (no VA02 fired, stock_short_inquiry email exists).

@@ -87,6 +87,8 @@ watch -n 900 'curl -s http://localhost:3000/backend/cron/sync-inventory'
 | `CRON_SECRET`          | Optional auth token for cron endpoints. |
 | `SCENARIO_ENGINE_ENABLED` | `'true'` to route branch/plant replies through the new scenario engine. Defaults off (legacy path). |
 | `SAP_DEFAULT_PLANT`    | Fallback plant code (e.g. `7581`) when `SalesOrder.plant` is null. Used by the free-stock pre-check that gates VA02 on modification scenarios. |
+| `UNIFIED_CLASSIFIER_ENABLED` | `'true'` to route ALL inbound emails (NEW ORDER + every reply type) through one unified LLM call (`classifyReply`). Returns a tagged-union intent; the dispatcher invokes the appropriate handler with pre-classified fields. When unclassifiable, escalates to `SUPERVISOR_EMAIL`. Defaults off (each email type uses its own classifier). |
+| `SUPERVISOR_EMAIL`     | Recipient for `supervisor_inquiry` emails when the unified classifier returns `action='other'`. Defaults to `amanrai369@gmail.com`. Caps the escalation chain at 3 hops. |
 
 Gmail OAuth tokens are managed separately — see existing setup notes.
 
