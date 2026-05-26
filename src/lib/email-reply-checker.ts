@@ -528,6 +528,7 @@ export async function checkForNewEmails(): Promise<{
               materials: [],
               validKeys: [],
               triggerEmailType: null,
+              gmailMessageId: msg.id,
             });
             if (cls.action === 'new_order') {
               customerId = cls.customer_id;

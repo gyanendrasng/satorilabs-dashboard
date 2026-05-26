@@ -435,6 +435,11 @@ export interface ClassifyReplyArgs {
   hasPdfAttachment?: boolean;
   /** Set when a scenario is already in flight; enables action_on_active. */
   activeScenario?: ClassifierActiveScenario | null;
+  /** Gmail message ID of the inbound email. Used to tag the
+   * [UNIVERSAL_CLASSIFIER] log line so a single grep returns the classifier's
+   * verdict for a specific email. Optional — when omitted, the log line
+   * prints `gmailMsgId=?` instead. */
+  gmailMessageId?: string | null;
 }
 
 // -----------------------------------------------------------------------------
@@ -529,6 +534,69 @@ function buildUserPrompt(args: ClassifyReplyArgs): string {
   return parts.join('\n');
 }
 
+/**
+ * Emit one log line per classifyReply call so the output can be grep'd from
+ * the dev-server log without needing a DB query:
+ *
+ *   grep "\[UNIVERSAL_CLASSIFIER\]" /tmp/dev-server.log
+ *
+ * Each line includes the Gmail message ID (when provided) so you can also
+ * grep for a specific email:
+ *
+ *   grep "gmailMsgId=19e63e6465a7b29c" /tmp/dev-server.log
+ */
+function logClassifierResult(args: ClassifyReplyArgs, cls: ReplyClassification): void {
+  const gmailMsgId = args.gmailMessageId ?? '?';
+  const soNumber = args.soNumber ?? '?';
+  const triggerType = args.triggerEmailType ?? '-';
+  const fields: string[] = [
+    `[UNIVERSAL_CLASSIFIER]`,
+    `gmailMsgId=${gmailMsgId}`,
+    `soNumber=${soNumber}`,
+    `triggerEmailType=${triggerType}`,
+    `action=${cls.action}`,
+  ];
+  switch (cls.action) {
+    case 'scenario':
+      fields.push(`scenario_key=${cls.scenario_key}`);
+      if (cls.action_on_active) fields.push(`action_on_active=${cls.action_on_active}`);
+      if (cls.escalate_reason) fields.push(`escalate_reason="${cls.escalate_reason}"`);
+      break;
+    case 'dispatch_confirmation_decision':
+    case '2nd_release_decision':
+      fields.push(`decision=${cls.decision}`);
+      break;
+    case 'vehicle_split_decision':
+      fields.push(`decision=${cls.decision}`);
+      if (cls.amendments?.length) fields.push(`amendments=${cls.amendments.length}`);
+      break;
+    case 'vehicle_details_extraction':
+      fields.push(`vehicles=${cls.vehicles.length}`);
+      break;
+    case 'production_timeline':
+      fields.push(`days=${cls.days}`);
+      break;
+    case 'production_confirmation':
+      fields.push(`decision=${cls.decision}`);
+      if (cls.additionalDays !== undefined) fields.push(`additionalDays=${cls.additionalDays}`);
+      break;
+    case 'new_order':
+      fields.push(`customer_id=${cls.customer_id ?? '(none)'}`);
+      fields.push(`so_numbers=[${cls.so_numbers.join(',')}]`);
+      break;
+    case 'invoice_pdf':
+      // No extra fields.
+      break;
+    case 'other':
+      fields.push(`description="${cls.description}"`);
+      break;
+  }
+  if ('reasoning' in cls && cls.reasoning) {
+    fields.push(`reasoning="${cls.reasoning.replace(/"/g, '\\"').slice(0, 240)}"`);
+  }
+  console.log(fields.join(' '));
+}
+
 export async function classifyReply(args: ClassifyReplyArgs): Promise<ReplyClassification> {
   const userPrompt = buildUserPrompt(args);
 
@@ -544,7 +612,9 @@ export async function classifyReply(args: ClassifyReplyArgs): Promise<ReplyClass
 
   const raw = completion.choices[0]?.message?.content;
   if (!raw) {
-    return fallbackOther('OpenAI returned empty content');
+    const cls = fallbackOther('OpenAI returned empty content');
+    logClassifierResult(args, cls);
+    return cls;
   }
 
   let parsed: ReplyClassification;
@@ -552,18 +622,22 @@ export async function classifyReply(args: ClassifyReplyArgs): Promise<ReplyClass
     const json = JSON.parse(raw);
     const validated = ReplyClassificationSchema.safeParse(json);
     if (!validated.success) {
-      return fallbackOther(`Zod validation failed: ${validated.error.message}`);
+      const cls = fallbackOther(`Zod validation failed: ${validated.error.message}`);
+      logClassifierResult(args, cls);
+      return cls;
     }
     parsed = validated.data;
   } catch (e) {
-    return fallbackOther(`JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+    const cls = fallbackOther(`JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+    logClassifierResult(args, cls);
+    return cls;
   }
 
   // Post-validate scenario-specific constraints.
   if (parsed.action === 'scenario') {
     const validKeySet = new Set(args.validKeys.map((v) => v.key));
     if (parsed.scenario_key !== 'unknown' && !validKeySet.has(parsed.scenario_key)) {
-      return {
+      const cls: ReplyClassification = {
         action: 'scenario',
         scenario_key: 'unknown',
         reasoning: parsed.reasoning,
@@ -571,6 +645,8 @@ export async function classifyReply(args: ClassifyReplyArgs): Promise<ReplyClass
         materials: parsed.materials,
         action_on_active: args.activeScenario ? 'escalate' : null,
       };
+      logClassifierResult(args, cls);
+      return cls;
     }
     if (parsed.scenario_key === 'unknown' && !parsed.escalate_reason) {
       parsed.escalate_reason = 'LLM returned unknown without a reason';
@@ -583,6 +659,7 @@ export async function classifyReply(args: ClassifyReplyArgs): Promise<ReplyClass
     }
   }
 
+  logClassifierResult(args, parsed);
   return parsed;
 }
 

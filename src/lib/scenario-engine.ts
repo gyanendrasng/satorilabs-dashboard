@@ -377,6 +377,7 @@ export async function handleReplyV2(args: {
       validKeys,
       activeScenario: activeScenarioContext,
       triggerEmailType: email.emailType ?? null,
+      gmailMessageId: email.gmailMessageId,
     });
   } catch (err) {
     log(`[ENGINE] Classifier failed: ${err instanceof Error ? err.message : err}`);
