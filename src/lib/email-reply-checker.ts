@@ -114,10 +114,14 @@ export async function checkForReplies(): Promise<{
       // Get reply HTML body for workflow classification
       const replyBodyHtml = await getMessageBody(latestReply.id);
 
-      // Store replyHtml on the email record
+      // Store replyHtml + repliedAt on the email record. Both fields are
+      // required by `renderEmailThreadForSO` to include the reply in the
+      // rendered thread the classifier sees — without repliedAt the inbound
+      // entry is silently dropped, and the LLM ends up classifying the
+      // outbound dispatch email instead.
       await prisma.email.update({
         where: { id: email.id },
-        data: { replyHtml: replyBodyHtml },
+        data: { replyHtml: replyBodyHtml, repliedAt: new Date() },
       });
 
       // Route based on emailType
