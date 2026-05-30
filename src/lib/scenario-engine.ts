@@ -127,7 +127,7 @@ export async function sendSecondReleaseEmail(args: {
     ``,
     ...lines,
     ``,
-    `Please confirm we should proceed with the revised plan (reply "yes" to confirm).`,
+    `Please do the second release and confirm.`,
     ``,
     `Thanks.`,
   ].join('\n');
@@ -151,6 +151,21 @@ export async function sendSecondReleaseEmail(args: {
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
   }
 
+  // Open a new dispatch round on the PO. This is the single moment that bumps
+  // the counter — the downstream ls_dispatch / dispatch_confirmation emails
+  // (sent after re-visibility) inherit this round, so their idempotency guards
+  // no longer collide with the previous round's emails.
+  let newRound: number | null = null;
+  if (so.purchaseOrderId) {
+    const updated = await prisma.purchaseOrder.update({
+      where: { id: so.purchaseOrderId },
+      data: { dispatchRound: { increment: 1 } },
+      select: { dispatchRound: true },
+    });
+    newRound = updated.dispatchRound;
+    log(`[2ndRelease] PO ${so.purchaseOrderId} advanced to dispatchRound=${newRound}`);
+  }
+
   await prisma.email.create({
     data: {
       salesOrderId,
@@ -164,6 +179,7 @@ export async function sendSecondReleaseEmail(args: {
       workflowState: 'awaiting_2nd_release_reply',
       sentBody: body,
       relatedMaterials: JSON.stringify({ version: '2nd-release-v1', modifications }),
+      dispatchRound: newRound,
     },
   });
 
@@ -1429,23 +1445,40 @@ async function fireStep(
       // Distinguish: if a sent ls_dispatch email already exists for the
       // PO AND it has a reply (replyHtml/repliedAt set), case (a) — advance.
       // Otherwise case (b) — segment-complete and wait.
+      // Round-scoped reply detection. After a VA02 modification, the PO is
+      // on a new dispatchRound; the previous round's ls_dispatch has a
+      // replyHtml/repliedAt set (from the modification reply itself), so
+      // without scoping the engine would falsely "advance" through round-2
+      // without waiting for the branch's actual round-2 confirmation.
       const so = await prisma.salesOrder.findUnique({
         where: { id: progress.salesOrderId },
         select: { purchaseOrderId: true },
       });
+      const poRow = so?.purchaseOrderId
+        ? await prisma.purchaseOrder.findUnique({
+            where: { id: so.purchaseOrderId },
+            select: { dispatchRound: true },
+          })
+        : null;
+      const currentRound = poRow?.dispatchRound ?? 1;
       const lsDispatch = so?.purchaseOrderId
         ? await prisma.email.findFirst({
-            where: { purchaseOrderId: so.purchaseOrderId, emailType: 'ls_dispatch', status: 'sent' },
+            where: {
+              purchaseOrderId: so.purchaseOrderId,
+              emailType: 'ls_dispatch',
+              status: 'sent',
+              dispatchRound: currentRound,
+            },
             orderBy: { sentAt: 'desc' },
             select: { id: true, replyHtml: true, repliedAt: true },
           })
         : null;
       const alreadyReplied = !!(lsDispatch && (lsDispatch.replyHtml || lsDispatch.repliedAt));
       if (alreadyReplied) {
-        log('[ENGINE] email_confirm_product_details — ls_dispatch already sent + replied; advancing');
+        log(`[ENGINE] email_confirm_product_details — round ${currentRound} ls_dispatch already sent + replied; advancing`);
         return 'advance_now';
       }
-      log('[ENGINE] email_confirm_product_details — waiting for branch reply on ls_dispatch');
+      log(`[ENGINE] email_confirm_product_details — waiting for branch reply on round ${currentRound} ls_dispatch`);
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
@@ -1469,15 +1502,26 @@ async function fireStep(
         return 'pause';
       }
 
-      // Idempotency: if a dispatch_confirmation is already sent for this
-      // PO, don't re-send. Lets this handler be safely re-entered if the
-      // scenario re-fires.
+      // Round-scoped idempotency. After a VA02 modification, `email_2nd_release`
+      // bumps PO.dispatchRound so the next dispatch_confirmation belongs to a
+      // fresh round and is NOT skipped by the guard. Lets this handler be
+      // safely re-entered if the scenario re-fires within the same round.
+      const poRow = await prisma.purchaseOrder.findUnique({
+        where: { id: so.purchaseOrderId },
+        select: { dispatchRound: true },
+      });
+      const currentRound = poRow?.dispatchRound ?? 1;
       const alreadySent = await prisma.email.findFirst({
-        where: { purchaseOrderId: so.purchaseOrderId, emailType: 'dispatch_confirmation', status: 'sent' },
+        where: {
+          purchaseOrderId: so.purchaseOrderId,
+          emailType: 'dispatch_confirmation',
+          status: 'sent',
+          dispatchRound: currentRound,
+        },
         select: { id: true },
       });
       if (alreadySent) {
-        log(`[ENGINE] email_confirm_bundle_details — dispatch_confirmation already sent (${alreadySent.id}); segment-completing`);
+        log(`[ENGINE] email_confirm_bundle_details — round ${currentRound} dispatch_confirmation already sent (${alreadySent.id}); segment-completing`);
         if (isSegmentedExecutionEnabled()) return 'complete_segment';
         await markAwaitingReply(progress.id);
         return 'pause';
@@ -1526,11 +1570,11 @@ async function fireStep(
       }
 
       const totalKg = items.reduce((s, it) => s + it.weight_kg, 0);
-      const poRow = await prisma.purchaseOrder.findUnique({
+      const poCustomer = await prisma.purchaseOrder.findUnique({
         where: { id: so.purchaseOrderId },
         select: { customer: { select: { weightage: true } } },
       });
-      const capacityTonnes = poRow?.customer?.weightage ? Number(poRow.customer.weightage) : 45;
+      const capacityTonnes = poCustomer?.customer?.weightage ? Number(poCustomer.customer.weightage) : 45;
 
       // Anchor in the scenario's trigger email so the dispatch_confirmation
       // lands in the same Gmail thread (best-effort; falls back to a fresh

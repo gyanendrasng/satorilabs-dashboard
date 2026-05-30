@@ -1288,7 +1288,10 @@ export async function sendDispatchConfirmationEmail(args: {
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
   }
 
-  // 4) Track the Email row for reply detection.
+  // 4) Track the Email row for reply detection. Stamp with the PO's current
+  // dispatchRound so the engine's round-scoped idempotency guard in
+  // `email_confirm_bundle_details` can distinguish this round's confirmation
+  // from prior rounds (post-VA02 re-cycle scenarios).
   await prisma.email.create({
     data: {
       purchaseOrderId,
@@ -1302,6 +1305,7 @@ export async function sendDispatchConfirmationEmail(args: {
       workflowState: 'awaiting_dispatch_confirmation',
       sentBody: body,
       relatedMaterials: JSON.stringify({ version: 'dispatch-v1', plans, twoVehicles, totalTonnes, capacityTonnes }),
+      dispatchRound: po.dispatchRound,
     },
   });
 
@@ -2175,16 +2179,26 @@ export async function assembleAndSendCombinedEmail(
     logs.push(m);
   };
 
-  // Idempotency guard
+  // Round-scoped idempotency guard. After a VA02 modification, `email_2nd_release`
+  // bumps `PurchaseOrder.dispatchRound`; the next visibility callback should
+  // send a FRESH ls_dispatch tagged with the new round. We only short-circuit
+  // when the current round's ls_dispatch is already out.
+  const poRound = await prisma.purchaseOrder.findUnique({
+    where: { id: purchaseOrderId },
+    select: { dispatchRound: true },
+  });
+  const currentRound = poRound?.dispatchRound ?? 1;
+
   const existing = await prisma.email.findFirst({
     where: {
       purchaseOrderId,
       emailType: 'ls_dispatch',
       status: 'sent',
+      dispatchRound: currentRound,
     },
   });
   if (existing) {
-    log(`[CombinedEmail] PO ${purchaseOrderId} already has sent ls_dispatch email ${existing.id} — skipping`);
+    log(`[CombinedEmail] PO ${purchaseOrderId} round ${currentRound} already has ls_dispatch ${existing.id} — skipping`);
     return { success: true, logs, alreadySent: true };
   }
 
@@ -2300,7 +2314,9 @@ export async function assembleAndSendCombinedEmail(
     return { success: false, logs };
   }
 
-  // Create the FINAL Email row keyed to lead SO + PO
+  // Create the FINAL Email row keyed to lead SO + PO. Stamp with the PO's
+  // current dispatchRound so the round-scoped guards above (and the engine
+  // step handlers) can distinguish this round's ls_dispatch from prior ones.
   await prisma.email.create({
     data: {
       salesOrderId: leadSO.id,
@@ -2314,6 +2330,7 @@ export async function assembleAndSendCombinedEmail(
       workflowState: 'awaiting_reply',
       relatedMaterials: JSON.stringify(aggregated),
       sentBody: combinedBody,
+      dispatchRound: currentRound,
     },
   });
 

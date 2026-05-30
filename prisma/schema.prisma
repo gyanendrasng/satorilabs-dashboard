@@ -108,6 +108,11 @@ model PurchaseOrder {
   customerId   String?
   status       String   @default("in-progress") // pending, in-progress, completed
   stage        Int      @default(1) // 1-6 workflow stages
+  // Dispatch round counter. 1 = original NEW ORDER → ls_dispatch cycle. After
+  // each `email_2nd_release` fires (post-VA02 modification), the engine
+  // increments this so the next ls_dispatch / dispatch_confirmation on the PO
+  // belong to a fresh round and are not skipped by idempotency guards.
+  dispatchRound Int    @default(1)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -418,6 +423,12 @@ model Email {
   sentAt            DateTime  @default(now())
   repliedAt         DateTime?
   replyPdfUrl       String?   // R2 key for the reply PDF attachment
+
+  // Dispatch-round tag. Set on ls_dispatch / dispatch_confirmation / 2nd_release
+  // emails so the engine can scope idempotency guards and reply detection to
+  // the current round (see PurchaseOrder.dispatchRound). Null for emails that
+  // aren't part of the dispatch cycle (vehicle_details, plant_ls, etc.).
+  dispatchRound     Int?
 
   // Workflow fields
   emailType         String?   // 'ls_dispatch' | 'ls_dispatch_buffered' | 'production_inquiry' | 'production_reminder' | null (legacy)
