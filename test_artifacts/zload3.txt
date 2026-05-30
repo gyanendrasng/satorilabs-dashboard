@@ -1,0 +1,34 @@
+this is what the payload looks like when i send it
+
+"data": [
+        {
+          "sales_order": "3260667",
+          "material_doc": "4900000327",
+          "delivery_no": "85817679",
+          "invoice_no": "7682614520"
+        },
+        {
+          "sales_order": "3260667",
+          "material_doc": "4900000328",
+          "delivery_no": "85817679",
+          "invoice_no": "7682614520"
+        },
+        {
+          "sales_order": "3260667",
+          "material_doc": "4900000329",
+          "delivery_no": "85817679",
+          "invoice_no": "7682614520"
+        },
+        {
+          "sales_order": "3260667",
+          "material_doc": "4900000330",
+          "delivery_no": "85817679",
+          "invoice_no": "7682614520"
+        },
+        {
+          "sales_order": "3260667",
+          "material_doc": "4900000331",
+          "delivery_no": "85817679",
+          "invoice_no": "7682614520"
+        }
+      ]

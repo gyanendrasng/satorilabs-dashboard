@@ -83,6 +83,33 @@ function randomDigits(n) {
   return s;
 }
 
+// ---------- deterministic SAP-number generators ----------------------------
+// Real auto_gui2 / SAP returns specific number shapes the artifacts pin down:
+//   - LS numbers: 6-digit integers (e.g., 373282 from test_artifacts/ 373282.PDF)
+//   - material_doc: 10-digit, sequential within a ZLOAD3 fire (4900000327, …)
+//   - delivery_no: 8-digit, ONE per ZLOAD3 fire (85817679)
+//   - invoice_no: 10-digit, ONE per ZLOAD3 fire (7682614520)
+// We use process-lifetime counters seeded from these artifact numbers so the
+// test transcript is deterministic and traceable. Restarting the dummy resets.
+
+let lsCounter = 373282;            // next LS number to hand out (6-digit)
+let matDocCounter = 4900000327;    // next material_doc (10-digit, increments per row)
+let deliveryNoCounter = 85817679;  // next delivery_no (8-digit, increments per fire)
+let invoiceNoCounter = 7682614520; // next invoice_no (10-digit, increments per fire)
+
+function nextLs() {
+  return String(lsCounter++);
+}
+function nextMaterialDoc() {
+  return String(matDocCounter++);
+}
+function nextDeliveryNo() {
+  return String(deliveryNoCounter++);
+}
+function nextInvoiceNo() {
+  return String(invoiceNoCounter++);
+}
+
 // Tiny, valid PDF stub. Plant doesn't actually open them in tests; just needs bytes.
 function makeStubPdf(text) {
   const escaped = String(text).replace(/[()\\]/g, '');
@@ -198,6 +225,7 @@ async function postJson(url, body) {
 }
 
 async function postCompletion({ work_id, success, summary, meta }) {
+  log(`POST /step-status [work=${work_id} success=${success}] ${summary ?? ''}`);
   return postJson(`${DASHBOARD_URL}/backend/orders/aman/step-status`, {
     event: 'workflow_complete',
     meta: { ...(meta || {}), work_id },
@@ -207,25 +235,29 @@ async function postCompletion({ work_id, success, summary, meta }) {
   });
 }
 
-async function sendVisibility({ so_number, meta }) {
+async function sendVisibility({ so_number, meta, work_id }) {
   const fixture = loadFixture('visibility', so_number) || defaultMaterials(so_number);
+  const materials = fixture.materials || fixture;
+  log(`POST /visibility-data [so=${so_number} materials=${materials.length} work=${work_id}]`);
   return postJson(`${DASHBOARD_URL}/backend/orders/aman/visibility-data`, {
     so_number,
-    materials: fixture.materials || fixture,
+    materials,
     meta,
   });
 }
 
-async function sendZload1Files({ so_number, materials, meta }) {
+async function sendZload1Files({ so_number, materials, meta, work_id }) {
   const url = `${DASHBOARD_URL}/backend/orders/aman/zload1-data`;
   const lsPerSo = parseInt(process.env.DUMMY_LS_PER_SO || '0', 10);
   const list = lsPerSo > 0 ? materials.slice(0, lsPerSo) : materials;
   if (list.length === 0) {
-    log(`[ZLOAD1] no materials parsed; sending one stub LS so the SO progresses`);
+    log(`[ZLOAD1 so=${so_number} work=${work_id}] no materials parsed; sending one stub LS so the SO progresses`);
     list.push({ material_code: 'STUB', batch: 'B000', quantity: 1 });
   }
   for (const m of list) {
-    const lsNumber = randomDigits(7);
+    // 6-digit LS number from the counter — matches the format the user
+    // confirmed via test_artifacts/ 373282.PDF.
+    const lsNumber = nextLs();
     const filename = `${lsNumber}.pdf`;
     const pdfBuffer = makeStubPdf(
       `LS ${lsNumber} | SO ${so_number} | ${m.material_code} batch ${m.batch} qty ${m.quantity}`
@@ -237,34 +269,51 @@ async function sendZload1Files({ so_number, materials, meta }) {
     fd.set('file', new Blob([pdfBuffer], { type: 'application/pdf' }), filename);
     try {
       const res = await fetch(url, { method: 'POST', body: fd });
-      log(`POST ${url} (LS ${lsNumber}, bundle=${meta?.bundle_id ?? 'none'}) → ${res.status}`);
+      log(
+        `POST /zload1-data [so=${so_number} ls=${lsNumber} material=${m.material_code} bundle=${meta?.bundle_id ?? 'none'} work=${work_id}] → ${res.status}`
+      );
     } catch (err) {
-      log(`POST ${url} FAILED: ${err.message}`);
+      log(`POST ${url} [so=${so_number} ls=${lsNumber}] FAILED: ${err.message}`);
     }
   }
 }
 
-async function sendProcessing({ so_number, meta, attachments }) {
+async function sendProcessing({ so_number, meta, attachments, work_id }) {
+  // Real auto_gui2 / ZLOAD3-B1 callback shape (per test_artifacts/zload3.txt):
+  //   { data: [{ sales_order, material_doc, delivery_no, invoice_no }] }
+  // All rows in ONE ZLOAD3 fire share the SAME delivery_no + invoice_no.
+  // material_doc is sequential (4900000327, 4900000328, …).
+  // No ls_number, no loaded_quantity, no invoice_date — those are derived
+  // by the dashboard's application layer from the SO's existing LSI rows.
+  //
+  // A per-SO fixture can override the row count. Otherwise: one row per
+  // attachment (one attachment per LS the dashboard already created),
+  // falling back to 5 rows if no attachments.
   const fixture = loadFixture('processing', so_number);
-  let items;
+  let rows;
   if (fixture) {
-    items = fixture.items || fixture;
+    rows = fixture.data || fixture.items || fixture;
   } else {
     const atts = attachments || [];
-    if (atts.length === 0) atts.push({ filename: `${randomDigits(7)}.pdf` });
-    items = atts.map((a, i) => ({
-      sales_order: so_number,
-      material_doc: `49000${randomDigits(5)}`,
-      delivery_no: `80000${randomDigits(5)}`,
-      invoice_no: `HRJ-${Date.now().toString().slice(-6)}-${i + 1}`,
-      ls_number: a.filename.replace(/\.pdf$/i, ''),
-      loaded_quantity: 20,
-      invoice_date: new Date().toISOString().slice(0, 10),
-    }));
+    const rowCount = atts.length > 0 ? atts.length : 5;
+    const sharedDelivery = nextDeliveryNo();
+    const sharedInvoice = nextInvoiceNo();
+    rows = [];
+    for (let i = 0; i < rowCount; i++) {
+      rows.push({
+        sales_order: so_number,
+        material_doc: nextMaterialDoc(),
+        delivery_no: sharedDelivery,
+        invoice_no: sharedInvoice,
+      });
+    }
   }
+  log(
+    `POST /processing-data [so=${so_number} rows=${rows.length} delivery=${rows[0]?.delivery_no} invoice=${rows[0]?.invoice_no} work=${work_id}]`
+  );
   return postJson(`${DASHBOARD_URL}/backend/orders/aman/processing-data`, {
     so_number,
-    items,
+    data: rows,
     meta,
   });
 }
@@ -273,8 +322,10 @@ async function sendProcessing({ so_number, meta, attachments }) {
 
 async function handleChat(body) {
   const transactionCode = body.transaction_code;
-  const soNumber = body.so_number;
   const meta = body.meta || {};
+  // Real auto_gui2 / dashboard put so_number in `meta.so_number`; older
+  // callers used the top level. Try both.
+  const soNumber = body.so_number ?? meta.so_number;
   const workId = body.work_id || meta.work_id;
   const attachments = body.attachments || [];
 
@@ -295,15 +346,24 @@ async function handleChat(body) {
 
   try {
     if (transactionCode === 'ZSO-VISIBILITY') {
-      await sendVisibility({ so_number: soNumber, meta });
+      await sendVisibility({ so_number: soNumber, meta, work_id: workId });
     } else if (transactionCode === 'ZLOAD1') {
       const materials = parseInstructionMaterials(body.instruction);
-      await sendZload1Files({ so_number: soNumber, materials, meta });
+      await sendZload1Files({ so_number: soNumber, materials, meta, work_id: workId });
     } else if (transactionCode === 'ZLOAD3-B1') {
-      await sendProcessing({ so_number: soNumber, meta, attachments });
+      await sendProcessing({ so_number: soNumber, meta, attachments, work_id: workId });
     } else if (transactionCode === 'VTO1N-B' || transactionCode === 'ZLOAD3-A') {
-      // No data callback in current dashboard wiring beyond /step-status.
-      log(`(no data callback for ${transactionCode}, going straight to /step-status)`);
+      // No data callback per user-confirmed contract — only /step-status.
+      log(`[${transactionCode} so=${soNumber} work=${workId}] no data callback (only /step-status)`);
+    } else if (
+      transactionCode === 'VA02' ||
+      transactionCode === 'ZLOAD2' ||
+      transactionCode === 'ZLOADING_CLOSE' ||
+      transactionCode === 'MB51'
+    ) {
+      // User-confirmed: these transactions return success/failure only; no
+      // data callback. Just log and fall through to /step-status.
+      log(`[${transactionCode} so=${soNumber} work=${workId}] no data callback (only /step-status)`);
     } else {
       log(`Unknown transaction_code: ${transactionCode} — only sending /step-status`);
     }
