@@ -182,6 +182,31 @@ export async function markFailed(
 }
 
 /**
+ * Cancel a still-queued work row. Only rows in `state='queued'` can be
+ * cancelled — a row that has already been fired (`state='firing'`) is being
+ * worked on by auto_gui2 and cannot be pulled back. The `where` clause guards
+ * the state transition atomically, so a row that flips to `firing` between the
+ * UI render and this call simply won't match (count === 0).
+ */
+export async function cancelWork(
+  workId: string,
+): Promise<{ cancelled: boolean; reason?: 'not_found' | 'already_firing' }> {
+  const row = await prisma.workQueue.findUnique({ where: { id: workId } });
+  if (!row) return { cancelled: false, reason: 'not_found' };
+  if (row.state !== 'queued') return { cancelled: false, reason: 'already_firing' };
+
+  const result = await prisma.workQueue.updateMany({
+    where: { id: workId, state: 'queued' },
+    data: { state: 'cancelled', finishedAt: new Date() },
+  });
+  // Lost the race — the pump flipped it to firing just now.
+  if (result.count === 0) return { cancelled: false, reason: 'already_firing' };
+
+  console.log(`[WorkQueue] ✗ CANCELLED work ${workId} (${row.step})`);
+  return { cancelled: true };
+}
+
+/**
  * Return the currently firing work row, if any. Useful for diagnostics
  * and the stale-recovery sweep.
  */
