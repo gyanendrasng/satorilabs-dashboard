@@ -20,15 +20,27 @@ import { prisma } from './prisma';
 export type ScenarioEmailType = 'branch' | 'plant';
 
 export type Stage =
-  | 'before_ls'                  // visibility done OR pending; no LS files yet
-  | 'after_ls_before_invoice'    // LS files exist, no plant invoice received
-  | 'after_invoice';             // shipment phase
+  | 'before_ls'                   // visibility done OR pending; no LS files yet
+  | 'after_ls_before_invoice'     // LS files exist, vehicle not yet placed
+  | 'after_vehicle_placement'     // Bundle.vehicleNumber set; no plant_ls email yet
+  | 'after_email_to_plant'        // plant_ls email sent; no plant invoice yet
+  | 'after_plant_invoice'         // plant invoice received; VT01N pending or done
+  | 'after_invoice'               // shipment phase (back-compat alias)
+  | 'anytime';                    // Anytime intents (Seeking Order Update, Others)
 
 export type Intent =
   | 'release_all'
   | 'release_part'
   | 'wait'
-  | 'modify';
+  | 'modify'
+  | 'new_so'                      // R4 — NEW ORDER inbound
+  | '2nd_release'                 // R5, R6 — branch confirms 2nd release
+  | 'discount_confirm'            // R7 — branch acks discount code
+  | 'clarify_weight'              // R8 — vehicle weight clarification
+  | 'vehicle_details'             // R10 — branch shares vehicle details
+  | 'status_update'               // R9 — Seeking Order Update
+  | 'other'                       // R11, R45 — catch-all → escalate
+  | 'invoice_sent';               // R44 — plant invoice arrival
 
 export type Modification =
   | 'increase' | 'decrease' | 'delete'
@@ -52,6 +64,8 @@ export type StepKind =
   | 'email_confirm_bundle_details'    // reuse sendDispatchConfirmationEmail
   | 'email_to_branch_for_vehicle'     // reuse sendCombinedVehicleDetailsEmailForPo
   | 'email_to_plant'                  // reuse sendLSEmail (per-LSI)
+  | 'email_to_branch_notifying_plant_change'  // NEW — sendPlantChangeNotificationEmail (R46-R51)
+  | 'email_order_status'              // NEW — sendOrderStatusEmail (R9 Seeking Order Update auto-reply)
   | 'await_plant_invoice'             // sentinel — engine pauses; plant reply advances it
   | 'await_vt01n';                    // sentinel — engine pauses; VT01N enqueue advances it
 
@@ -299,8 +313,8 @@ export const SCENARIOS: Record<string, Scenario> = {
   // ---------- Plant Email, Before Plant Invoice — LS Modification (rows 25–30) ----------
 
   // Row 25 — plant says actual is more than ordered
-  'plant|after_ls_before_invoice|modify|increase': {
-    key: 'plant|after_ls_before_invoice|modify|increase',
+  'plant|after_email_to_plant|modify|increase': {
+    key: 'plant|after_email_to_plant|modify|increase',
     description: 'Plant reports increase — VA02 + re-visibility + ZLOAD2',
     steps: [
       { kind: 'stock_precheck', label: 'Free-stock pre-check (replaces Zmatana)' },
@@ -315,8 +329,8 @@ export const SCENARIOS: Record<string, Scenario> = {
   },
 
   // Row 26
-  'plant|after_ls_before_invoice|modify|inc_dec': {
-    key: 'plant|after_ls_before_invoice|modify|inc_dec',
+  'plant|after_email_to_plant|modify|inc_dec': {
+    key: 'plant|after_email_to_plant|modify|inc_dec',
     description: 'Plant reports increase + decrease — VA02 + ZLOAD2',
     steps: [
       { kind: 'stock_precheck', label: 'Free-stock pre-check (replaces Zmatana)' },
@@ -331,8 +345,8 @@ export const SCENARIOS: Record<string, Scenario> = {
   },
 
   // Row 27
-  'plant|after_ls_before_invoice|modify|inc_del': {
-    key: 'plant|after_ls_before_invoice|modify|inc_del',
+  'plant|after_email_to_plant|modify|inc_del': {
+    key: 'plant|after_email_to_plant|modify|inc_del',
     description: 'Plant reports increase + delete — VA02 + ZLOAD2 + ZLOAD_Delete',
     steps: [
       { kind: 'stock_precheck', label: 'Free-stock pre-check (replaces Zmatana)' },
@@ -348,8 +362,8 @@ export const SCENARIOS: Record<string, Scenario> = {
   },
 
   // Row 28
-  'plant|after_ls_before_invoice|modify|decrease': {
-    key: 'plant|after_ls_before_invoice|modify|decrease',
+  'plant|after_email_to_plant|modify|decrease': {
+    key: 'plant|after_email_to_plant|modify|decrease',
     description: 'Plant reports shortage — ZLOAD2 (no VA02 / re-visibility)',
     steps: [
       { kind: 'zload2', awaitsCallback: true },
@@ -358,8 +372,8 @@ export const SCENARIOS: Record<string, Scenario> = {
   },
 
   // Row 29
-  'plant|after_ls_before_invoice|modify|delete': {
-    key: 'plant|after_ls_before_invoice|modify|delete',
+  'plant|after_email_to_plant|modify|delete': {
+    key: 'plant|after_email_to_plant|modify|delete',
     description: 'Plant cannot ship a line at all — ZLOAD_Delete only',
     steps: [
       { kind: 'zloading_close', awaitsCallback: true },
@@ -368,8 +382,8 @@ export const SCENARIOS: Record<string, Scenario> = {
   },
 
   // Row 30
-  'plant|after_ls_before_invoice|modify|dec_del': {
-    key: 'plant|after_ls_before_invoice|modify|dec_del',
+  'plant|after_email_to_plant|modify|dec_del': {
+    key: 'plant|after_email_to_plant|modify|dec_del',
     description: 'Plant reports shortage + cannot ship others — ZLOAD2 + ZLOAD_Delete',
     steps: [
       { kind: 'zload2', awaitsCallback: true },
@@ -400,21 +414,51 @@ export function resolveScenario(
 // -----------------------------------------------------------------------------
 
 export async function deriveStage(salesOrderId: string): Promise<Stage> {
-  // Pull the minimum we need in one go. The triage logic is in-process to keep
-  // it auditable; if performance ever matters this can be replaced with raw SQL.
+  // Pull the minimum we need in one go. The triage logic is in-process to
+  // keep it auditable; if performance ever matters this can be replaced
+  // with raw SQL.
+  //
+  // The 7 stages cascade top-to-bottom — first match wins. Each check looks
+  // for evidence that the SO has progressed past that milestone.
   const so = await prisma.salesOrder.findUnique({
     where: { id: salesOrderId },
     select: {
       status: true,
+      // Files only matter for "LS exists" detection (post-ZLOAD1).
       items: {
         select: { fileUrl: true },
         take: 1,
         where: { fileUrl: { not: null } },
       },
+      // VT01N evidence — shipment row in a post-create status.
       shipments: {
         select: { status: true },
         where: { status: { in: ['shipment-triggered', 'shipped'] } },
         take: 1,
+      },
+      // Plant invoice arrival — a real Invoice row (1:1 with SO).
+      invoice: { select: { id: true } },
+      // Vehicle placement is captured per-Bundle on the parent PurchaseOrder.
+      // Any bundle with a vehicleNumber means the branch has shared transport
+      // for at least one truck on this PO.
+      purchaseOrder: {
+        select: {
+          bundles: {
+            select: { vehicleNumber: true },
+            where: { vehicleNumber: { not: null } },
+            take: 1,
+          },
+        },
+      },
+      // plant_ls email outbound = "LS forwarded to plant". The presence of
+      // a sent row signals we've moved past After-Vehicle-Placement. A reply
+      // on the plant_ls thread does NOT by itself mean "invoice arrived" —
+      // the plant might be replying with a modification request instead.
+      // Invoice arrival is signalled by the Invoice row created from the
+      // ZLOAD3 processing-data callback (above).
+      emails: {
+        select: { id: true, emailType: true, status: true },
+        where: { emailType: 'plant_ls' },
       },
     },
   });
@@ -425,14 +469,43 @@ export async function deriveStage(salesOrderId: string): Promise<Stage> {
     return 'before_ls';
   }
 
-  if (so.shipments.length > 0 || so.status === 'in-progress' || so.status === 'completed') {
+  // Stage 7 (terminal) — VT01N completed OR SO marked completed.
+  if (
+    so.shipments.length > 0 ||
+    so.status === 'in-progress' ||
+    so.status === 'completed'
+  ) {
     return 'after_invoice';
   }
 
+  // Stage 6 — plant invoice arrived (Invoice row created by ZLOAD3
+  // processing-data callback), VT01N not yet done. We don't treat a
+  // plant_ls reply as proof of invoice arrival because the reply could be
+  // a modification request instead.
+  if (so.invoice) {
+    return 'after_plant_invoice';
+  }
+
+  // Stage 5 — plant_ls email is out the door, awaiting plant invoice.
+  const plantLsSent = so.emails.find((e) => e.status === 'sent');
+  if (plantLsSent) {
+    return 'after_email_to_plant';
+  }
+
+  // Stage 4 — at least one bundle on the parent PO has a vehicleNumber, but
+  // we haven't yet forwarded the LS to the plant.
+  if ((so.purchaseOrder?.bundles?.length ?? 0) > 0) {
+    return 'after_vehicle_placement';
+  }
+
+  // Stage 3 — LS file(s) exist (ZLOAD1 ran), but no vehicle yet.
   if (so.status === 'ls_created' && so.items.length > 0) {
     return 'after_ls_before_invoice';
   }
 
+  // Stage 1 — nothing has happened beyond the NEW ORDER intake.
+  // ('anytime' is never DB-derived; the classifier picks it when an email
+  // matches an Anytime intent regardless of computed stage.)
   return 'before_ls';
 }
 
@@ -446,12 +519,53 @@ export function getValidScenarioKeys(
   sender: ScenarioEmailType,
   stage: Stage,
 ): Array<{ key: string; description: string; stepKinds: string[] }> {
+  // Sheet-driven path: pull every key in the adapter's KEY_TO_COORD that
+  // matches the (sender, stage) prefix, plus every Anytime intent (which
+  // the LLM may pick at any stage when the email content matches). Falls
+  // back to the legacy SCENARIOS registry for any key the sheet doesn't
+  // cover — so the classifier sees the full vocabulary, not just the 21
+  // hardcoded scenarios.
+  //
+  // Dynamic require to avoid a circular import: sheet-scenario-adapter
+  // imports `Scenario`/`Step`/`StepKind` from this file.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const adapter = require('./sheet-scenario-adapter') as typeof import('./sheet-scenario-adapter');
   const prefix = `${sender}|${stage}|`;
-  return Object.entries(SCENARIOS)
-    .filter(([k]) => k.startsWith(prefix))
-    .map(([key, s]) => ({
+  const anytimePrefix = `${sender}|anytime|`;
+
+  // Stage-transition keys: some intents at "stage N+1" are the very inbound
+  // that triggers the SO to move from stage N → N+1. The classifier must
+  // see them as candidates while the SO is still computed at stage N — or
+  // we hide them in the gap. Each entry below means "expose this key for
+  // its parent stage too". Only intents that legitimately *cross* stages.
+  const TRANSITION_KEYS: Array<{ keyPrefix: string; visibleAtStage: Stage }> = [
+    // Plant's invoice email arrives while deriveStage still says
+    // `after_email_to_plant` (no Invoice row yet). The invoice_sent inbound
+    // is what creates the Invoice row → advances to `after_plant_invoice`.
+    { keyPrefix: `${sender}|after_plant_invoice|invoice_sent|`, visibleAtStage: 'after_email_to_plant' },
+  ];
+
+  const allKeys = new Set<string>([
+    ...adapter.getAllSheetBackedKeys(),
+    ...Object.keys(SCENARIOS),
+  ]);
+  const matching = Array.from(allKeys).filter((k) => {
+    if (k.startsWith(prefix)) return true;
+    if (k.startsWith(anytimePrefix)) return true;
+    for (const t of TRANSITION_KEYS) {
+      if (t.visibleAtStage === stage && k.startsWith(t.keyPrefix)) return true;
+    }
+    return false;
+  });
+
+  return matching.map((key) => {
+    const sheetSc = adapter.getScenarioFromKey(key);
+    const legacySc = SCENARIOS[key];
+    const sc = sheetSc ?? legacySc;
+    return {
       key,
-      description: s.description,
-      stepKinds: s.steps.map((st) => st.kind),
-    }));
+      description: sc?.description ?? key,
+      stepKinds: sc?.steps.map((st) => st.kind) ?? [],
+    };
+  });
 }
