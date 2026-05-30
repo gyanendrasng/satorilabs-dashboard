@@ -84,10 +84,12 @@ export async function POST(request: Request) {
     }
 
     // Per-request fields are repeated across rows; pick from rows[0].
+    // The real auto_gui2 payload doesn't send invoice_date — fall back to
+    // "now" so downstream UIs that show an invoice date still have a value.
     const obdNumber = rows[0]?.delivery_no ?? null;
     const invoiceNumber = rows[0]?.invoice_no ?? null;
     const rawDate = rows[0]?.invoice_date ?? null;
-    const invoiceDate = rawDate ? new Date(rawDate) : null;
+    const invoiceDate = rawDate ? new Date(rawDate) : new Date();
 
     // === Shipment: per (Bundle, SO) pair ===
     let shipment = null as null | { id: string };
@@ -117,19 +119,64 @@ export async function POST(request: Request) {
     }
 
     // === Per-LS fields on LoadingSlipItem ===
+    //
+    // The real auto_gui2 / ZLOAD3-B1 payload only carries
+    // { sales_order, material_doc, delivery_no, invoice_no } per row — no
+    // ls_number, no loaded_quantity. When ls_number is absent we positionally
+    // map each row to one of the SO's existing LSI rows (scoped to the
+    // bundle when known, ordered by createdAt asc). When loaded_quantity is
+    // absent we fall back to LoadingSlipItem.orderQuantity so the audit/UI
+    // still has a number to show.
     let lsiUpdated = 0;
-    for (const r of rows) {
-      const lsNumber = r.ls_number;
-      if (!lsNumber) continue;
+    const needPositionalMapping = rows.some((r) => !r.ls_number);
+    let positionalLsis: Array<{ id: string; lsNumber: string; orderQuantity: number | null }> = [];
+    if (needPositionalMapping) {
+      const where = bundleId
+        ? { salesOrderId: salesOrder.id, bundleId }
+        : { salesOrderId: salesOrder.id };
+      const lsisInOrder = await prisma.loadingSlipItem.findMany({
+        where,
+        select: { id: true, lsNumber: true, orderQuantity: true },
+        orderBy: { createdAt: 'asc' },
+      });
+      positionalLsis = lsisInOrder;
+      console.warn(
+        `[ProcessingData] ${rows.filter((r) => !r.ls_number).length}/${rows.length} row(s) missing ls_number — positional fallback against ${lsisInOrder.length} LSI(s) for SO ${soNumber}${bundleId ? ` bundle ${bundleId}` : ''}`
+      );
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      let lsNumber = r.ls_number;
+      let positionalLsiId: string | null = null;
+      let positionalOrderQty: number | null = null;
+      if (!lsNumber) {
+        const lsi = positionalLsis[i];
+        if (!lsi) {
+          console.warn(
+            `[ProcessingData] row ${i} has no ls_number and no positional LSI match (positional list length ${positionalLsis.length}); skipping`
+          );
+          continue;
+        }
+        lsNumber = lsi.lsNumber;
+        positionalLsiId = lsi.id;
+        positionalOrderQty = lsi.orderQuantity;
+      }
       const update: Record<string, unknown> = {};
       if (r.material_doc) update.sapMaterialDoc = r.material_doc;
-      if (typeof r.loaded_quantity === 'number') update.sapLoadedQuantity = r.loaded_quantity;
+      if (typeof r.loaded_quantity === 'number') {
+        update.sapLoadedQuantity = r.loaded_quantity;
+      } else if (positionalOrderQty !== null) {
+        // No loaded_quantity in payload — fall back to the LSI's orderQuantity.
+        update.sapLoadedQuantity = positionalOrderQty;
+      }
       if (shipment) update.shipmentId = shipment.id;
       if (Object.keys(update).length === 0) continue;
-      const res = await prisma.loadingSlipItem.updateMany({
-        where: { salesOrderId: salesOrder.id, lsNumber },
-        data: update,
-      });
+      const res = positionalLsiId
+        ? await prisma.loadingSlipItem.update({ where: { id: positionalLsiId }, data: update }).then(() => ({ count: 1 }))
+        : await prisma.loadingSlipItem.updateMany({
+            where: { salesOrderId: salesOrder.id, lsNumber },
+            data: update,
+          });
       lsiUpdated += res.count;
     }
 

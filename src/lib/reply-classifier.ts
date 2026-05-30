@@ -73,16 +73,21 @@ const VehicleSplitDecisionSchema = z.object({
   reasoning: z.string().default(''),
 });
 
+// Lenient about `null` for optional fields — the LLM occasionally returns
+// {bundleNumber: null, driverMobile: null} when a value isn't explicitly in
+// the reply. We coerce nulls to undefined/'' so validation doesn't fail.
 const VehicleDetailSchema = z.object({
-  bundleNumber: z.number().int().optional(),
-  vehicleNumber: z.string().default(''),
-  driverMobile: z.string().default(''),
-  containerNumber: z.string().default(''),
+  bundleNumber: z.number().int().nullable().optional().transform((v) => (v ?? undefined)),
+  vehicleNumber: z.string().nullable().default('').transform((v) => v ?? ''),
+  driverMobile: z.string().nullable().default('').transform((v) => v ?? ''),
+  containerNumber: z.string().nullable().default('').transform((v) => v ?? ''),
 });
 
 const VehicleDetailsExtractionSchema = z.object({
   action: z.literal('vehicle_details_extraction'),
-  vehicles: z.array(VehicleDetailSchema).default([]),
+  // Same null-tolerance for the outer array: LLM may return `vehicles: null`
+  // for "no per-bundle vehicles found", in which case we treat it as [].
+  vehicles: z.array(VehicleDetailSchema).nullable().default([]).transform((v) => v ?? []),
   reasoning: z.string().default(''),
 });
 
@@ -440,6 +445,12 @@ export interface ClassifyReplyArgs {
    * verdict for a specific email. Optional — when omitted, the log line
    * prints `gmailMsgId=?` instead. */
   gmailMessageId?: string | null;
+  /** Compact event timeline rendered by `renderAuditTrailForSO`. Passed into
+   * the Manager prompt so the LLM can reason about prior workflow state
+   * (ZLOAD1 already fired? vehicle details already shared? etc.), not just
+   * the latest email. Optional — empty string for NEW ORDER (no SO yet) or
+   * legacy callers that haven't been updated. */
+  auditTrail?: string;
 }
 
 // -----------------------------------------------------------------------------
@@ -523,6 +534,18 @@ function buildUserPrompt(args: ClassifyReplyArgs): string {
     parts.push('For action="scenario", set action_on_active = "abort_and_replace" if the new email asks for something DIFFERENT.');
     parts.push('Set action_on_active = "escalate" if you cannot decide.');
     parts.push('═══════════════════════════════════');
+    parts.push('');
+  }
+
+  if (args.auditTrail && args.auditTrail.trim().length > 0) {
+    parts.push('PRIOR ACTIONS ON THIS SO (oldest first — the full workflow history):');
+    parts.push(args.auditTrail);
+    parts.push('');
+    parts.push(
+      'Use the audit trail to disambiguate stage. If the trail shows ZLOAD1 already fired, ' +
+        'the LS is created; intents valid only before LS creation no longer apply. When the ' +
+        'latest email seems to contradict the trail, prefer the stage implied by the trail.',
+    );
     parts.push('');
   }
 
@@ -622,6 +645,12 @@ export async function classifyReply(args: ClassifyReplyArgs): Promise<ReplyClass
     const json = JSON.parse(raw);
     const validated = ReplyClassificationSchema.safeParse(json);
     if (!validated.success) {
+      // Log the raw LLM output alongside the Zod error so future drift can
+      // be debugged from logs alone. Truncated to keep log lines reasonable.
+      const rawPreview = raw.length > 500 ? raw.slice(0, 500) + '…' : raw;
+      console.warn(
+        `[CLASSIFIER_ZOD_FAIL] gmailMsgId=${args.gmailMessageId ?? '?'} action=${(json as { action?: unknown })?.action ?? '?'} raw=${rawPreview} errors=${JSON.stringify(validated.error.issues)}`,
+      );
       const cls = fallbackOther(`Zod validation failed: ${validated.error.message}`);
       logClassifierResult(args, cls);
       return cls;
