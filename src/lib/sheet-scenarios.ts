@@ -18,7 +18,7 @@
  * Reload semantics: parsed once at module load. Server restart picks up
  * sheet changes.
  */
-import XLSX from 'xlsx';
+import * as XLSX from 'xlsx';
 import path from 'path';
 import type { ScenarioEmailType } from './dispatch-scenarios';
 
