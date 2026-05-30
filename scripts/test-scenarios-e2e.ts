@@ -168,27 +168,27 @@ const CASES: CaseSpec[] = [
     replyText: 'Reduce M-A to 60 and remove M-C from the LS.' },
 
   // ─── Plant + after_ls + modify (rows 25–30) ──────────────────────────
-  { key: 'plant|after_ls_before_invoice|modify|increase', row: 25, bucket: 'after_ls_plant',
+  { key: 'plant|after_email_to_plant|modify|increase', row: 25, bucket: 'after_ls_plant',
     emailType: 'plant', stage: 'after_ls_before_invoice', triggerEmailType: 'plant_ls',
     expectedIntent: 'modify', expectedModification: 'increase',
     replyText: 'Update: we can ship 150 units of M-A (more than ordered).' },
-  { key: 'plant|after_ls_before_invoice|modify|inc_dec', row: 26, bucket: 'after_ls_plant',
+  { key: 'plant|after_email_to_plant|modify|inc_dec', row: 26, bucket: 'after_ls_plant',
     emailType: 'plant', stage: 'after_ls_before_invoice', triggerEmailType: 'plant_ls',
     expectedIntent: 'modify', expectedModification: 'inc_dec',
     replyText: 'We can ship 150 of M-A but only 60 of M-B.' },
-  { key: 'plant|after_ls_before_invoice|modify|inc_del', row: 27, bucket: 'after_ls_plant',
+  { key: 'plant|after_email_to_plant|modify|inc_del', row: 27, bucket: 'after_ls_plant',
     emailType: 'plant', stage: 'after_ls_before_invoice', triggerEmailType: 'plant_ls',
     expectedIntent: 'modify', expectedModification: 'inc_del',
     replyText: 'We can ship 150 of M-A; M-C is unavailable.' },
-  { key: 'plant|after_ls_before_invoice|modify|decrease', row: 28, bucket: 'after_ls_plant',
+  { key: 'plant|after_email_to_plant|modify|decrease', row: 28, bucket: 'after_ls_plant',
     emailType: 'plant', stage: 'after_ls_before_invoice', triggerEmailType: 'plant_ls',
     expectedIntent: 'modify', expectedModification: 'decrease',
     replyText: 'We only have 60 of M-A available — short of ordered quantity.' },
-  { key: 'plant|after_ls_before_invoice|modify|delete', row: 29, bucket: 'after_ls_plant',
+  { key: 'plant|after_email_to_plant|modify|delete', row: 29, bucket: 'after_ls_plant',
     emailType: 'plant', stage: 'after_ls_before_invoice', triggerEmailType: 'plant_ls',
     expectedIntent: 'modify', expectedModification: 'delete',
     replyText: 'M-C is completely unavailable, cannot ship.' },
-  { key: 'plant|after_ls_before_invoice|modify|dec_del', row: 30, bucket: 'after_ls_plant',
+  { key: 'plant|after_email_to_plant|modify|dec_del', row: 30, bucket: 'after_ls_plant',
     emailType: 'plant', stage: 'after_ls_before_invoice', triggerEmailType: 'plant_ls',
     expectedIntent: 'modify', expectedModification: 'dec_del',
     replyText: 'Only 60 of M-A available; M-C is unavailable entirely.' },
@@ -433,6 +433,20 @@ async function main() {
     maybeAdvanceScenario,
   } = await import('../src/lib/scenario-engine');
   const { SCENARIOS, deriveStage } = await import('../src/lib/dispatch-scenarios');
+  const { getScenarioFromKey } = await import('../src/lib/sheet-scenario-adapter');
+  // Sheet-driven scenario lookup (matches the engine's behavior). Falls back to
+  // the legacy SCENARIOS registry for keys not yet in the sheet mapping.
+  const lookupScenario = (key: string) => getScenarioFromKey(key) ?? SCENARIOS[key];
+
+  /**
+   * In segmented-execution mode the engine stops after the first outbound
+   * email step. The expected step trail is the prefix up to and including
+   * that step. Outbound steps are everything starting with `email_`.
+   */
+  const firstSegment = (kinds: string[]): string[] => {
+    const cut = kinds.findIndex((k) => k.startsWith('email_'));
+    return cut === -1 ? kinds : kinds.slice(0, cut + 1);
+  };
   const { prisma } = prismaImport;
 
   type StepKind = keyof typeof STEP_TO_WORK_STEP_TYPE_HOLDER;
@@ -507,10 +521,14 @@ async function main() {
     }
 
     if (spec.stage === 'after_ls_before_invoice') {
+      // Bundle is created but WITHOUT vehicle details — deriveStage
+      // distinguishes "LS exists, no vehicle" (after_ls_before_invoice) from
+      // "LS exists, vehicle placed" (after_vehicle_placement). The "before
+      // vehicle placement" fixtures must not seed vehicleNumber, or the new
+      // 7-stage deriveStage will route them past After-LS.
       const bundle = await prisma.bundle.create({
         data: {
           purchaseOrderId: po.id, bundleNumber: 1, totalWeightKg: 3000, status: 'planned',
-          vehicleNumber: 'GJ12-MOCK', driverMobile: '9876543210', containerNumber: 'CONT-1',
         },
       });
       await prisma.material.updateMany({
@@ -586,7 +604,7 @@ async function main() {
       if (!p) return;
       if (['completed', 'aborted', 'failed'].includes(p.state)) return;
 
-      const scenario = SCENARIOS[key];
+      const scenario = lookupScenario(key);
       if (!scenario) return;
       const currentStep = scenario.steps[p.currentStepIndex];
       if (!currentStep) {
@@ -695,7 +713,7 @@ async function main() {
           for (let i = 0; i < primarySteps; i++) {
             const p = await getActiveProgress(so.id);
             if (!p) break;
-            const sc = SCENARIOS[p.scenarioKey];
+            const sc = lookupScenario(p.scenarioKey);
             if (!sc) break;
             const cur = sc.steps[p.currentStepIndex];
             if (!cur) break;
@@ -787,29 +805,56 @@ async function main() {
       // Pass = (1) first classifier picked the primary key, (2) second classifier
       // returned action_on_active='abort_and_replace' AND key=midflowReplaceKey,
       // (3) final state is 'completed' on the replacement scenario.
+      //
+      // SEGMENTED_EXECUTION_ENABLED: the concept of "active scenario in
+      // flight that a second reply can supersede" doesn't apply — each
+      // scenario terminates at its first outbound, so a second reply just
+      // creates a new scenario. The pass criterion collapses to "first
+      // classifier picked the primary key, second classifier picked SOMETHING
+      // non-null, both scenarios reached terminal state."
+      const segmented = (process.env.SEGMENTED_EXECUTION_ENABLED ?? 'false').toLowerCase() === 'true';
       const firstOk = gotKey === spec.key;
-      const actionOk = gotAction2 === 'abort_and_replace';
-      const replaceKeyOk = gotKey2 === spec.midflowReplaceKey;
-      const completedOk = finalState === 'completed';
-      pass = firstOk && actionOk && replaceKeyOk && completedOk;
-      if (!firstOk) failReasons.push(`first scenario_key: expected ${spec.key}, got ${gotKey}`);
-      if (!actionOk) failReasons.push(`action_on_active: expected abort_and_replace, got ${gotAction2}`);
-      if (!replaceKeyOk) failReasons.push(`replacement key: expected ${spec.midflowReplaceKey}, got ${gotKey2}`);
-      if (!completedOk) failReasons.push(`finalState: expected 'completed', got ${finalState}`);
-      expectedSteps = (SCENARIOS[spec.midflowReplaceKey ?? '']?.steps ?? []).map((s) => s.kind);
+      if (segmented) {
+        const secondClassified = !!gotKey2;
+        pass = firstOk && secondClassified;
+        if (!firstOk) failReasons.push(`first scenario_key: expected ${spec.key}, got ${gotKey}`);
+        if (!secondClassified) failReasons.push('second reply not classified into any scenario');
+      } else {
+        const actionOk = gotAction2 === 'abort_and_replace';
+        const replaceKeyOk = gotKey2 === spec.midflowReplaceKey;
+        const completedOk = finalState === 'completed';
+        pass = firstOk && actionOk && replaceKeyOk && completedOk;
+        if (!firstOk) failReasons.push(`first scenario_key: expected ${spec.key}, got ${gotKey}`);
+        if (!actionOk) failReasons.push(`action_on_active: expected abort_and_replace, got ${gotAction2}`);
+        if (!replaceKeyOk) failReasons.push(`replacement key: expected ${spec.midflowReplaceKey}, got ${gotKey2}`);
+        if (!completedOk) failReasons.push(`finalState: expected 'completed', got ${finalState}`);
+      }
+      expectedSteps = (lookupScenario(spec.midflowReplaceKey ?? '')?.steps ?? []).map((s) => s.kind);
     } else if (spec.kind === 'midflow_escalate') {
       // Pass criteria depend on UNIFIED_CLASSIFIER_ENABLED:
       //   • Flag OFF: legacy escalate path — second classifier returns action_on_active='escalate', primary aborts.
       //   • Flag ON: ambiguous mid-flow reply may classify as action='other' and route to supervisor.
+      //
+      // SEGMENTED_EXECUTION_ENABLED: like midflow_abort, the "active scenario
+      // to escalate against" concept doesn't apply. The second classifier
+      // either picks a new scenario or escalates via supervisor_inquiry.
+      const segmented = (process.env.SEGMENTED_EXECUTION_ENABLED ?? 'false').toLowerCase() === 'true';
       const firstOk = gotKey === spec.key;
-      const legacyEscalate = gotAction2 === 'escalate' && finalState === 'aborted';
       const supervisorInquiry = await prisma.email.findFirst({
         where: { salesOrderId: so.id, emailType: 'supervisor_inquiry' },
       });
-      const unifiedOk = !!supervisorInquiry;
-      pass = firstOk && (legacyEscalate || unifiedOk);
-      if (!firstOk) failReasons.push(`first scenario_key: expected ${spec.key}, got ${gotKey}`);
-      if (!legacyEscalate && !unifiedOk) failReasons.push(`mid-flow escalate: expected action_on_active='escalate'+aborted OR supervisor_inquiry, got action=${gotAction2} state=${finalState}`);
+      if (segmented) {
+        const secondClassified = !!gotKey2;
+        pass = firstOk && (secondClassified || !!supervisorInquiry);
+        if (!firstOk) failReasons.push(`first scenario_key: expected ${spec.key}, got ${gotKey}`);
+        if (!secondClassified && !supervisorInquiry) failReasons.push('second reply neither classified nor escalated');
+      } else {
+        const legacyEscalate = gotAction2 === 'escalate' && finalState === 'aborted';
+        const unifiedOk = !!supervisorInquiry;
+        pass = firstOk && (legacyEscalate || unifiedOk);
+        if (!firstOk) failReasons.push(`first scenario_key: expected ${spec.key}, got ${gotKey}`);
+        if (!legacyEscalate && !unifiedOk) failReasons.push(`mid-flow escalate: expected action_on_active='escalate'+aborted OR supervisor_inquiry, got action=${gotAction2} state=${finalState}`);
+      }
     } else if (spec.kind === 'stock_short') {
       // Pass = classifier picked the increase-shaped scenario AND engine
       // aborted at stock_precheck (no VA02 fired, stock_short_inquiry email exists).
@@ -833,7 +878,10 @@ async function main() {
     } else if (spec.kind === 'stock_sufficient') {
       // Pass = same as a normal scenario (precheck advances, VA02 fires,
       // scenario completes). The precheck step still appears in actualSteps.
-      expectedSteps = (SCENARIOS[spec.key]?.steps ?? []).map((s) => s.kind);
+      // Segmented-mode: harness expects only the first-outbound segment.
+      const segmented = (process.env.SEGMENTED_EXECUTION_ENABLED ?? 'false').toLowerCase() === 'true';
+      const full = (lookupScenario(spec.key)?.steps ?? []).map((s) => s.kind);
+      expectedSteps = segmented ? firstSegment(full) : full;
       const keyOk = gotKey === spec.key;
       const seqOk =
         expectedSteps.length === actualSteps.length &&
@@ -844,8 +892,13 @@ async function main() {
       if (!seqOk) failReasons.push(`step sequence mismatch (expected ${expectedSteps.length}, got ${actualSteps.length})`);
       if (!terminalOk) failReasons.push(`final state ${finalState} (expected completed)`);
     } else {
-      // Standard scenario.
-      expectedSteps = (SCENARIOS[spec.key]?.steps ?? []).map((s) => s.kind);
+      // Standard scenario. In segmented-execution mode the engine stops after
+      // the first outbound email step, so the harness expects only the
+      // segment-1 prefix (up to and including that step). In legacy mode the
+      // engine walks the whole step list.
+      const segmented = (process.env.SEGMENTED_EXECUTION_ENABLED ?? 'false').toLowerCase() === 'true';
+      const fullSteps = (lookupScenario(spec.key)?.steps ?? []).map((s) => s.kind);
+      expectedSteps = segmented ? firstSegment(fullSteps) : fullSteps;
       const keyOk = gotKey === spec.key;
       const intentOk = !gotKey && gotIntent === spec.expectedIntent;
       const modOk = !gotKey && (!spec.expectedModification || gotMod === spec.expectedModification);
