@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import Hls from 'hls.js';
 import { WorkChat } from '@/components/work/WorkChat';
 import {
   Monitor,
@@ -198,8 +197,6 @@ export default function WorkPage() {
     }
   }, [logs, autoScroll]);
 
-  // HLS video ref
-  const videoRef = useRef<HTMLVideoElement>(null);
 
   // Fetch orders
   const fetchOrders = useCallback(async () => {
@@ -242,35 +239,8 @@ export default function WorkPage() {
     fetchOrders();
   }, [fetchOrders]);
 
-  // Initialize HLS video stream
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-
-    const hlsUrl = 'https://app.satorilabs.tech/hls/stream/index.m3u8';
-    let hls: Hls | null = null;
-
-    if (Hls.isSupported()) {
-      hls = new Hls();
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        video.play().catch(() => {});
-      });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Safari native HLS support
-      video.src = hlsUrl;
-      video.addEventListener('loadedmetadata', () => {
-        video.play().catch(() => {});
-      });
-    }
-
-    return () => {
-      if (hls) {
-        hls.destroy();
-      }
-    };
-  }, [showVmScreen, activeTab]);
+  // Agent screen is now an iframe pointing at AGENT_SCREEN_URL — no HLS init needed.
+  const AGENT_SCREEN_URL = 'http://20.244.42.146:8080/';
 
   const handleUpdateTitle = (sessionId: string, newTitle: string) => {
     if (chat && chat.id === sessionId) {
@@ -1203,12 +1173,11 @@ export default function WorkPage() {
                     maxWidth: '1400px',
                   }}
                 >
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    muted
-                    playsInline
-                    style={{ width: '100%', height: '650px', objectFit: 'contain', background: '#0f172a' }}
+                  <iframe
+                    src={AGENT_SCREEN_URL}
+                    title="Agent Screen"
+                    style={{ width: '100%', height: '650px', border: 0, background: '#0f172a' }}
+                    allow="autoplay; fullscreen"
                   />
                 </div>
 
