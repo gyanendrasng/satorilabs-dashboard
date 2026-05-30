@@ -1304,14 +1304,24 @@ async function fireStep(
 
     // -------- SAP transactions --------
     case 'va02': {
+      // VA02 in SAP changes the order quantity to a new (typically larger)
+      // value. We only run it for materials whose quantity is being INCREASED.
+      //   - decreases   → handled at LS time via ZLOAD2 (post-LS) or by the
+      //                   release-plan dispatching less than the order qty
+      //                   (pre-LS); no VA02 needed.
+      //   - deletes     → handled by dropping the material from the release
+      //                   plan / dispatching qty = 0; no VA02 needed.
+      // Running VA02 for a decrease/delete would push wrong (or zero)
+      // quantities into SAP, so filter those out here.
       const soNumber = await soNumberFor(progress.salesOrderId);
       const items = classification.materials
-        .filter((m) => m.operation === 'increase' || m.operation === 'decrease')
+        .filter((m) => m.operation === 'increase')
         .map((m) => ({ material: m.material_code, orderQuantity: m.quantity ?? 0 }));
       if (items.length === 0) {
-        log('[ENGINE] va02 step has no inc/dec materials in classifier output — skipping');
+        log('[ENGINE] va02 step has no increase materials in classifier output — skipping');
         return 'advance_now';
       }
+      log(`[ENGINE] va02 firing for ${items.length} increase line(s): ${items.map((i) => `${i.material}→${i.orderQuantity}`).join(', ')}`);
       await triggerVa02(soNumber, items);
       await markAwaitingCallback(progress.id);
       return 'pause';
