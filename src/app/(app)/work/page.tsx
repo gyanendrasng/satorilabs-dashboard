@@ -239,8 +239,58 @@ export default function WorkPage() {
     fetchOrders();
   }, [fetchOrders]);
 
-  // Agent screen is now an iframe pointing at AGENT_SCREEN_URL — no HLS init needed.
-  const AGENT_SCREEN_URL = 'http://20.244.42.146:8080/';
+  // Agent screen: connect directly to the auto_gui2 live-view's /video WebSocket
+  // and render each JPEG frame into an <img>. Skips the source page's toolbar
+  // and right-side logs panel — we have our own Logs tab.
+  const AGENT_SCREEN_HOST = '20.244.42.146:8080';
+  const agentImgRef = useRef<HTMLImageElement>(null);
+  const [agentFps, setAgentFps] = useState<number | null>(null);
+  const [agentStatus, setAgentStatus] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
+
+  useEffect(() => {
+    if (activeTab !== 'screen' || !showVmScreen) return;
+    let ws: WebSocket | null = null;
+    let prevUrl: string | null = null;
+    let frames = 0;
+    let lastReport = Date.now();
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+
+    const connect = () => {
+      ws = new WebSocket(`ws://${AGENT_SCREEN_HOST}/video`);
+      ws.binaryType = 'blob';
+      ws.onopen = () => setAgentStatus('live');
+      ws.onmessage = (e) => {
+        const img = agentImgRef.current;
+        if (!img) return;
+        const url = URL.createObjectURL(e.data as Blob);
+        const old = prevUrl;
+        img.onload = () => { if (old) URL.revokeObjectURL(old); };
+        img.src = url;
+        prevUrl = url;
+        frames++;
+        const now = Date.now();
+        if (now - lastReport >= 1000) {
+          setAgentFps(frames);
+          frames = 0;
+          lastReport = now;
+        }
+      };
+      ws.onclose = () => {
+        if (closed) return;
+        setAgentStatus('reconnecting');
+        reconnectTimer = setTimeout(connect, 1500);
+      };
+    };
+    connect();
+
+    return () => {
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+      if (prevUrl) URL.revokeObjectURL(prevUrl);
+    };
+  }, [activeTab, showVmScreen]);
 
   const handleUpdateTitle = (sessionId: string, newTitle: string) => {
     if (chat && chat.id === sessionId) {
@@ -1173,12 +1223,16 @@ export default function WorkPage() {
                     maxWidth: '1400px',
                   }}
                 >
-                  <iframe
-                    src={AGENT_SCREEN_URL}
-                    title="Agent Screen"
-                    style={{ width: '100%', height: '650px', border: 0, background: '#0f172a' }}
-                    allow="autoplay; fullscreen"
-                  />
+                  <div style={{ position: 'relative', width: '100%', height: '650px', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
+                    <img
+                      ref={agentImgRef}
+                      alt="Agent screen"
+                      style={{ maxWidth: '100%', maxHeight: '100%', userSelect: 'none', pointerEvents: 'none' }}
+                    />
+                    <div style={{ position: 'absolute', top: 10, left: 10, background: 'rgba(0,0,0,0.7)', padding: '4px 10px', borderRadius: 6, fontSize: 12, color: '#ddd' }}>
+                      {agentStatus === 'live' && agentFps != null ? `live · ${agentFps} fps` : agentStatus}
+                    </div>
+                  </div>
                 </div>
 
                 <div className="mt-4 flex items-center justify-center gap-3 text-sm text-slate-400">
