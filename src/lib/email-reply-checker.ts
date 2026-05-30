@@ -569,7 +569,7 @@ export async function checkForNewEmails(): Promise<{
           continue;
         }
 
-        // Upsert Customer if we extracted an id; auto-create with generic name + default 45t capacity.
+        // Upsert Customer if we extracted an id; auto-create with generic name + default 35t capacity.
         let customer: { id: string; name: string } | null = null;
         if (customerId) {
           const existing = await prisma.customer.findUnique({ where: { id: customerId } });
@@ -581,7 +581,7 @@ export async function checkForNewEmails(): Promise<{
               data: { id: customerId, name: `Customer ${count + 1}` },
             });
             customer = { id: created.id, name: created.name };
-            log(`[NewEmail] Created new Customer ${customerId} ("${created.name}", default 45 tonne capacity)`);
+            log(`[NewEmail] Created new Customer ${customerId} ("${created.name}", default 35 tonne capacity)`);
           }
         }
 

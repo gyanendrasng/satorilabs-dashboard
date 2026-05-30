@@ -72,7 +72,7 @@ export function buildDispatchApprovalHtml(
   poNumber: string,
   sections: DispatchSoSection[],
   // capacity is accepted for API compatibility but no longer rendered (no form)
-  _capacityTonnes: number = 31,
+  _capacityTonnes: number = 35,
   _formUrl?: string
 ): string {
   void _capacityTonnes;

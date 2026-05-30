@@ -111,7 +111,7 @@ export function packMaterialsIntoBundles(
  * any LS is created.
  *
  * Per-Material weight = (dispatchQuantity / orderQuantity) * orderWeightKg.
- * Capacity = Customer.weightage * 1000 kg (defaults to 31000 if missing or
+ * Capacity = Customer.weightage * 1000 kg (defaults to 35000 if missing or
  * non-positive). Bin packing delegated to `packMaterialsIntoBundles` —
  * material-grouping is enforced there.
  *
@@ -131,10 +131,10 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
   if (!po) throw new Error(`PurchaseOrder ${purchaseOrderId} not found`);
 
   const rawWeightage = po.customer?.weightage ? Number(po.customer.weightage) : 0;
-  const weightageT = rawWeightage > 0 ? rawWeightage : 31;
+  const weightageT = rawWeightage > 0 ? rawWeightage : 35;
   if (rawWeightage <= 0) {
     console.warn(
-      `[Bundler] PO ${po.poNumber}: customer weightage missing/zero, defaulting to 31 t per truck`
+      `[Bundler] PO ${po.poNumber}: customer weightage missing/zero, defaulting to 35 t per truck`
     );
   }
   const capacityKg = weightageT * 1000;
