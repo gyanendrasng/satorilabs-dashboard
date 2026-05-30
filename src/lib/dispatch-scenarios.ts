@@ -7,7 +7,7 @@
  * its `steps` one external event at a time (SAP /step-status callback, email
  * reply, plant invoice arrival, VT01N UI click).
  *
- * Each row in Intent Classification.xlsx (in-scope subset) maps to one entry
+ * Each row in Intent_Classification.xlsx (in-scope subset) maps to one entry
  * in SCENARIOS. The trigger-mapping table in the plan documents the StepKind
  * → existing trigger function correspondence.
  */

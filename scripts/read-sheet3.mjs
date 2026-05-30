@@ -1,6 +1,6 @@
 import XLSX from 'xlsx';
 
-const wb = XLSX.readFile('/Users/apple/Documents/personal/satorilabs-dashboard/Intent Classification.xlsx');
+const wb = XLSX.readFile('/Users/apple/Documents/personal/satorilabs-dashboard/Intent_Classification.xlsx');
 const ws = wb.Sheets['Sheet3'];
 if (!ws) {
   console.error('Sheet3 not found. Available:', wb.SheetNames);

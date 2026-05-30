@@ -122,7 +122,7 @@ Two systems sit behind the dashboard:
 
 ## 3. The scenario engine — why it exists
 
-The happy path above works fine for a clean "yes, ship everything" reply. But the spreadsheet `Intent Classification.xlsx` describes **22 distinct scenarios** that can arise based on who sends what, when. Examples:
+The happy path above works fine for a clean "yes, ship everything" reply. But the spreadsheet `Intent_Classification.xlsx` describes **22 distinct scenarios** that can arise based on who sends what, when. Examples:
 
 - "Branch increases qty on material X before LS is created" → VA02 → re-visibility → ZLOAD1
 - "Plant says we only have 98 of Y" (after LS) → ZLOAD2 (revise LS qty)

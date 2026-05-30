@@ -1,6 +1,6 @@
 /**
  * Adapter: maps internal scenario keys (`branch|before_ls|modify|increase`)
- * to sheet rows in `Intent Classification.xlsx` Sheet3, and converts a sheet
+ * to sheet rows in `Intent_Classification.xlsx` Sheet3, and converts a sheet
  * row into the engine's internal Scenario shape.
  *
  * Goal: the engine's step lists come from the sheet at runtime, not from a

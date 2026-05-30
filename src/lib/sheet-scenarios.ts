@@ -1,5 +1,5 @@
 /**
- * Parses Sheet3 of `Intent Classification.xlsx` at module load and exposes
+ * Parses Sheet3 of `Intent_Classification.xlsx` at module load and exposes
  * a queryable registry of (Email Type, Stage, Primary Intent) → step list.
  *
  * The sheet is the **source of truth** for what to do when each kind of
@@ -54,7 +54,7 @@ export interface SheetRow {
   enabledSteps: SheetStep[];
 }
 
-const SHEET_FILE = path.join(process.cwd(), 'Intent Classification.xlsx');
+const SHEET_FILE = path.join(process.cwd(), 'Intent_Classification.xlsx');
 const SHEET_NAME = 'Sheet3';
 const META_COLS = 4; // A..D — Email Type / Stage / Primary Intent / Augmented Intent
 
