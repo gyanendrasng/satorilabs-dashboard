@@ -31,6 +31,7 @@ import {
   ScrollText,
   Trash2,
   ArrowDown,
+  ListChecks,
 } from 'lucide-react';
 import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, groupItemsByLsNumber } from '@/components/orders/types';
 
@@ -53,7 +54,24 @@ interface WorkSession {
 
 export default function WorkPage() {
   // Active tab state
-  const [activeTab, setActiveTab] = useState<'hierarchy' | 'chat' | 'screen' | 'logs'>('hierarchy');
+  const [activeTab, setActiveTab] = useState<'hierarchy' | 'chat' | 'screen' | 'queue' | 'logs'>('hierarchy');
+
+  // Work queue state
+  interface QueueItem {
+    id: string;
+    step: string;
+    state: string;
+    soNumber: string | null;
+    attemptCount: number;
+    error: string | null;
+    createdAt: string;
+    startedAt: string | null;
+    finishedAt: string | null;
+    cancellable: boolean;
+  }
+  const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
+  const [queueLoading, setQueueLoading] = useState(true);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
 
   // Chat state
   const [chat, setChat] = useState<WorkSession | null>(null);
@@ -217,6 +235,42 @@ export default function WorkPage() {
       setOrdersLoading(false);
     }
   }, []);
+
+  const fetchQueue = useCallback(async () => {
+    try {
+      const res = await fetch('/backend/work-queue');
+      const data = await res.json();
+      if (Array.isArray(data.items)) setQueueItems(data.items);
+    } catch (err) {
+      console.error('Failed to fetch work queue:', err);
+    } finally {
+      setQueueLoading(false);
+    }
+  }, []);
+
+  const cancelQueueItem = useCallback(async (id: string) => {
+    setCancellingId(id);
+    try {
+      const res = await fetch(`/backend/work-queue/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || 'Could not cancel — it may already be running.');
+      }
+    } catch (err) {
+      console.error('Failed to cancel work item:', err);
+    } finally {
+      setCancellingId(null);
+      fetchQueue();
+    }
+  }, [fetchQueue]);
+
+  // Poll the work queue while the Queue tab is open.
+  useEffect(() => {
+    if (activeTab !== 'queue') return;
+    fetchQueue();
+    const interval = setInterval(fetchQueue, 3000);
+    return () => clearInterval(interval);
+  }, [activeTab, fetchQueue]);
 
   // Fetch work chat
   useEffect(() => {
@@ -726,6 +780,22 @@ export default function WorkPage() {
               <Monitor className="w-4 h-4" />
               <span className="font-medium">Agent Screen</span>
               <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
+            </button>
+            <button
+              onClick={() => setActiveTab('queue')}
+              className={`px-4 py-2 flex items-center gap-2 border-b-2 transition-colors ${
+                activeTab === 'queue'
+                  ? 'border-cyan-500 text-cyan-400 bg-slate-700/30'
+                  : 'border-transparent text-slate-400 hover:text-slate-300'
+              }`}
+            >
+              <ListChecks className="w-4 h-4" />
+              <span className="font-medium">Work Queue</span>
+              {queueItems.some((i) => i.state === 'queued' || i.state === 'firing') && (
+                <span className="text-xs px-1.5 py-0.5 bg-cyan-900/50 text-cyan-300 rounded-full">
+                  {queueItems.filter((i) => i.state === 'queued' || i.state === 'firing').length}
+                </span>
+              )}
             </button>
             <button
               onClick={() => setActiveTab('logs')}
@@ -1239,6 +1309,113 @@ export default function WorkPage() {
         )}
 
         {/* Logs Tab */}
+        {activeTab === 'queue' && (
+          <div
+            className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl flex flex-col"
+            style={{ height: 'calc(100vh - 200px)' }}
+          >
+            {/* Queue Header */}
+            <div className="flex items-center justify-between p-4 border-b border-slate-700">
+              <div className="flex items-center gap-3">
+                <ListChecks className="w-5 h-5 text-cyan-400" />
+                <div>
+                  <h2 className="font-semibold text-lg">Work Queue</h2>
+                  <p className="text-xs text-slate-400">
+                    Queued items can be cancelled. Items already firing are being worked on.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={fetchQueue}
+                className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-slate-400 hover:text-cyan-400"
+                title="Refresh"
+              >
+                <RotateCcw className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Queue Items */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-2">
+              {queueLoading ? (
+                <div className="flex items-center justify-center h-full text-slate-500">
+                  <Loader2 className="w-6 h-6 animate-spin" />
+                </div>
+              ) : queueItems.length === 0 ? (
+                <div className="flex items-center justify-center h-full text-slate-500">
+                  <div className="text-center">
+                    <ListChecks className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                    <p>Queue is empty</p>
+                  </div>
+                </div>
+              ) : (
+                queueItems.map((item) => {
+                  const stateStyle: Record<string, { dot: string; label: string; text: string }> = {
+                    queued:    { dot: 'bg-yellow-500 animate-pulse', label: 'Queued', text: 'text-yellow-300' },
+                    firing:    { dot: 'bg-cyan-500 animate-pulse', label: 'Working…', text: 'text-cyan-300' },
+                    done:      { dot: 'bg-emerald-500', label: 'Done', text: 'text-emerald-300' },
+                    failed:    { dot: 'bg-red-500', label: 'Failed', text: 'text-red-300' },
+                    cancelled: { dot: 'bg-slate-500', label: 'Cancelled', text: 'text-slate-400' },
+                  };
+                  const style = stateStyle[item.state] || stateStyle.queued;
+                  const isInactive = item.state === 'done' || item.state === 'cancelled';
+                  return (
+                    <div
+                      key={item.id}
+                      className={`flex items-center gap-3 px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/40 ${
+                        isInactive ? 'opacity-60' : ''
+                      }`}
+                    >
+                      <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${style.dot}`} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-sm font-medium">{item.step}</span>
+                          {item.soNumber && (
+                            <span className="text-xs px-1.5 py-0.5 bg-slate-700 rounded text-slate-300">
+                              SO {item.soNumber}
+                            </span>
+                          )}
+                          {item.attemptCount > 0 && (
+                            <span className="text-xs text-amber-400">retry {item.attemptCount}</span>
+                          )}
+                        </div>
+                        {item.error && (
+                          <p className="text-xs text-red-400 mt-0.5 truncate" title={item.error}>
+                            {item.error}
+                          </p>
+                        )}
+                      </div>
+                      <span className={`text-xs font-medium flex-shrink-0 ${style.text}`}>{style.label}</span>
+                      {item.cancellable ? (
+                        <button
+                          onClick={() => cancelQueueItem(item.id)}
+                          disabled={cancellingId === item.id}
+                          className="flex items-center gap-1 px-2.5 py-1.5 text-xs rounded-lg bg-red-900/40 hover:bg-red-900/70 text-red-300 hover:text-red-200 transition-colors disabled:opacity-50 flex-shrink-0"
+                          title="Cancel this queued item"
+                        >
+                          {cancellingId === item.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <X className="w-3.5 h-3.5" />
+                          )}
+                          Cancel
+                        </button>
+                      ) : item.state === 'firing' ? (
+                        <span
+                          className="flex items-center gap-1 px-2.5 py-1.5 text-xs rounded-lg bg-slate-700/50 text-slate-500 flex-shrink-0 cursor-not-allowed"
+                          title="Already running — cannot be cancelled"
+                        >
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          In progress
+                        </span>
+                      ) : null}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
         {activeTab === 'logs' && (
           <div
             className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl flex flex-col"
