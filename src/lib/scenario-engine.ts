@@ -59,6 +59,18 @@ export function isUnifiedClassifierEnabled(): boolean {
   return (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
 }
 
+/**
+ * Phase F (segmented execution). When true, each scenario walks until the
+ * first outbound email then marks itself `completed`. Subsequent inbound
+ * emails re-enter handleReplyV2 → classifyReply to pick a new sheet row.
+ *
+ * Defaults to false — preserves the legacy multi-segment behavior where one
+ * scenario row runs to the end with multiple `awaiting_reply` pauses.
+ */
+export function isSegmentedExecutionEnabled(): boolean {
+  return (process.env.SEGMENTED_EXECUTION_ENABLED ?? 'false').toLowerCase() === 'true';
+}
+
 // -----------------------------------------------------------------------------
 // Plant-reply classifier — same shape as classifyBranchReply but tighter prompt.
 // Plants only send `modify` (a quantity correction) or an invoice PDF.
@@ -174,6 +186,219 @@ export async function sendSecondReleaseEmail(args: {
   }
 
   log(`[2ndRelease] Sent for SO ${so.soNumber} (${lines.length} change(s))`);
+  return sent;
+}
+
+// -----------------------------------------------------------------------------
+// Order-status auto-reply — R9 "Seeking Order Update"
+// -----------------------------------------------------------------------------
+
+/**
+ * Send a compact status reply to the branch summarizing the SO's current
+ * workflow position. Reuses the same `renderAuditTrailForSO` timeline we feed
+ * the classifier — recent events are usually what the branch is asking about
+ * ("Has the LS been created? Has the truck left?"). Stays in-thread when
+ * possible so the branch sees the answer threaded under their question.
+ */
+export async function sendOrderStatusEmail(args: {
+  salesOrderId: string;
+  threadAnchor: { gmailThreadId: string | null; gmailMessageId: string | null } | null;
+  log: (msg: string) => void;
+}): Promise<{ messageId: string; threadId: string } | null> {
+  const { salesOrderId, threadAnchor, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log('[OrderStatus] BRANCH_EMAIL not configured — skipping');
+    return null;
+  }
+
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: salesOrderId },
+    select: { soNumber: true, purchaseOrderId: true, status: true },
+  });
+  if (!so) {
+    log(`[OrderStatus] SO ${salesOrderId} not found`);
+    return null;
+  }
+
+  const { renderAuditTrailForSO } = await import('./audit-trail');
+  const timeline = await renderAuditTrailForSO({ salesOrderId, maxEvents: 20 });
+
+  const body = [
+    `Hi,`,
+    ``,
+    `Current status for SO ${so.soNumber}: ${so.status ?? 'in-progress'}`,
+    ``,
+    `Recent activity:`,
+    timeline || '  (no recorded events yet)',
+    ``,
+    `Let us know if you need anything else.`,
+  ].join('\n');
+
+  const subject = `Order status — SO ${so.soNumber}`;
+
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (threadAnchor?.gmailThreadId && threadAnchor.gmailMessageId) {
+      const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
+      if (rfc822Id) {
+        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
+      } else {
+        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      }
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[OrderStatus] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  await prisma.email.create({
+    data: {
+      salesOrderId,
+      purchaseOrderId: so.purchaseOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'order_status',
+      workflowState: 'completed',
+      sentBody: body,
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    await emitEvent({
+      salesOrderId,
+      type: 'email_sent',
+      payload: {
+        emailType: 'order_status',
+        recipient: BRANCH_EMAIL,
+        subject,
+        body_excerpt: body.slice(0, 200),
+        gmailMessageId: sent.messageId,
+      },
+    });
+  } catch {
+    // Event emission must never break the primary flow.
+  }
+
+  log(`[OrderStatus] Sent for SO ${so.soNumber}`);
+  return sent;
+}
+
+// -----------------------------------------------------------------------------
+// Plant-change notification — R46-R51 "Email to Branch notifying plant change"
+// -----------------------------------------------------------------------------
+
+/**
+ * Plant proposed a modification (R46-R51 LS Modification flow). Before we
+ * actually apply it in SAP we tell the branch what the plant wants and wait
+ * for their ack. The branch ack arrives as a fresh inbound that the
+ * classifier picks up as a separate scenario row.
+ *
+ * Generic template — the user can iterate on the wording later once they
+ * see how branches respond.
+ */
+export async function sendPlantChangeNotificationEmail(args: {
+  salesOrderId: string;
+  modifications: BranchReplyIntent['materials'];
+  threadAnchor: { gmailThreadId: string | null; gmailMessageId: string | null } | null;
+  log: (msg: string) => void;
+}): Promise<{ messageId: string; threadId: string } | null> {
+  const { salesOrderId, modifications, threadAnchor, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log('[PlantChangeNotify] BRANCH_EMAIL not configured — skipping');
+    return null;
+  }
+
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: salesOrderId },
+    select: { soNumber: true, purchaseOrderId: true },
+  });
+  if (!so) {
+    log(`[PlantChangeNotify] SO ${salesOrderId} not found`);
+    return null;
+  }
+
+  const lines = (modifications ?? [])
+    .filter((m) => m.operation && m.operation !== 'keep')
+    .map((m) => {
+      const op = m.operation ?? 'keep';
+      const qty = m.quantity ?? 0;
+      if (op === 'delete') return `  - Plant wants to delete material ${m.material_code}`;
+      return `  - Plant wants to ${op === 'increase' ? 'increase' : 'decrease'} ${m.material_code} → ${qty}`;
+    });
+
+  const body = [
+    `Hi,`,
+    ``,
+    `The plant has proposed the following changes to SO ${so.soNumber}:`,
+    ``,
+    ...(lines.length > 0 ? lines : ['  (no specific line changes captured — see plant email for details)']),
+    ``,
+    `Please confirm whether to proceed with the plant's proposal (reply "yes" to accept).`,
+    ``,
+    `Thanks.`,
+  ].join('\n');
+
+  const subject = `Plant-proposed change — SO ${so.soNumber}`;
+
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (threadAnchor?.gmailThreadId && threadAnchor.gmailMessageId) {
+      const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
+      if (rfc822Id) {
+        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
+      } else {
+        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      }
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[PlantChangeNotify] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  await prisma.email.create({
+    data: {
+      salesOrderId,
+      purchaseOrderId: so.purchaseOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'plant_change_notification',
+      workflowState: 'awaiting_branch_ack',
+      sentBody: body,
+      relatedMaterials: JSON.stringify({ version: 'plant-change-v1', modifications }),
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    await emitEvent({
+      salesOrderId,
+      type: 'email_sent',
+      payload: {
+        emailType: 'plant_change_notification',
+        recipient: BRANCH_EMAIL,
+        subject,
+        body_excerpt: body.slice(0, 200),
+        gmailMessageId: sent.messageId,
+      },
+    });
+  } catch {
+    // Event emission must never break the primary flow.
+  }
+
+  log(`[PlantChangeNotify] Sent for SO ${so.soNumber} (${lines.length} change(s))`);
   return sent;
 }
 
@@ -343,7 +568,11 @@ export async function handleReplyV2(args: {
   // Build active-scenario context for the selector if applicable.
   let activeScenarioContext: Parameters<ReplyClsModule['classifyReply']>[0]['activeScenario'] = null;
   if (activeProgress) {
-    const scenarioDef = SCENARIOS[activeProgress.scenarioKey];
+    // Sheet-driven lookup is now the source of truth for step lists;
+    // fall back to the in-code SCENARIOS registry as a safety net while
+    // mapping coverage is being expanded.
+    const { getScenarioFromKey } = await import('./sheet-scenario-adapter');
+    const scenarioDef = getScenarioFromKey(activeProgress.scenarioKey) ?? SCENARIOS[activeProgress.scenarioKey];
     if (scenarioDef) {
       const recentEvents = await getRecentEventsForSO({ salesOrderId: email.salesOrderId, limit: 30 });
       const stepsAlreadyExecuted = recentEvents
@@ -368,6 +597,8 @@ export async function handleReplyV2(args: {
   // Call the unified LLM classifier.
   let cls: ReplyCls;
   try {
+    const { renderAuditTrailForSO } = await import('./audit-trail');
+    const auditTrail = await renderAuditTrailForSO({ salesOrderId: email.salesOrderId }).catch(() => '');
     cls = await classifyReply({
       soNumber: email.salesOrder.soNumber,
       sender: args.sourceEmailType,
@@ -378,6 +609,7 @@ export async function handleReplyV2(args: {
       activeScenario: activeScenarioContext,
       triggerEmailType: email.emailType ?? null,
       gmailMessageId: email.gmailMessageId,
+      auditTrail,
     });
   } catch (err) {
     log(`[ENGINE] Classifier failed: ${err instanceof Error ? err.message : err}`);
@@ -511,7 +743,9 @@ export async function handleReplyV2(args: {
   }
 
   // (a) and (c continuation): create new ScenarioProgress and fire step 0
-  const scenario = SCENARIOS[selection.scenario_key];
+  // Sheet-driven step list with the in-code SCENARIOS registry as fallback.
+  const { getScenarioFromKey: getScenarioFromKeyForCreate } = await import('./sheet-scenario-adapter');
+  const scenario = getScenarioFromKeyForCreate(selection.scenario_key) ?? SCENARIOS[selection.scenario_key];
   if (!scenario) {
     // Shouldn't happen — the selector validated the key against validKeys.
     log(`[ENGINE] BUG: validated key ${selection.scenario_key} missing from SCENARIOS — escalating`);
@@ -562,10 +796,82 @@ export async function handleReplyV2(args: {
 
   log(`[ENGINE] handled — scenario=${scenario.key} (${scenario.steps.length} step(s))`);
 
+  // Anytime intents (R9 status_update, R11/R45 other) have NO step list — the
+  // sheet only marks them as "things you might receive at any stage". They map
+  // to dedicated handlers instead of the step walker.
+  if (scenario.key.includes('|anytime|')) {
+    await handleAnytimeIntent({
+      scenarioKey: scenario.key,
+      progressId: newProgress.id,
+      email,
+      log,
+    });
+    return { success: true, matched: true, logs };
+  }
+
   // Fire step 0.
   await executeScenario({ salesOrderId: email.salesOrderId, log });
 
   return { success: true, matched: true, logs };
+}
+
+/**
+ * Handle the three sheet-defined Anytime intents that have zero steps:
+ *  - branch|anytime|status_update|-  → reply with current SO status
+ *  - branch|anytime|other|-          → escalate to supervisor
+ *  - plant|anytime|other|-           → escalate to supervisor
+ *
+ * Each terminates the scenario immediately after the outbound action.
+ */
+async function handleAnytimeIntent(args: {
+  scenarioKey: string;
+  progressId: string;
+  email: { id: string; salesOrderId: string | null; gmailThreadId: string | null; gmailMessageId: string | null };
+  log: (m: string) => void;
+}): Promise<void> {
+  const { scenarioKey, progressId, email, log } = args;
+  const { emitEvent } = await import('./scenario-events');
+
+  if (!email.salesOrderId) {
+    log(`[ENGINE] Anytime intent ${scenarioKey} but no salesOrderId — marking failed`);
+    await prisma.scenarioProgress.update({
+      where: { id: progressId },
+      data: { state: 'failed', error: 'no salesOrderId for Anytime intent' },
+    });
+    return;
+  }
+
+  if (scenarioKey === 'branch|anytime|status_update|-') {
+    await sendOrderStatusEmail({
+      salesOrderId: email.salesOrderId,
+      threadAnchor: { gmailThreadId: email.gmailThreadId, gmailMessageId: email.gmailMessageId },
+      log,
+    });
+  } else if (scenarioKey === 'branch|anytime|other|-' || scenarioKey === 'plant|anytime|other|-') {
+    const { escalateToSupervisor } = await import('./supervisor-escalation');
+    const sender = scenarioKey === 'plant|anytime|other|-' ? 'plant' : 'branch';
+    await escalateToSupervisor({
+      salesOrderId: email.salesOrderId,
+      triggerEmailId: email.id,
+      description: `${sender} sent an email that did not match any known sheet intent`,
+      suggested_question_for_supervisor: `How should we respond to this ${sender} email? See thread for context.`,
+      reasoning: `Classifier picked the catch-all Anytime "${sender}" intent because none of the stage-specific intents matched.`,
+      log,
+    });
+  } else {
+    log(`[ENGINE] BUG: unknown Anytime scenarioKey ${scenarioKey}`);
+  }
+
+  await prisma.scenarioProgress.update({
+    where: { id: progressId },
+    data: { state: 'completed' },
+  });
+  await emitEvent({
+    salesOrderId: email.salesOrderId,
+    scenarioProgressId: progressId,
+    type: 'scenario_completed',
+    payload: { scenario_key: scenarioKey, step_count: 0, kind: 'anytime' },
+  });
 }
 
 // -----------------------------------------------------------------------------
@@ -750,7 +1056,9 @@ export async function executeScenario(args: {
     return;
   }
 
-  const scenario = SCENARIOS[progress.scenarioKey];
+  // Sheet-driven step list with the in-code SCENARIOS registry as fallback.
+  const { getScenarioFromKey: getScenarioFromKeyForExec } = await import('./sheet-scenario-adapter');
+  const scenario = getScenarioFromKeyForExec(progress.scenarioKey) ?? SCENARIOS[progress.scenarioKey];
   const { emitEvent } = await import('./scenario-events');
   if (!scenario) {
     log(`[ENGINE] Unknown scenarioKey ${progress.scenarioKey} — marking failed`);
@@ -800,17 +1108,51 @@ export async function executeScenario(args: {
     const next = await fireStep(step, progress, scenario, log);
     if (next === 'advance_now') {
       // No-op step — emit step_completed immediately, advance, and recurse.
+      const sapOutput = await collectSapOutputForStep(args.salesOrderId, step.kind);
       await emitEvent({
         salesOrderId: args.salesOrderId,
         scenarioProgressId: progress.id,
         type: 'step_completed',
-        payload: { step_index: progress.currentStepIndex, kind: step.kind, scenario_key: scenario.key },
+        payload: {
+          step_index: progress.currentStepIndex,
+          kind: step.kind,
+          scenario_key: scenario.key,
+          ...(sapOutput ? { sap_output: sapOutput } : {}),
+        },
       });
       await prisma.scenarioProgress.update({
         where: { id: progress.id },
         data: { currentStepIndex: progress.currentStepIndex + 1, state: 'ready' },
       });
       await executeScenario({ salesOrderId: args.salesOrderId, log });
+      return;
+    }
+    if (next === 'complete_segment') {
+      // Segmented execution: outbound email step fired, scenario terminates
+      // here. The next inbound email re-classifies and creates a new scenario.
+      const sapOutput = await collectSapOutputForStep(args.salesOrderId, step.kind);
+      await emitEvent({
+        salesOrderId: args.salesOrderId,
+        scenarioProgressId: progress.id,
+        type: 'step_completed',
+        payload: {
+          step_index: progress.currentStepIndex,
+          kind: step.kind,
+          scenario_key: scenario.key,
+          ...(sapOutput ? { sap_output: sapOutput } : {}),
+        },
+      });
+      await prisma.scenarioProgress.update({
+        where: { id: progress.id },
+        data: { currentStepIndex: progress.currentStepIndex + 1, state: 'completed' },
+      });
+      await emitEvent({
+        salesOrderId: args.salesOrderId,
+        scenarioProgressId: progress.id,
+        type: 'scenario_completed',
+        payload: { scenario_key: scenario.key, step_count: scenario.steps.length, kind: 'segment_boundary' },
+      });
+      log(`[ENGINE] Segment boundary on ${step.kind} — scenario ${scenario.key} marked completed (segmented mode)`);
       return;
     }
     // Otherwise the step set its own pause state inside fireStep.
@@ -836,7 +1178,7 @@ export async function executeScenario(args: {
 // waiting for an external callback.
 // -----------------------------------------------------------------------------
 
-type FireResult = 'pause' | 'advance_now';
+type FireResult = 'pause' | 'advance_now' | 'complete_segment';
 
 async function fireStep(
   step: Step,
@@ -1028,6 +1370,9 @@ async function fireStep(
     }
 
     // -------- existing email senders --------
+    // In segmented-execution mode (SEGMENTED_EXECUTION_ENABLED=true) each
+    // outbound email step marks the scenario `completed` and stops; the next
+    // inbound email re-classifies into a new sheet row.
     case 'email_confirm_product_details': {
       // This is the existing `ls_dispatch` email. If we're in a fresh
       // release_all/release_part scenario it should already be sent (it's
@@ -1035,12 +1380,14 @@ async function fireStep(
       // visibility, the /visibility-data callback will re-send it. Either
       // way the engine just waits for the branch reply.
       log('[ENGINE] email_confirm_product_details — relying on existing ls_dispatch send path');
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
 
     case 'email_confirm_bundle_details': {
       log('[ENGINE] email_confirm_bundle_details — relying on existing dispatch_confirmation send path');
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
@@ -1053,6 +1400,7 @@ async function fireStep(
       if (so?.purchaseOrderId) {
         await checkAndSendCombinedVehicleEmailForPo(so.purchaseOrderId);
       }
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
@@ -1062,7 +1410,9 @@ async function fireStep(
       // details land. For the engine's purposes this step is fire-and-forget:
       // we don't re-send here, we just advance (the email goes out from the
       // existing pipeline; the engine's role is to track the milestone).
+      // In segmented mode this is still a segment boundary (it's an outbound).
       log('[ENGINE] email_to_plant — existing pipeline sends LS to plant on vehicle reply');
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
       return 'advance_now';
     }
 
@@ -1080,8 +1430,50 @@ async function fireStep(
           : null,
         log,
       });
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
+    }
+
+    case 'email_to_branch_notifying_plant_change': {
+      // R46-R51 — branch needs to ack plant-proposed modifications before we
+      // touch SAP. The classification carries the plant's proposed materials.
+      const classBranch = classification as BranchReplyIntent;
+      const triggerEmail = await prisma.email.findUnique({
+        where: { id: (await loadProgress(progress.id)).triggerEmailId ?? '' },
+        select: { gmailThreadId: true, gmailMessageId: true },
+      }).catch(() => null);
+      await sendPlantChangeNotificationEmail({
+        salesOrderId: progress.salesOrderId,
+        modifications: classBranch?.materials ?? [],
+        threadAnchor: triggerEmail
+          ? { gmailThreadId: triggerEmail.gmailThreadId, gmailMessageId: triggerEmail.gmailMessageId }
+          : null,
+        log,
+      });
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      await markAwaitingReply(progress.id);
+      return 'pause';
+    }
+
+    case 'email_order_status': {
+      // R9 — Seeking Order Update auto-reply. Single-step Anytime intent; the
+      // handleAnytimeIntent path normally runs first and short-circuits before
+      // executeScenario. This case exists for completeness if a step list ever
+      // includes order_status directly.
+      const triggerEmail = await prisma.email.findUnique({
+        where: { id: (await loadProgress(progress.id)).triggerEmailId ?? '' },
+        select: { gmailThreadId: true, gmailMessageId: true },
+      }).catch(() => null);
+      await sendOrderStatusEmail({
+        salesOrderId: progress.salesOrderId,
+        threadAnchor: triggerEmail
+          ? { gmailThreadId: triggerEmail.gmailThreadId, gmailMessageId: triggerEmail.gmailMessageId }
+          : null,
+        log,
+      });
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'advance_now';
     }
 
     // -------- sentinels: pause until an existing pipeline reports back --------
@@ -1113,6 +1505,136 @@ async function fireStep(
 // advanceScenario / maybeAdvanceScenario — called by external events
 // -----------------------------------------------------------------------------
 
+/**
+ * Pull the SAP transaction's persisted output for a just-completed step so we
+ * can surface it in the `step_completed` audit event. Returns null when the
+ * step kind has no captured SAP output (email steps, sentinels, etc.) — the
+ * caller leaves `sap_output` off the payload in that case.
+ *
+ * Important: these reads are best-effort. If a DB lookup fails or the SAP
+ * fields are still null (race), we return null and the audit event still
+ * records the step as completed without the output blob.
+ */
+async function collectSapOutputForStep(
+  salesOrderId: string,
+  stepKind: StepKind,
+): Promise<Record<string, unknown> | null> {
+  try {
+    switch (stepKind) {
+      case 'zload1': {
+        // ZLOAD1 creates LoadingSlipItems. Surface the LS numbers + per-LSI
+        // material+quantity so the audit reads like "LS-12345 created with M-A=100".
+        const lsis = await prisma.loadingSlipItem.findMany({
+          where: { salesOrderId, lsNumber: { not: '' } },
+          select: { lsNumber: true, material: true, orderQuantity: true },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        });
+        if (lsis.length === 0) return null;
+        return {
+          ls_count: lsis.length,
+          loading_slips: lsis.map((l) => ({
+            ls: l.lsNumber,
+            material: l.material,
+            quantity: l.orderQuantity,
+          })),
+        };
+      }
+      case 'zload2':
+      case 'zloading_close': {
+        // Revised quantities live on LSI as well. Surface a compact summary.
+        const lsis = await prisma.loadingSlipItem.findMany({
+          where: { salesOrderId },
+          select: { lsNumber: true, material: true, orderQuantity: true, status: true },
+          orderBy: { updatedAt: 'desc' },
+          take: 10,
+        });
+        if (lsis.length === 0) return null;
+        return {
+          ls_count: lsis.length,
+          loading_slips: lsis.map((l) => ({
+            ls: l.lsNumber,
+            material: l.material,
+            quantity: l.orderQuantity,
+            status: l.status,
+          })),
+        };
+      }
+      case 'va02': {
+        // VA02 updates Material.dispatchQuantity. Surface the post-change values.
+        const mats = await prisma.material.findMany({
+          where: { salesOrderId },
+          select: { material: true, batch: true, orderQuantity: true, dispatchQuantity: true },
+          take: 10,
+        });
+        if (mats.length === 0) return null;
+        return {
+          materials: mats.map((m) => ({
+            material: m.material,
+            batch: m.batch,
+            ordered: m.orderQuantity,
+            dispatch: m.dispatchQuantity,
+          })),
+        };
+      }
+      case 'zso_visibility': {
+        // ZSO-VISIBILITY refreshes Material.availableStock. Surface the
+        // updated availability.
+        const mats = await prisma.material.findMany({
+          where: { salesOrderId },
+          select: { material: true, availableStock: true, orderQuantity: true },
+          take: 10,
+        });
+        if (mats.length === 0) return null;
+        return {
+          materials: mats.map((m) => ({
+            material: m.material,
+            ordered: m.orderQuantity,
+            available: m.availableStock,
+          })),
+        };
+      }
+      case 'await_plant_invoice': {
+        // ZLOAD3+ZSO_Auto creates the Invoice row. Surface its identifiers.
+        const inv = await prisma.invoice.findUnique({
+          where: { salesOrderId },
+          select: { invoiceNumber: true, obdNumber: true, amount: true },
+        });
+        if (!inv) return null;
+        return {
+          invoice_number: inv.invoiceNumber,
+          obd_number: inv.obdNumber,
+          amount: inv.amount?.toString() ?? null,
+        };
+      }
+      case 'await_vt01n': {
+        // VT01N creates Shipment rows. Surface their statuses.
+        const shipments = await prisma.shipment.findMany({
+          where: { salesOrderId },
+          select: { obdNumber: true, status: true, shipmentTriggeredAt: true },
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+        });
+        if (shipments.length === 0) return null;
+        return {
+          shipment_count: shipments.length,
+          shipments: shipments.map((s) => ({
+            obd: s.obdNumber,
+            status: s.status,
+            triggered_at: s.shipmentTriggeredAt?.toISOString() ?? null,
+          })),
+        };
+      }
+      default:
+        return null;
+    }
+  } catch {
+    // SAP-output capture is best-effort; never break the engine if a DB read
+    // throws. The step still emits step_completed without the output blob.
+    return null;
+  }
+}
+
 export async function advanceScenario(salesOrderId: string): Promise<void> {
   const progress = await prisma.scenarioProgress.findFirst({
     where: {
@@ -1123,7 +1645,9 @@ export async function advanceScenario(salesOrderId: string): Promise<void> {
   });
   if (!progress) return;
 
-  const scenario = SCENARIOS[progress.scenarioKey];
+  // Sheet-driven step list with legacy SCENARIOS as fallback.
+  const { getScenarioFromKey: getScenarioFromKeyForAdvanceLog } = await import('./sheet-scenario-adapter');
+  const scenario = getScenarioFromKeyForAdvanceLog(progress.scenarioKey) ?? SCENARIOS[progress.scenarioKey];
 
   // Emit step_completed for the step that just finished (the one at the
   // current index BEFORE we increment). This is the source-of-truth marker
@@ -1133,6 +1657,7 @@ export async function advanceScenario(salesOrderId: string): Promise<void> {
     const completedStep = scenario.steps[progress.currentStepIndex];
     if (completedStep) {
       const { emitEvent } = await import('./scenario-events');
+      const sapOutput = await collectSapOutputForStep(salesOrderId, completedStep.kind);
       await emitEvent({
         salesOrderId,
         scenarioProgressId: progress.id,
@@ -1141,6 +1666,7 @@ export async function advanceScenario(salesOrderId: string): Promise<void> {
           step_index: progress.currentStepIndex,
           kind: completedStep.kind,
           scenario_key: progress.scenarioKey,
+          ...(sapOutput ? { sap_output: sapOutput } : {}),
         },
       });
     }
@@ -1180,7 +1706,12 @@ export async function maybeAdvanceScenario(
   });
   if (!progress) return;
 
-  const scenario = SCENARIOS[progress.scenarioKey];
+  // Sheet-driven lookup with legacy SCENARIOS as fallback — same as other
+  // sites in this file. Without this, scenarios whose sheet step lists
+  // differ in length from the legacy registry would advance into undefined
+  // territory and stall.
+  const { getScenarioFromKey: getScenarioFromKeyForAdvance } = await import('./sheet-scenario-adapter');
+  const scenario = getScenarioFromKeyForAdvance(progress.scenarioKey) ?? SCENARIOS[progress.scenarioKey];
   if (!scenario) return;
 
   const currentStep = scenario.steps[progress.currentStepIndex];
