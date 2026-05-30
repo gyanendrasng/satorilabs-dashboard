@@ -2,6 +2,11 @@ import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
   /* config options here */
+  // xlsx uses dynamic `require('fs')` at runtime; Turbopack's bundling breaks
+  // that, causing XLSX.readFile to throw "Cannot access file <path>" even
+  // though the file exists. Keeping xlsx external to the server bundle lets it
+  // resolve Node's fs the normal way.
+  serverExternalPackages: ['xlsx'],
   eslint: {
     ignoreDuringBuilds: true,
   },
