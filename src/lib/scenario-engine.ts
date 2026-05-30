@@ -451,6 +451,34 @@ export async function handleSecondReleaseReply(
 
   if (intent === 'yes') {
     log(`[2ndRelease] Confirmed — advancing scenario for SO ${email.salesOrderId}`);
+    // In segmented mode the scenario row was marked `completed` when the
+    // email_2nd_release segment terminated, with `currentStepIndex`
+    // already pointing at the NEXT step. `advanceScenario()` only looks
+    // at non-terminal rows AND increments the index — both wrong here.
+    // Detect the parked-at-2nd_release case and resume by re-firing the
+    // current step directly.
+    if (isSegmentedExecutionEnabled()) {
+      const parked = await prisma.scenarioProgress.findFirst({
+        where: { salesOrderId: email.salesOrderId, state: 'completed' },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (parked) {
+        const { getScenarioFromKey } = await import('./sheet-scenario-adapter');
+        const scenarioDef = getScenarioFromKey(parked.scenarioKey) ?? SCENARIOS[parked.scenarioKey];
+        const lastStepIdx = parked.currentStepIndex - 1;
+        const lastStep = scenarioDef?.steps[lastStepIdx];
+        if (lastStep?.kind === 'email_2nd_release') {
+          await prisma.scenarioProgress.update({
+            where: { id: parked.id },
+            data: { state: 'ready' },
+          });
+          log(`[2ndRelease] Re-opened scenario ${parked.scenarioKey} — resuming at step ${parked.currentStepIndex}`);
+          // Fire the next step (currentStepIndex already points at it).
+          await executeScenario({ salesOrderId: email.salesOrderId });
+          return { success: true, logs };
+        }
+      }
+    }
     await advanceScenario(email.salesOrderId);
     return { success: true, logs };
   }
@@ -1374,19 +1402,163 @@ async function fireStep(
     // outbound email step marks the scenario `completed` and stops; the next
     // inbound email re-classifies into a new sheet row.
     case 'email_confirm_product_details': {
-      // This is the existing `ls_dispatch` email. If we're in a fresh
-      // release_all/release_part scenario it should already be sent (it's
-      // what triggered this whole flow). If we're post-VA02 and re-running
-      // visibility, the /visibility-data callback will re-send it. Either
-      // way the engine just waits for the branch reply.
-      log('[ENGINE] email_confirm_product_details — relying on existing ls_dispatch send path');
+      // This step represents "ls_dispatch email is/was sent and branch
+      // has replied". When the engine reaches it, one of two situations
+      // applies:
+      //
+      //   (a) Fresh scenario triggered by a branch reply on ls_dispatch
+      //       (release_all / release_part / modify_delete). The
+      //       ls_dispatch is already sent AND the reply is already in;
+      //       the step is a milestone, not a wait. Advance.
+      //
+      //   (b) Post-VA02 re-visibility (modify_increase / inc_dec / inc_del).
+      //       The /visibility-data callback re-sends ls_dispatch; we
+      //       genuinely need to wait for the branch's reply on the
+      //       re-sent email. Segment-complete here.
+      //
+      // Distinguish: if a sent ls_dispatch email already exists for the
+      // PO AND it has a reply (replyHtml/repliedAt set), case (a) — advance.
+      // Otherwise case (b) — segment-complete and wait.
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: progress.salesOrderId },
+        select: { purchaseOrderId: true },
+      });
+      const lsDispatch = so?.purchaseOrderId
+        ? await prisma.email.findFirst({
+            where: { purchaseOrderId: so.purchaseOrderId, emailType: 'ls_dispatch', status: 'sent' },
+            orderBy: { sentAt: 'desc' },
+            select: { id: true, replyHtml: true, repliedAt: true },
+          })
+        : null;
+      const alreadyReplied = !!(lsDispatch && (lsDispatch.replyHtml || lsDispatch.repliedAt));
+      if (alreadyReplied) {
+        log('[ENGINE] email_confirm_product_details — ls_dispatch already sent + replied; advancing');
+        return 'advance_now';
+      }
+      log('[ENGINE] email_confirm_product_details — waiting for branch reply on ls_dispatch');
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
 
     case 'email_confirm_bundle_details': {
-      log('[ENGINE] email_confirm_bundle_details — relying on existing dispatch_confirmation send path');
+      // Build the release plan from Material rows and send the
+      // dispatch_confirmation email. Previously this was a no-op stub that
+      // relied on the legacy `handleBranchReply` path to send the email
+      // — that path is bypassed when UNIFIED_CLASSIFIER_ENABLED is true,
+      // so without this the flow stalls (no email → no reply → no ZLOAD1).
+      const { sendDispatchConfirmationEmail } = await import('./auto-gui-trigger');
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: progress.salesOrderId },
+        select: { soNumber: true, purchaseOrderId: true },
+      });
+      if (!so?.purchaseOrderId) {
+        log('[ENGINE] email_confirm_bundle_details — no PO; segment-completing');
+        if (isSegmentedExecutionEnabled()) return 'complete_segment';
+        await markAwaitingReply(progress.id);
+        return 'pause';
+      }
+
+      // Idempotency: if a dispatch_confirmation is already sent for this
+      // PO, don't re-send. Lets this handler be safely re-entered if the
+      // scenario re-fires.
+      const alreadySent = await prisma.email.findFirst({
+        where: { purchaseOrderId: so.purchaseOrderId, emailType: 'dispatch_confirmation', status: 'sent' },
+        select: { id: true },
+      });
+      if (alreadySent) {
+        log(`[ENGINE] email_confirm_bundle_details — dispatch_confirmation already sent (${alreadySent.id}); segment-completing`);
+        if (isSegmentedExecutionEnabled()) return 'complete_segment';
+        await markAwaitingReply(progress.id);
+        return 'pause';
+      }
+
+      // Pull Material rows for the SO; pick the per-material quantity to
+      // dispatch from `dispatchQuantity` if the legacy planner set it,
+      // otherwise fall back to min(orderQuantity, availableStock) — the
+      // "release what's available" plan that matches release_all/release_part.
+      const materials = await prisma.material.findMany({
+        where: { salesOrderId: progress.salesOrderId },
+      });
+      const items = materials
+        .map((m) => {
+          const qty =
+            m.dispatchQuantity && m.dispatchQuantity > 0
+              ? m.dispatchQuantity
+              : Math.min(m.orderQuantity ?? 0, m.availableStock ?? 0);
+          return {
+            material_code: m.material,
+            batch: m.batch ?? '',
+            quantity: qty,
+            weight_kg: m.orderWeightKg ? Number(m.orderWeightKg) : 0,
+          };
+        })
+        .filter((it) => it.quantity > 0);
+
+      if (items.length === 0) {
+        log('[ENGINE] email_confirm_bundle_details — no items with qty>0; segment-completing without email');
+        if (isSegmentedExecutionEnabled()) return 'complete_segment';
+        await markAwaitingReply(progress.id);
+        return 'pause';
+      }
+
+      // Persist dispatchQuantity onto Material rows so downstream bundling
+      // (`computeBundlesForPo` inside sendDispatchConfirmationEmail) and
+      // `fanOutZload1ForPo` read from a stable source.
+      for (const m of materials) {
+        const qty =
+          m.dispatchQuantity && m.dispatchQuantity > 0
+            ? m.dispatchQuantity
+            : Math.min(m.orderQuantity ?? 0, m.availableStock ?? 0);
+        if (qty > 0 && m.dispatchQuantity !== qty) {
+          await prisma.material.update({ where: { id: m.id }, data: { dispatchQuantity: qty } });
+        }
+      }
+
+      const totalKg = items.reduce((s, it) => s + it.weight_kg, 0);
+      const poRow = await prisma.purchaseOrder.findUnique({
+        where: { id: so.purchaseOrderId },
+        select: { customer: { select: { weightage: true } } },
+      });
+      const capacityTonnes = poRow?.customer?.weightage ? Number(poRow.customer.weightage) : 45;
+
+      // Anchor in the scenario's trigger email so the dispatch_confirmation
+      // lands in the same Gmail thread (best-effort; falls back to a fresh
+      // thread if the trigger email is missing). The `progress` arg passed
+      // into fireStep is a subset of ScenarioProgress that doesn't include
+      // triggerEmailId — look it up directly.
+      const progressRow = await prisma.scenarioProgress.findUnique({
+        where: { id: progress.id },
+        select: { triggerEmailId: true },
+      });
+      const trigger = progressRow?.triggerEmailId
+        ? await prisma.email.findUnique({
+            where: { id: progressRow.triggerEmailId },
+            select: { gmailThreadId: true, gmailMessageId: true },
+          })
+        : null;
+
+      await sendDispatchConfirmationEmail({
+        purchaseOrderId: so.purchaseOrderId,
+        plans: [
+          {
+            soNumber: so.soNumber,
+            salesOrderId: progress.salesOrderId,
+            items,
+            totalWeightKg: totalKg,
+          },
+        ],
+        twoVehicles: false,
+        totalTonnes: totalKg / 1000,
+        capacityTonnes,
+        threadAnchor: {
+          gmailThreadId: trigger?.gmailThreadId ?? '',
+          gmailMessageId: trigger?.gmailMessageId ?? '',
+        },
+        log,
+      });
+
+      log(`[ENGINE] email_confirm_bundle_details — dispatch_confirmation sent (${items.length} item(s), ${(totalKg / 1000).toFixed(2)}t)`);
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';

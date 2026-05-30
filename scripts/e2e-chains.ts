@@ -216,11 +216,7 @@ interface ChainResult {
 function releaseAllTail(): ChainStep[] {
   return [
     {
-      description: '(driver fills engine gap) Synthesise dispatch_confirmation email',
-      action: { kind: 'synthesise_dispatch_confirmation' },
-    },
-    {
-      description: 'Wait for dispatch_confirmation outbound email',
+      description: 'Wait for dispatch_confirmation outbound email (sent by engine)',
       action: { kind: 'wait_for_email', emailType: 'dispatch_confirmation', timeoutMs: 15000 },
     },
     {
