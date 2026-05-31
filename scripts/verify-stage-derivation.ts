@@ -61,17 +61,25 @@ async function main(): Promise<void> {
       setup: async () => {},
     },
     {
-      label: 'LSI with fileUrl exists, no vehicle yet',
+      label: 'LoadingSlip with file exists, no vehicle yet',
       expect: 'after_ls_before_invoice',
       setup: async () => {
+        const ls = await prisma.loadingSlip.create({
+          data: {
+            lsNumber: 'LS-stage-1',
+            bundleId: ctx.bundleId,
+            salesOrderId: ctx.id,
+            plantEmail: 'test-plant@example.com',
+            fileUrl: 'r2://test/ls.pdf',
+          },
+        });
         await prisma.loadingSlipItem.create({
           data: {
             salesOrderId: ctx.id,
-            bundleId: ctx.bundleId,
+            loadingSlipId: ls.id,
             lsNumber: 'LS-stage-1',
             material: 'M-A',
             orderQuantity: 100,
-            fileUrl: 'r2://test/ls.pdf',
           },
         });
         await prisma.salesOrder.update({

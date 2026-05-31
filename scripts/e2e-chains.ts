@@ -672,22 +672,31 @@ async function executeAction(
             ...(poId ? [{ purchaseOrderId: poId, emailType: 'plant_ls', status: 'sent' }] : []),
           ],
         },
-        include: { loadingSlipItem: true },
+        include: {
+          loadingSlip: { select: { bundleId: true } },
+          loadingSlipItem: {
+            include: { loadingSlip: { select: { bundleId: true } } },
+          },
+        },
       });
       if (plantEmails.length === 0) throw new Error('plant_ls email missing');
       let bundleId: string | null = null;
       for (const e of plantEmails) {
-        if (e.loadingSlipItem?.bundleId) {
-          bundleId = e.loadingSlipItem.bundleId;
+        const candidate =
+          e.loadingSlip?.bundleId ??
+          e.loadingSlipItem?.loadingSlip?.bundleId ??
+          null;
+        if (candidate) {
+          bundleId = candidate;
           break;
         }
       }
       if (!bundleId) {
-        const lsi = await prisma.loadingSlipItem.findFirst({
-          where: { salesOrderId: soId, bundleId: { not: null } },
+        const ls = await prisma.loadingSlip.findFirst({
+          where: { salesOrderId: soId },
           select: { bundleId: true },
         });
-        bundleId = lsi?.bundleId ?? null;
+        bundleId = ls?.bundleId ?? null;
       }
       const replyText = `Plant invoice attached. Invoice ${action.invoiceNumber}, OBD ${action.obdNumber}.`;
       for (const e of plantEmails) {

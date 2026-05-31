@@ -486,19 +486,25 @@ async function runCase(env: Env, spec: TestCase): Promise<CaseResult> {
     if (reply.targetEmailType === 'plant_ls' && reply.sender === 'plant') {
       const targetEmail = await env.prisma.email.findUnique({
         where: { id: target.id },
-        select: { loadingSlipItem: { select: { bundleId: true } } },
+        select: {
+          loadingSlip: { select: { bundleId: true } },
+          loadingSlipItem: { select: { loadingSlip: { select: { bundleId: true } } } },
+        },
       });
-      const bundleId = targetEmail?.loadingSlipItem?.bundleId ?? null;
+      const bundleId =
+        targetEmail?.loadingSlip?.bundleId ??
+        targetEmail?.loadingSlipItem?.loadingSlip?.bundleId ??
+        null;
       if (bundleId) {
-        // Update every plant_ls Email row tied to any LSI in this bundle.
-        const lsisInBundle = await env.prisma.loadingSlipItem.findMany({
+        // Update every plant_ls Email row tied to any LS in this bundle.
+        const lsesInBundle = await env.prisma.loadingSlip.findMany({
           where: { bundleId },
           select: { id: true },
         });
-        const lsiIds = lsisInBundle.map((l) => l.id);
+        const lsIds = lsesInBundle.map((l) => l.id);
         const updated = await env.prisma.email.updateMany({
           where: {
-            loadingSlipItemId: { in: lsiIds },
+            loadingSlipId: { in: lsIds },
             emailType: 'plant_ls',
             status: { in: ['sent'] },
           },
