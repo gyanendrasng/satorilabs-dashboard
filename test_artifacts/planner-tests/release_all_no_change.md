@@ -3,22 +3,22 @@
 **Description**: Branch confirms full dispatch with no quantity changes (no modification).
 **SO Number**: 3290101
 **Customer**: TEST-CUST-RELEASE-ALL
-**Started**: 2026-05-31T12:09:03.265Z
-**Finished**: 2026-05-31T12:09:24.770Z (duration 21.5s)
+**Started**: 2026-05-31T13:23:55.369Z
+**Finished**: 2026-05-31T13:24:18.565Z (duration 23.2s)
 **Result**: ✅ PASS
 
 ## SAP transactions (instruction payloads)
 
 | # | Transaction | State | Work ID | Enqueued | Finished |
 |---|---|---|---|---|---|
-| 1 | ZSO-VISIBILITY | done | `nu7pgnqm` | 2026-05-31T12:09:04.937Z | 2026-05-31T12:09:05.251Z |
-| 2 | ZLOAD1 | done | `aics77f7` | 2026-05-31T12:09:11.171Z | 2026-05-31T12:09:12.014Z |
-| 3 | ZLOAD3-B1 | done | `z0bieo6n` | 2026-05-31T12:09:19.814Z | 2026-05-31T12:09:20.052Z |
-| 4 | VTO1N-B | done | `chekochs` | 2026-05-31T12:09:22.847Z | 2026-05-31T12:09:23.064Z |
+| 1 | ZSO-VISIBILITY | done | `jn7wx37y` | 2026-05-31T13:23:56.587Z | 2026-05-31T13:23:56.896Z |
+| 2 | ZLOAD1 | done | `55asfc68` | 2026-05-31T13:24:03.659Z | 2026-05-31T13:24:04.474Z |
+| 3 | ZLOAD3-B1 | done | `zpj34nsr` | 2026-05-31T13:24:13.612Z | 2026-05-31T13:24:13.846Z |
+| 4 | VTO1N-B | done | `i1ugzslm` | 2026-05-31T13:24:16.641Z | 2026-05-31T13:24:16.860Z |
 
 ### Transaction 1 — ZSO-VISIBILITY
 
-- **Work ID**: `cmptql5t5000csx7bnu7pgnqm`
+- **Work ID**: `cmptt9fl7000csxobjn7wx37y`
 - **State**: done
 - **Instruction sent to SAP**:
   ```
@@ -36,7 +36,7 @@
 
 ### Transaction 2 — ZLOAD1
 
-- **Work ID**: `cmptqlama001qsx7baics77f7`
+- **Work ID**: `cmptt9l1n001qsxob55asfc68`
 - **State**: done
 - **Instruction sent to SAP**:
   ```
@@ -52,15 +52,16 @@
     "so_number": "3290101",
     "meta": {
       "so_number": "3290101",
-      "bundle_id": "cmptqlam5001osx7btm4j2xip",
-      "bundle_number": 1
+      "bundle_id": "cmptt9l1a001osxob3wah11y8",
+      "bundle_number": 1,
+      "dedup_key": "so:3290101|bundle:1"
     }
   }
   ```
 
 ### Transaction 3 — ZLOAD3-B1
 
-- **Work ID**: `cmptqlhae003gsx7bz0bieo6n`
+- **Work ID**: `cmptt9sq4003gsxobzpj34nsr`
 - **State**: done
 - **Instruction sent to SAP**:
   ```
@@ -88,7 +89,7 @@
     "extraction_context": "For each file, extract the loading slip number, loaded quantity, invoice number, and invoice date",
     "meta": {
       "so_number": "3290101",
-      "bundle_id": "cmptqlam5001osx7btm4j2xip",
+      "bundle_id": "cmptt9l1a001osxob3wah11y8",
       "bundle_number": 1
     }
   }
@@ -96,7 +97,7 @@
 
 ### Transaction 4 — VTO1N-B
 
-- **Work ID**: `cmptqljmm003wsx7bchekochs`
+- **Work ID**: `cmptt9v29003wsxobi1ugzslm`
 - **State**: done
 - **Instruction sent to SAP**:
   ```
@@ -110,8 +111,8 @@
     "extraction_context": "Extract the OBD number, LR number, LR date and Vehicle number",
     "meta": {
       "so_number": "3290101",
-      "shipment_id": "cmptqlhgg003qsx7b1fhflwys",
-      "bundle_id": "cmptqlam5001osx7btm4j2xip",
+      "shipment_id": "cmptt9sw7003qsxobiauro6g3",
+      "bundle_id": "cmptt9l1a001osxob3wah11y8",
       "bundle_number": 1,
       "obd_number": "85817679"
     }
@@ -124,73 +125,73 @@
 [T+0:00:00] email_received       from branch — Subject "NEW ORDER 3290101" — "Dear Sales Team, Please create SO 3290101 for customer TEST-CUST-RELEASE-ALL. M…"
 [T+0:00:00] classifier_decision  action=new_order
 [T+0:00:00] step_completed       zso_visibility ✓ — materials YE1EDWO00001APJP=50, YV6FRYENE0000PJP=100, YA4COWOCR000043P=250
-[T+0:00:00] email_sent           ls_dispatch to test-branch@example.com — "Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-178022934…"
+[T+0:00:00] email_sent           ls_dispatch to test-branch@example.com — "Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-178023383…"
 [T+0:00:00] step_completed       zso_visibility ✓
-[T+0:00:00] email_received       from branch — Subject "Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-178022934…" — "Confirmed. Please release everything as available and proceed with dispatch."
-[T+0:00:02] classifier_decision  llm-planned
-[T+0:00:02] scenario_started     llm-planned
-[T+0:00:02] step_fired           email_confirm_bundle_details
-[T+0:00:02] email_sent           dispatch_confirmation to test-branch@example.com — "Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780229343286"
-[T+0:00:02] step_completed       email_confirm_bundle_details ✓
-[T+0:00:02] scenario_completed   llm-planned
-[T+0:00:03] email_received       from branch — Subject "Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780229343286" — "Confirmed. Please proceed with the dispatch plan as outlined."
-[T+0:00:06] classifier_decision  llm-planned
-[T+0:00:06] scenario_started     llm-planned
-[T+0:00:06] step_fired           zload1
-[T+0:00:07] email_sent           vehicle_details to test-branch@example.com — "Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780229343…"
+[T+0:00:00] email_received       from branch — Subject "Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-178023383…" — "Confirmed. Please release everything as available and proceed with dispatch."
+[T+0:00:03] classifier_decision  llm-planned
+[T+0:00:03] scenario_started     llm-planned
+[T+0:00:03] step_fired           email_confirm_bundle_details
+[T+0:00:03] email_sent           dispatch_confirmation to test-branch@example.com — "Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780233835404"
+[T+0:00:03] step_completed       email_confirm_bundle_details ✓
+[T+0:00:03] scenario_completed   llm-planned
+[T+0:00:04] email_received       from branch — Subject "Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780233835404" — "Confirmed. Please proceed with the dispatch plan as outlined."
+[T+0:00:07] classifier_decision  llm-planned
+[T+0:00:07] scenario_started     llm-planned
+[T+0:00:07] step_fired           zload1
+[T+0:00:07] email_sent           vehicle_details to test-branch@example.com — "Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780233835…"
 [T+0:00:07] step_completed       zload1 ✓ — LS 373284:PENDING=?, 373283:PENDING=?, 373282:PENDING=?
 [T+0:00:07] step_fired           email_to_branch_for_vehicle
 [T+0:00:07] step_completed       email_to_branch_for_vehicle ✓
 [T+0:00:07] scenario_completed   llm-planned
-[T+0:00:07] email_received       from branch — Subject "Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780229343…" — "Vehicle: MH12AB1234, Driver: 9876543210, LR: LR-001 dated 2026-05-31"
-[T+0:00:09] classifier_decision  llm-planned
-[T+0:00:09] scenario_started     llm-planned
-[T+0:00:09] step_fired           email_to_plant
-[T+0:00:11] email_sent           plant_ls to test-plant@example.com — "Loading Slip 373282 - SO 3290101"
-[T+0:00:11] email_sent           plant_ls to test-plant@example.com — "Loading Slip 373283 - SO 3290101"
-[T+0:00:11] email_sent           plant_ls to test-plant@example.com — "Loading Slip 373284 - SO 3290101"
-[T+0:00:11] step_completed       email_to_plant ✓
-[T+0:00:11] scenario_completed   llm-planned
-[T+0:00:12] email_received       from plant — Subject "Loading Slip 373284 - SO 3290101" — "Invoice attached. Invoice number 7682614520, OBD 5070000123."
-[T+0:00:14] classifier_decision  llm-planned
-[T+0:00:14] scenario_started     llm-planned
-[T+0:00:14] step_fired           process_plant_invoice
-[T+0:00:14] step_completed       process_plant_invoice ✓
-[T+0:00:14] scenario_completed   llm-planned
-[T+0:00:14] step_completed       process_plant_invoice ✓
-[T+0:00:14] scenario_completed   llm-planned
-[T+0:00:15] step_completed       zload3b1 ✓
-[T+0:00:18] step_completed       vto1n ✓
+[T+0:00:08] email_received       from branch — Subject "Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780233835…" — "Vehicle: MH12AB1234, Driver: 9876543210, LR: LR-001 dated 2026-05-31"
+[T+0:00:10] classifier_decision  llm-planned
+[T+0:00:10] scenario_started     llm-planned
+[T+0:00:11] step_fired           email_to_plant
+[T+0:00:12] email_sent           plant_ls to test-plant@example.com — "Loading Slip 373282 - SO 3290101"
+[T+0:00:12] email_sent           plant_ls to test-plant@example.com — "Loading Slip 373283 - SO 3290101"
+[T+0:00:12] email_sent           plant_ls to test-plant@example.com — "Loading Slip 373284 - SO 3290101"
+[T+0:00:12] step_completed       email_to_plant ✓
+[T+0:00:12] scenario_completed   llm-planned
+[T+0:00:13] email_received       from plant — Subject "Loading Slip 373284 - SO 3290101" — "Invoice attached. Invoice number 7682614520, OBD 5070000123."
+[T+0:00:17] classifier_decision  llm-planned
+[T+0:00:17] scenario_started     llm-planned
+[T+0:00:17] step_fired           process_plant_invoice
+[T+0:00:17] step_completed       process_plant_invoice ✓
+[T+0:00:17] scenario_completed   llm-planned
+[T+0:00:17] step_completed       process_plant_invoice ✓
+[T+0:00:17] scenario_completed   llm-planned
+[T+0:00:17] step_completed       zload3b1 ✓
+[T+0:00:20] step_completed       vto1n ✓
 ```
 
 ## Email thread
 
 ```
-[2026-05-31T12:09:05.240Z] OUTBOUND to test-branch@example.com [type=ls_dispatch] — Subject: "Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-1780229343286"
-  Body: Dispatch Recommendation - AUTO-MOCK-NEWORDER-1780229343286 Dear Sales Team, Sales Order 3290101 I have reviewed the stock availability for Sales Order 3290101. Here is the dispatch recommendation: M-A [YE1EDWO00001APJP] : Stock is confirmed available. Proceed with 50 units from Batch A-26. M-C [YA4COWOCR000043P] : Stock is confirmed available. Proceed with 250 units from Batch 20. M-B [YV6FRYENE0000PJP] : Stock is confirmed available. Proceed with 100 units from Batch 30-07-2025. Best regards, Sales Order Dispatch Co-ordinator
+[2026-05-31T13:23:56.884Z] OUTBOUND to test-branch@example.com [type=ls_dispatch] — Subject: "Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-1780233835404"
+  Body: Dispatch Recommendation - AUTO-MOCK-NEWORDER-1780233835404 Dear Sales Team, Sales Order 3290101 I have reviewed the stock availability for Sales Order 3290101. Here is the dispatch recommendation: M-A [YE1EDWO00001APJP] : Stock is confirmed available. Proceed with 50 units from Batch A-26. M-B [YV6FRYENE0000PJP] : Stock is confirmed available. Proceed with 100 units from Batch 30-07-2025. M-C [YA4COWOCR000043P] : Stock is confirmed available. Proceed with 250 units from Batch 20. Best regards, Sales Order Dispatch Co-ordinator
 
-[2026-05-31T12:09:05.346Z] INBOUND from test-branch@example.com [type=ls_dispatch] — Subject: "Re: Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-1780229343286"
+[2026-05-31T13:23:56.996Z] INBOUND from test-branch@example.com [type=ls_dispatch] — Subject: "Re: Dispatch Approval Request - PO AUTO-MOCK-NEWORDER-1780233835404"
   Body: Confirmed. Please release everything as available and proceed with dispatch.
 
-[2026-05-31T12:09:07.511Z] OUTBOUND to test-branch@example.com [type=dispatch_confirmation] — Subject: "Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780229343286"
-  Body: Dear Branch Team, Dispatch plan ready for Purchase Order AUTO-MOCK-NEWORDER-1780229343286 (Customer 1). Total 10.665 t — fits in 1 vehicle (capacity 35 t). Proposed dispatch (grouped by bundle): Bundle 1 — 10.665 t (of 35 t capacity): - SO 3290101 / YA4COWOCR000043P (Batch 20): 250 units, 6.625 t - SO 3290101 / YE1EDWO00001APJP (Batch A-26): 50 units, 1.320 t - SO 3290101 / YV6FRYENE0000PJP (Batch 30-07-2025): 100 units, 2.720 t Please reply with: - "yes" / "confirm" to proceed with the above plan, or - the changes you want (e.g. "skip OOWJ on SO 1234567", "send only 15 of OP7WJ"). Once confirmed we will create the loading slips. Best regards, Sales Order Dispatch Co-ordinator
+[2026-05-31T13:23:59.855Z] OUTBOUND to test-branch@example.com [type=dispatch_confirmation] — Subject: "Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780233835404"
+  Body: Dear Branch Team, Dispatch plan ready for Purchase Order AUTO-MOCK-NEWORDER-1780233835404 (Customer 1). Total 10.665 t — fits in 1 vehicle (capacity 35 t). Proposed dispatch (grouped by bundle): Bundle 1 — 10.665 t (of 35 t capacity): - SO 3290101 / YA4COWOCR000043P (Batch 20): 250 units, 6.625 t - SO 3290101 / YE1EDWO00001APJP (Batch A-26): 50 units, 1.320 t - SO 3290101 / YV6FRYENE0000PJP (Batch 30-07-2025): 100 units, 2.720 t Please reply with: - "yes" / "confirm" to proceed with the above plan, or - the changes you want (e.g. "skip OOWJ on SO 1234567", "send only 15 of OP7WJ"). Once confirmed we will create the loading slips. Best regards, Sales Order Dispatch Co-ordinator
 
-[2026-05-31T12:09:08.520Z] INBOUND from test-branch@example.com [type=dispatch_confirmation] — Subject: "Re: Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780229343286"
+[2026-05-31T13:24:00.884Z] INBOUND from test-branch@example.com [type=dispatch_confirmation] — Subject: "Re: Dispatch Confirmation - PO AUTO-MOCK-NEWORDER-1780233835404"
   Body: Confirmed. Please proceed with the dispatch plan as outlined.
 
-[2026-05-31T12:09:12.017Z] OUTBOUND to test-branch@example.com [type=vehicle_details] — Subject: "Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780229343286 (1 bundle)"
-  Body: Dear Branch Team, Loading slips for Purchase Order AUTO-MOCK-NEWORDER-1780229343286 are now ready in SAP. The PO is split into 1 bundle: Bundle 1 (~10.66 t): - SO 3290101 / LS 373282 / Material PENDING - SO 3290101 / LS 373283 / Material PENDING - SO 3290101 / LS 373284 / Material PENDING Please reply with vehicle/transport details for each bundle in the format below: Bundle 1: , , Best regards, Sales Order Dispatch Co-ordinator
+[2026-05-31T13:24:04.477Z] OUTBOUND to test-branch@example.com [type=vehicle_details] — Subject: "Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780233835404 (1 bundle)"
+  Body: Dear Branch Team, Loading slips for Purchase Order AUTO-MOCK-NEWORDER-1780233835404 are now ready in SAP. The PO is split into 1 bundle: Bundle 1 (~10.66 t): - SO 3290101 / LS 373282 / Material PENDING - SO 3290101 / LS 373283 / Material PENDING - SO 3290101 / LS 373284 / Material PENDING Please reply with vehicle/transport details for each bundle in the format below: Bundle 1: , , Best regards, Sales Order Dispatch Co-ordinator
 
-[2026-05-31T12:09:15.988Z] INBOUND from test-branch@example.com [type=vehicle_details] — Subject: "Re: Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780229343286 (1 bundle)"
+[2026-05-31T13:24:08.709Z] INBOUND from test-branch@example.com [type=vehicle_details] — Subject: "Re: Vehicle Details Required - PO AUTO-MOCK-NEWORDER-1780233835404 (1 bundle)"
   Body: Vehicle: MH12AB1234, Driver: 9876543210, LR: LR-001 dated 2026-05-31
 
-[2026-05-31T12:09:17.022Z] INBOUND from test-plant@example.com [type=plant_ls] — Subject: "Re: Loading Slip 373282 - SO 3290101"
+[2026-05-31T13:24:09.745Z] INBOUND from test-plant@example.com [type=plant_ls] — Subject: "Re: Loading Slip 373282 - SO 3290101"
   Body: Invoice attached. Invoice number 7682614520, OBD 5070000123.
 
-[2026-05-31T12:09:17.022Z] INBOUND from test-plant@example.com [type=plant_ls] — Subject: "Re: Loading Slip 373283 - SO 3290101"
+[2026-05-31T13:24:09.745Z] INBOUND from test-plant@example.com [type=plant_ls] — Subject: "Re: Loading Slip 373283 - SO 3290101"
   Body: Invoice attached. Invoice number 7682614520, OBD 5070000123.
 
-[2026-05-31T12:09:17.022Z] INBOUND from test-plant@example.com [type=plant_ls] — Subject: "Re: Loading Slip 373284 - SO 3290101"
+[2026-05-31T13:24:09.745Z] INBOUND from test-plant@example.com [type=plant_ls] — Subject: "Re: Loading Slip 373284 - SO 3290101"
   Body: Invoice attached. Invoice number 7682614520, OBD 5070000123.
 ```
 
@@ -208,28 +209,28 @@
 | Material | Batch | Ordered | Available | Dispatch |
 |---|---|---|---|---|
 | YE1EDWO00001APJP | A-26 | 50 | 50 | 50 |
-| YA4COWOCR000043P | 20 | 250 | 250 | 250 |
 | YV6FRYENE0000PJP | 30-07-2025 | 100 | 100 | 100 |
+| YA4COWOCR000043P | 20 | 250 | 250 | 250 |
 
 ## Run log
 
 ```
-[2026-05-31T12:09:03.286Z] Pushing NEW ORDER for SO 3290101
-[2026-05-31T12:09:04.940Z] SO row created — soId=cmptql5sy0006sx7bxv54bdzg poId=cmptql5sw0004sx7by15rabp2
-[2026-05-31T12:09:04.940Z] Step 1/4: waiting for outbound "ls_dispatch" (timeout 30000ms)
-[2026-05-31T12:09:05.346Z] Step 1: targeting email uoh65c6z with reply: "Confirmed. Please release everything as available and proceed with dispatch."
-[2026-05-31T12:09:07.515Z] Step 1: handleReplyV2 returned matched=true
-[2026-05-31T12:09:08.518Z] Step 2/4: waiting for outbound "dispatch_confirmation" (timeout 30000ms)
-[2026-05-31T12:09:08.520Z] Step 2: targeting email ns37b1ia with reply: "Confirmed. Please proceed with the dispatch plan as outlined."
-[2026-05-31T12:09:11.176Z] Step 2: handleReplyV2 returned matched=true
-[2026-05-31T12:09:12.177Z] Step 3/4: waiting for outbound "vehicle_details" (timeout 30000ms)
-[2026-05-31T12:09:12.178Z] Step 3: targeting email 6l9pty56 with reply: "Vehicle: MH12AB1234, Driver: 9876543210, LR: LR-001 dated 2026-05-31"
-[2026-05-31T12:09:16.013Z] Step 3: handleReplyV2 returned matched=true
-[2026-05-31T12:09:16.015Z]   [operator input sim] persisted lrNumber=LR-001 lrDate=2026-05-31 on SO
-[2026-05-31T12:09:17.017Z] Step 4/4: waiting for outbound "plant_ls" (timeout 30000ms)
-[2026-05-31T12:09:17.018Z] Step 4: targeting email tp2fox6o with reply: "Invoice attached. Invoice number 7682614520, OBD 5070000123."
-[2026-05-31T12:09:17.023Z]   [plant invoice sim] marked 3 plant_ls Email row(s) in bundle tm4j2xip as replied with mock PDF URL
-[2026-05-31T12:09:19.833Z] Step 4: handleReplyV2 returned matched=true
-[2026-05-31T12:09:22.838Z] Shipment(s) created (1); simulating operator VT01N click per shipment
-[2026-05-31T12:09:22.854Z]   triggerVto1n(1fhflwys) enqueued (obd=85817679)
+[2026-05-31T13:23:55.403Z] Pushing NEW ORDER for SO 3290101
+[2026-05-31T13:23:56.591Z] SO row created — soId=cmptt9fl10006sxob3lfu4lfk poId=cmptt9fkz0004sxob0fbxeg9y
+[2026-05-31T13:23:56.591Z] Step 1/4: waiting for outbound "ls_dispatch" (timeout 30000ms)
+[2026-05-31T13:23:56.996Z] Step 1: targeting email cfdvy7o0 with reply: "Confirmed. Please release everything as available and proceed with dispatch."
+[2026-05-31T13:23:59.876Z] Step 1: handleReplyV2 returned matched=true
+[2026-05-31T13:24:00.881Z] Step 2/4: waiting for outbound "dispatch_confirmation" (timeout 30000ms)
+[2026-05-31T13:24:00.883Z] Step 2: targeting email fvg2zmy3 with reply: "Confirmed. Please proceed with the dispatch plan as outlined."
+[2026-05-31T13:24:03.663Z] Step 2: handleReplyV2 returned matched=true
+[2026-05-31T13:24:04.666Z] Step 3/4: waiting for outbound "vehicle_details" (timeout 30000ms)
+[2026-05-31T13:24:04.667Z] Step 3: targeting email 02dzg7zp with reply: "Vehicle: MH12AB1234, Driver: 9876543210, LR: LR-001 dated 2026-05-31"
+[2026-05-31T13:24:08.730Z] Step 3: handleReplyV2 returned matched=true
+[2026-05-31T13:24:08.731Z]   [operator input sim] persisted lrNumber=LR-001 lrDate=2026-05-31 on SO
+[2026-05-31T13:24:09.737Z] Step 4/4: waiting for outbound "plant_ls" (timeout 30000ms)
+[2026-05-31T13:24:09.739Z] Step 4: targeting email ltsr41hj with reply: "Invoice attached. Invoice number 7682614520, OBD 5070000123."
+[2026-05-31T13:24:09.746Z]   [plant invoice sim] marked 3 plant_ls Email row(s) in bundle 3wah11y8 as replied with mock PDF URL
+[2026-05-31T13:24:13.625Z] Step 4: handleReplyV2 returned matched=true
+[2026-05-31T13:24:16.633Z] Shipment(s) created (1); simulating operator VT01N click per shipment
+[2026-05-31T13:24:16.649Z]   triggerVto1n(iauro6g3) enqueued (obd=85817679)
 ```
