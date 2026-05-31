@@ -2,11 +2,14 @@ import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
   /* config options here */
-  // xlsx uses dynamic `require('fs')` at runtime; Turbopack's bundling breaks
-  // that, causing XLSX.readFile to throw "Cannot access file <path>" even
-  // though the file exists. Keeping xlsx external to the server bundle lets it
-  // resolve Node's fs the normal way.
-  serverExternalPackages: ['xlsx'],
+  // xlsx and pdfjs-dist both rely on dynamic Node resolution at runtime
+  // (xlsx: `require('fs')`; pdfjs-dist: locating its worker .mjs alongside
+  // the package). Turbopack's bundling breaks both, surfacing as
+  // "Cannot access file <path>" from xlsx and
+  // "Cannot find module .../pdf.worker.mjs" from pdfjs-dist (the ZLOAD1
+  // PDF parser then falls back to PENDING placeholder rows). Keeping them
+  // external lets Node resolve the packages from node_modules normally.
+  serverExternalPackages: ['xlsx', 'pdfjs-dist'],
   eslint: {
     ignoreDuringBuilds: true,
   },
