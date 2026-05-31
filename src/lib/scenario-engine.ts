@@ -22,13 +22,113 @@ import {
 import { type BranchReplyIntent } from './branch-reply-classifier';
 import { classifyDispatchConfirmation } from './dispatch-confirmation-classifier';
 import {
-  SCENARIOS,
   deriveStage,
-  type Scenario,
-  type ScenarioEmailType,
   type Step,
   type StepKind,
 } from './dispatch-scenarios';
+import type { PlannedStep } from './llm-planner';
+
+// -----------------------------------------------------------------------------
+// Planner-mode step list: every active ScenarioProgress in the new code path
+// carries its step list as JSON in `generatedSteps`. Helpers below read that
+// list, with a defensive fallback to an empty array if the column is null
+// (shouldn't happen in practice — handleReplyV2 always populates it).
+// -----------------------------------------------------------------------------
+
+interface PlanView {
+  /** The step list in execution order. */
+  steps: Step[];
+  /** Index after which the walker pauses (last step that fires before pause). */
+  stopAfterIndex: number;
+  /** The raw PlannedStep entries — kind + optional rationale, no data values. */
+  plannedSteps: PlannedStep[];
+}
+
+function plannedStepToStep(p: PlannedStep): Step {
+  return {
+    kind: p.kind,
+    label: p.rationale ? p.rationale.slice(0, 80) : undefined,
+  };
+}
+
+function readPlanFromProgress(progress: { generatedSteps: string | null; stopAfterIndex: number | null }): PlanView {
+  if (!progress.generatedSteps) {
+    return { steps: [], stopAfterIndex: -1, plannedSteps: [] };
+  }
+  let plannedSteps: PlannedStep[] = [];
+  try {
+    plannedSteps = JSON.parse(progress.generatedSteps) as PlannedStep[];
+    if (!Array.isArray(plannedSteps)) plannedSteps = [];
+  } catch {
+    plannedSteps = [];
+  }
+  return {
+    steps: plannedSteps.map(plannedStepToStep),
+    stopAfterIndex: progress.stopAfterIndex ?? plannedSteps.length - 1,
+    plannedSteps,
+  };
+}
+
+// -----------------------------------------------------------------------------
+// loadTriggerReply — fetch the inbound reply that triggered the current plan.
+//
+// Each ScenarioProgress carries `triggerEmailId` — the Email row whose reply
+// caused this plan to be built. fireStep cases that need to extract data
+// from the reply (modification lists, vehicle details, plant invoice PDF)
+// call this once at the top of the case and pass the result into their
+// dedicated extractor function.
+// -----------------------------------------------------------------------------
+
+export interface TriggerReply {
+  emailId: string;
+  emailType: string | null;
+  replyHtml: string;
+  /** The email this is a reply to was sent to / received from this party. */
+  sender: 'branch' | 'plant' | 'production';
+  gmailThreadId: string | null;
+  gmailMessageId: string | null;
+  hasPdfAttachment: boolean;
+  replyPdfUrl: string | null;
+}
+
+async function loadTriggerReply(progressId: string): Promise<TriggerReply | null> {
+  const progress = await prisma.scenarioProgress.findUnique({
+    where: { id: progressId },
+    select: { triggerEmailId: true },
+  });
+  if (!progress?.triggerEmailId) return null;
+
+  const email = await prisma.email.findUnique({
+    where: { id: progress.triggerEmailId },
+    select: {
+      id: true,
+      emailType: true,
+      replyHtml: true,
+      gmailThreadId: true,
+      gmailMessageId: true,
+      replyPdfUrl: true,
+      recipientEmail: true,
+    },
+  });
+  if (!email?.replyHtml) return null;
+
+  // Sender inference: we sent this email TO recipientEmail. Their reply came
+  // FROM that address. emailType tells us which role we sent to.
+  let sender: 'branch' | 'plant' | 'production' = 'branch';
+  if (email.emailType === 'plant_ls') sender = 'plant';
+  else if (email.emailType === 'production_inquiry' || email.emailType === 'production_reminder') sender = 'production';
+
+  return {
+    emailId: email.id,
+    emailType: email.emailType ?? null,
+    replyHtml: email.replyHtml,
+    sender,
+    gmailThreadId: email.gmailThreadId,
+    gmailMessageId: email.gmailMessageId,
+    hasPdfAttachment: !!email.replyPdfUrl,
+    replyPdfUrl: email.replyPdfUrl ?? null,
+  };
+}
 import type { WorkStep } from './work-queue';
 import {
   triggerVa02,
@@ -419,109 +519,26 @@ export async function sendPlantChangeNotificationEmail(args: {
 }
 
 /**
- * Branch replied to a '2nd_release' email. yes → advance scenario, no/ambiguous
- * → abort scenario so an operator can review.
+ * Branch replied to a '2nd_release' email. In planner mode this routes through
+ * the unified `handleReplyV2` — the planner reads the audit trail (sees
+ * email_2nd_release was sent), reads the email thread (sees "yes" / "no" /
+ * etc.), and emits the next step list. Kept as a wrapper so external callers
+ * don't have to change.
  */
 export async function handleSecondReleaseReply(
   emailId: string,
   replyHtml: string,
-  /**
-   * Phase 2 (unified classifier): when the dispatcher has already classified
-   * via `classifyReply` (action='2nd_release_decision'), it passes the
-   * decision here. Skips the internal `classifyDispatchConfirmation` call.
-   */
-  preClassified?: { decision: 'yes' | 'no' | 'ambiguous' },
+  // Unused in planner mode (LLM reads the reply text directly), kept for
+  // backwards compatibility with legacy callers.
+  _preClassified?: { decision: 'yes' | 'no' | 'ambiguous' },
 ): Promise<{ success: boolean; logs: string[] }> {
-  const logs: string[] = [];
-  const log = (m: string) => {
-    const t = `[${new Date().toISOString()}] ${m}`;
-    console.log(t);
-    logs.push(t);
-  };
-
-  const email = await prisma.email.findUnique({ where: { id: emailId } });
-  if (!email || !email.salesOrderId) {
-    log(`[2ndRelease] Email or salesOrderId missing on ${emailId}`);
-    return { success: false, logs };
-  }
-
-  let intent: 'yes' | 'no' | 'ambiguous';
-  if (preClassified) {
-    intent = preClassified.decision;
-    log(`[2ndRelease] using pre-classified decision=${intent}`);
-  } else {
-    try {
-      const ai = await classifyDispatchConfirmation(replyHtml);
-      intent = ai.intent;
-      log(`[2ndRelease] AI intent=${intent} reason="${ai.reason}"`);
-    } catch (aiErr) {
-      log(`[2ndRelease] classifier failed: ${aiErr instanceof Error ? aiErr.message : String(aiErr)}`);
-      intent = 'ambiguous';
-    }
-  }
-
-  await prisma.email.update({
-    where: { id: emailId },
-    data: { status: 'replied', repliedAt: new Date(), replyHtml, workflowState: 'completed' },
+  const r = await handleReplyV2({
+    emailId,
+    replyHtml,
+    originalEmailHtml: '',
+    sourceEmailType: 'branch',
   });
-
-  if (intent === 'yes') {
-    log(`[2ndRelease] Confirmed — advancing scenario for SO ${email.salesOrderId}`);
-    // In segmented mode the scenario row was marked `completed` when the
-    // email_2nd_release segment terminated, with `currentStepIndex`
-    // already pointing at the NEXT step. `advanceScenario()` only looks
-    // at non-terminal rows AND increments the index — both wrong here.
-    // Detect the parked-at-2nd_release case and resume by re-firing the
-    // current step directly.
-    if (isSegmentedExecutionEnabled()) {
-      const parked = await prisma.scenarioProgress.findFirst({
-        where: { salesOrderId: email.salesOrderId, state: 'completed' },
-        orderBy: { createdAt: 'desc' },
-      });
-      if (parked) {
-        const { getScenarioFromKey } = await import('./sheet-scenario-adapter');
-        const scenarioDef = getScenarioFromKey(parked.scenarioKey) ?? SCENARIOS[parked.scenarioKey];
-        const lastStepIdx = parked.currentStepIndex - 1;
-        const lastStep = scenarioDef?.steps[lastStepIdx];
-        if (lastStep?.kind === 'email_2nd_release') {
-          await prisma.scenarioProgress.update({
-            where: { id: parked.id },
-            data: { state: 'ready' },
-          });
-          log(`[2ndRelease] Re-opened scenario ${parked.scenarioKey} — resuming at step ${parked.currentStepIndex}`);
-          // Fire the next step (currentStepIndex already points at it).
-          await executeScenario({ salesOrderId: email.salesOrderId });
-          return { success: true, logs };
-        }
-      }
-    }
-    await advanceScenario(email.salesOrderId);
-    return { success: true, logs };
-  }
-
-  // no / ambiguous → abort the scenario so an operator can take over
-  log(`[2ndRelease] Not a clean yes — aborting scenario for SO ${email.salesOrderId}`);
-  const { emitEvent } = await import('./scenario-events');
-  const active = await prisma.scenarioProgress.findFirst({
-    where: {
-      salesOrderId: email.salesOrderId,
-      state: { notIn: ['completed', 'aborted', 'failed'] },
-    },
-    orderBy: { createdAt: 'desc' },
-  });
-  if (active) {
-    await prisma.scenarioProgress.update({
-      where: { id: active.id },
-      data: { state: 'aborted', error: `2nd_release reply intent=${intent}` },
-    });
-    await emitEvent({
-      salesOrderId: email.salesOrderId,
-      scenarioProgressId: active.id,
-      type: 'scenario_aborted',
-      payload: { scenario_key: active.scenarioKey, reason: `2nd_release reply intent=${intent}` },
-    });
-  }
-  return { success: true, logs };
+  return { success: r.success, logs: r.logs };
 }
 
 // -----------------------------------------------------------------------------
@@ -543,7 +560,7 @@ export async function handleReplyV2(args: {
   emailId: string;
   replyHtml: string;
   originalEmailHtml: string;
-  sourceEmailType: ScenarioEmailType;
+  sourceEmailType: 'branch' | 'plant';
 }): Promise<{ success: boolean; matched: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (m: string) => {
@@ -552,12 +569,8 @@ export async function handleReplyV2(args: {
     logs.push(t);
   };
 
-  const { classifyReply } = await import('./reply-classifier');
-  type ReplyClsModule = typeof import('./reply-classifier');
-  type ReplyCls = Awaited<ReturnType<ReplyClsModule['classifyReply']>>;
-  const { renderEmailThreadForSO } = await import('./email-thread');
-  const { getValidScenarioKeys } = await import('./dispatch-scenarios');
-  const { emitEvent, getRecentEventsForSO } = await import('./scenario-events');
+  const { planNextSteps } = await import('./llm-planner');
+  const { emitEvent } = await import('./scenario-events');
 
   const email = await prisma.email.findUnique({
     where: { id: args.emailId },
@@ -582,9 +595,9 @@ export async function handleReplyV2(args: {
     },
   });
 
-  // Ensure the trigger Email row records this reply BEFORE we render the
-  // thread. In production the cron does this in email-reply-checker.ts:120,
-  // but defending against harness/test paths that skip that step.
+  // Ensure the trigger Email row records this reply BEFORE the planner reads
+  // the thread. In production the cron does this; defending against harness
+  // paths that skip it.
   if (!email.replyHtml) {
     await prisma.email.update({
       where: { id: email.id },
@@ -592,7 +605,9 @@ export async function handleReplyV2(args: {
     });
   }
 
-  // Find active scenario (most recent non-terminal).
+  // Abort any prior non-terminal ScenarioProgress. The planner builds a fresh
+  // plan per inbound; there's no notion of "continuing" a prior plan — once
+  // the next email arrives, the prior plan is superseded.
   const activeProgress = await prisma.scenarioProgress.findFirst({
     where: {
       salesOrderId: email.salesOrderId,
@@ -600,179 +615,10 @@ export async function handleReplyV2(args: {
     },
     orderBy: { createdAt: 'desc' },
   });
-
-  const stage = await deriveStage(email.salesOrderId);
-  const validKeys = getValidScenarioKeys(args.sourceEmailType, stage);
-  const emailThread = await renderEmailThreadForSO({ salesOrderId: email.salesOrderId });
-  const materialRows = await prisma.material.findMany({
-    where: { salesOrderId: email.salesOrderId },
-    select: { material: true, batch: true, orderQuantity: true, availableStock: true },
-  });
-
-  // Build active-scenario context for the selector if applicable.
-  let activeScenarioContext: Parameters<ReplyClsModule['classifyReply']>[0]['activeScenario'] = null;
   if (activeProgress) {
-    // Sheet-driven lookup is now the source of truth for step lists;
-    // fall back to the in-code SCENARIOS registry as a safety net while
-    // mapping coverage is being expanded.
-    const { getScenarioFromKey } = await import('./sheet-scenario-adapter');
-    const scenarioDef = getScenarioFromKey(activeProgress.scenarioKey) ?? SCENARIOS[activeProgress.scenarioKey];
-    if (scenarioDef) {
-      const recentEvents = await getRecentEventsForSO({ salesOrderId: email.salesOrderId, limit: 30 });
-      const stepsAlreadyExecuted = recentEvents
-        .filter((e) => e.type === 'step_completed' && e.scenarioProgressId === activeProgress.id)
-        .map((e) => ({
-          stepIndex: (e.payload.step_index as number) ?? -1,
-          kind: String(e.payload.kind ?? ''),
-          completedAt: e.createdAt.toISOString(),
-        }))
-        .filter((s) => s.stepIndex >= 0)
-        .sort((a, b) => a.stepIndex - b.stepIndex);
-      activeScenarioContext = {
-        scenarioKey: activeProgress.scenarioKey,
-        description: scenarioDef.description,
-        currentStepIndex: activeProgress.currentStepIndex,
-        steps: scenarioDef.steps.map((s) => s.kind),
-        stepsAlreadyExecuted,
-      };
-    }
-  }
-
-  // Call the unified LLM classifier.
-  let cls: ReplyCls;
-  try {
-    const { renderAuditTrailForSO } = await import('./audit-trail');
-    const auditTrail = await renderAuditTrailForSO({ salesOrderId: email.salesOrderId }).catch(() => '');
-    cls = await classifyReply({
-      soNumber: email.salesOrder.soNumber,
-      sender: args.sourceEmailType,
-      stage,
-      emailThread,
-      materials: materialRows,
-      validKeys,
-      activeScenario: activeScenarioContext,
-      triggerEmailType: email.emailType ?? null,
-      gmailMessageId: email.gmailMessageId,
-      auditTrail,
-    });
-  } catch (err) {
-    log(`[ENGINE] Classifier failed: ${err instanceof Error ? err.message : err}`);
-    await emitEvent({
-      salesOrderId: email.salesOrderId,
-      type: 'scenario_aborted',
-      payload: { reason: `classifier_error: ${err instanceof Error ? err.message : String(err)}` },
-    });
-    return { success: false, matched: false, logs };
-  }
-
-  // ─── Phase 2 dispatcher (gated by UNIFIED_CLASSIFIER_ENABLED) ───────
-  // When the flag is on AND the LLM picked a non-scenario action, route to
-  // the appropriate refactored handler with pre-classified fields. When the
-  // flag is off, OR the action is 'scenario', fall through to the existing
-  // scenario logic below (which projects scenario fields out of `cls`).
-  if (isUnifiedClassifierEnabled() && cls.action !== 'scenario') {
-    return dispatchNonScenarioAction(cls, {
-      emailId: args.emailId,
-      salesOrderId: email.salesOrderId,
-      replyHtml: args.replyHtml,
-      log,
-      logs,
-    });
-  }
-
-  // Project the union → legacy ScenarioSelection shape so the existing
-  // scenario logic compiles unchanged. Non-scenario actions reaching here
-  // (i.e. unified flag OFF) are coerced to 'unknown' so the engine uses its
-  // existing escalation path.
-  const selection: {
-    scenario_key: string;
-    reasoning: string;
-    escalate_reason?: string;
-    materials: Array<{ material_code: string; batch: string; operation?: 'keep' | 'increase' | 'decrease' | 'delete'; quantity: number }>;
-    action_on_active?: 'abort_and_replace' | 'escalate' | null;
-  } = cls.action === 'scenario'
-    ? {
-        scenario_key: cls.scenario_key,
-        reasoning: cls.reasoning,
-        escalate_reason: cls.escalate_reason,
-        materials: cls.materials,
-        action_on_active: cls.action_on_active ?? null,
-      }
-    : {
-        scenario_key: 'unknown',
-        reasoning: 'reasoning' in cls ? (cls as { reasoning?: string }).reasoning ?? '' : '',
-        escalate_reason: `Classifier picked action="${cls.action}" but unified flag is off; coerced to unknown`,
-        materials: [],
-        action_on_active: activeProgress ? 'escalate' : null,
-      };
-
-  log(
-    `[ENGINE] SO ${email.salesOrder.soNumber}: stage=${stage} scenario_key=${selection.scenario_key}` +
-      (selection.action_on_active ? ` action_on_active=${selection.action_on_active}` : '') +
-      ` reasoning="${selection.reasoning}"`,
-  );
-
-  await emitEvent({
-    salesOrderId: email.salesOrderId,
-    scenarioProgressId: activeProgress?.id ?? null,
-    type: 'classifier_decision',
-    payload: {
-      scenario_key: selection.scenario_key,
-      reasoning: selection.reasoning,
-      escalate_reason: selection.escalate_reason,
-      action_on_active: selection.action_on_active,
-      stage,
-      sender: args.sourceEmailType,
-    },
-  });
-
-  // ─── Handle each outcome ───────────────────────────────────────────
-
-  // (b) and (d): scenario_key === 'unknown' OR mid-flow escalate
-  const isUnknown = selection.scenario_key === 'unknown';
-  const isMidFlowEscalate = activeProgress && selection.action_on_active === 'escalate';
-  if (isUnknown || isMidFlowEscalate) {
-    const reason = selection.escalate_reason ?? selection.reasoning ?? 'LLM escalated';
-    // If we have an active scenario, mark it aborted.
-    if (activeProgress) {
-      await prisma.scenarioProgress.update({
-        where: { id: activeProgress.id },
-        data: { state: 'aborted', error: `[mid-flow escalate] ${reason}` },
-      });
-      await emitEvent({
-        salesOrderId: email.salesOrderId,
-        scenarioProgressId: activeProgress.id,
-        type: 'scenario_aborted',
-        payload: { scenario_key: activeProgress.scenarioKey, reason: `mid-flow escalate: ${reason}` },
-      });
-    }
-    // Create a "marker" aborted ScenarioProgress so the dashboard sees the escalation.
-    const escalated = await prisma.scenarioProgress.create({
-      data: {
-        salesOrderId: email.salesOrderId,
-        scenarioKey: 'unknown',
-        currentStepIndex: 0,
-        state: 'aborted',
-        classifierOutput: JSON.stringify(selection),
-        triggerEmailId: email.id,
-        error: reason,
-      },
-    });
-    await emitEvent({
-      salesOrderId: email.salesOrderId,
-      scenarioProgressId: escalated.id,
-      type: 'scenario_aborted',
-      payload: { scenario_key: 'unknown', reason },
-    });
-    log(`[ENGINE] handled — escalated (${isUnknown ? 'unknown' : 'mid_flow_escalate'}): ${reason}`);
-    return { success: true, matched: false, logs };
-  }
-
-  // (c): mid-flow abort_and_replace
-  if (activeProgress && selection.action_on_active === 'abort_and_replace') {
     await prisma.scenarioProgress.update({
       where: { id: activeProgress.id },
-      data: { state: 'aborted', error: 'superseded by classifier decision' },
+      data: { state: 'aborted', error: 'superseded by new inbound email' },
     });
     await emitEvent({
       salesOrderId: email.salesOrderId,
@@ -780,80 +626,137 @@ export async function handleReplyV2(args: {
       type: 'scenario_aborted',
       payload: {
         scenario_key: activeProgress.scenarioKey,
-        reason: `superseded by new scenario ${selection.scenario_key}`,
+        reason: 'superseded by new inbound email',
       },
     });
-    log(`[ENGINE] mid-flow abort_and_replace: ${activeProgress.scenarioKey} → ${selection.scenario_key}`);
+    log(`[ENGINE] Aborted prior plan ${activeProgress.id} (was at step ${activeProgress.currentStepIndex}) — superseded by new inbound`);
   }
 
-  // (a) and (c continuation): create new ScenarioProgress and fire step 0
-  // Sheet-driven step list with the in-code SCENARIOS registry as fallback.
-  const { getScenarioFromKey: getScenarioFromKeyForCreate } = await import('./sheet-scenario-adapter');
-  const scenario = getScenarioFromKeyForCreate(selection.scenario_key) ?? SCENARIOS[selection.scenario_key];
-  if (!scenario) {
-    // Shouldn't happen — the selector validated the key against validKeys.
-    log(`[ENGINE] BUG: validated key ${selection.scenario_key} missing from SCENARIOS — escalating`);
-    const broken = await prisma.scenarioProgress.create({
+  // Build a fresh plan from the LLM.
+  let plan: Awaited<ReturnType<typeof planNextSteps>>;
+  try {
+    plan = await planNextSteps({
+      salesOrderId: email.salesOrderId,
+      triggerEmailId: email.id,
+      sender: args.sourceEmailType,
+    });
+  } catch (err) {
+    log(`[ENGINE] Planner failed: ${err instanceof Error ? err.message : err}`);
+    await emitEvent({
+      salesOrderId: email.salesOrderId,
+      type: 'scenario_aborted',
+      payload: { reason: `planner_error: ${err instanceof Error ? err.message : String(err)}` },
+    });
+    return { success: false, matched: false, logs };
+  }
+
+  log(
+    `[ENGINE] SO ${email.salesOrder.soNumber}: planner produced ${plan.steps.length} step(s) ` +
+      `(stopAfter=${plan.stopAfterIndex}, escalate=${plan.escalate}); rationale="${plan.rationale.slice(0, 200)}"`,
+  );
+
+  await emitEvent({
+    salesOrderId: email.salesOrderId,
+    scenarioProgressId: null,
+    type: 'classifier_decision',
+    payload: {
+      scenario_key: 'llm-planned',
+      reasoning: plan.rationale,
+      escalate: plan.escalate,
+      escalation_question: plan.escalationQuestion ?? null,
+      planned_steps: plan.steps.map((s) => s.kind),
+      stop_after_index: plan.stopAfterIndex,
+      sender: args.sourceEmailType,
+    },
+  });
+
+  // Escalate path: write an aborted marker row + send the supervisor inquiry
+  // (existing helper). Don't fire any steps.
+  if (plan.escalate) {
+    const escalated = await prisma.scenarioProgress.create({
       data: {
         salesOrderId: email.salesOrderId,
-        scenarioKey: 'unknown',
+        scenarioKey: 'llm-planned',
         currentStepIndex: 0,
         state: 'aborted',
-        classifierOutput: JSON.stringify(selection),
+        classifierOutput: JSON.stringify({ escalate: true, rationale: plan.rationale, question: plan.escalationQuestion }),
         triggerEmailId: email.id,
-        error: `validated key ${selection.scenario_key} missing from SCENARIOS`,
+        generatedSteps: JSON.stringify([]),
+        stopAfterIndex: -1,
+        plannerRationale: plan.rationale,
+        error: plan.escalationQuestion ?? 'planner requested escalation',
       },
     });
     await emitEvent({
       salesOrderId: email.salesOrderId,
-      scenarioProgressId: broken.id,
+      scenarioProgressId: escalated.id,
       type: 'scenario_aborted',
-      payload: { scenario_key: selection.scenario_key, reason: 'registry miss after validation' },
+      payload: { scenario_key: 'llm-planned', reason: plan.escalationQuestion ?? 'planner requested escalation' },
     });
+    log(`[ENGINE] Planner requested escalation: ${plan.escalationQuestion ?? '(no question)'}`);
+    // TODO: trigger supervisor email here once we re-wire escalateToSupervisor
     return { success: true, matched: false, logs };
   }
 
+  // Empty plan = nothing to do (e.g. the email is just "thanks"). Mark
+  // completed immediately so the dashboard sees the no-op.
+  if (plan.steps.length === 0) {
+    const noop = await prisma.scenarioProgress.create({
+      data: {
+        salesOrderId: email.salesOrderId,
+        scenarioKey: 'llm-planned',
+        currentStepIndex: 0,
+        state: 'completed',
+        classifierOutput: JSON.stringify({ rationale: plan.rationale }),
+        triggerEmailId: email.id,
+        generatedSteps: JSON.stringify([]),
+        stopAfterIndex: -1,
+        plannerRationale: plan.rationale,
+      },
+    });
+    await emitEvent({
+      salesOrderId: email.salesOrderId,
+      scenarioProgressId: noop.id,
+      type: 'scenario_completed',
+      payload: { scenario_key: 'llm-planned', step_count: 0 },
+    });
+    log(`[ENGINE] Planner returned no-op (empty step list) — nothing to fire`);
+    return { success: true, matched: true, logs };
+  }
+
+  // Create the new ScenarioProgress row carrying the plan as JSON, then walk it.
   const newProgress = await prisma.scenarioProgress.create({
     data: {
       salesOrderId: email.salesOrderId,
-      scenarioKey: scenario.key,
+      scenarioKey: 'llm-planned',
       currentStepIndex: 0,
       state: 'ready',
-      classifierOutput: JSON.stringify(selection),
+      classifierOutput: JSON.stringify({ rationale: plan.rationale }),
       triggerEmailId: email.id,
+      generatedSteps: JSON.stringify(plan.steps),
+      stopAfterIndex: plan.stopAfterIndex,
+      plannerRationale: plan.rationale,
     },
   });
   await prisma.salesOrder.update({
     where: { id: email.salesOrderId },
-    data: { intentLabel: scenario.key },
+    data: { intentLabel: 'llm-planned' },
   });
   await emitEvent({
     salesOrderId: email.salesOrderId,
     scenarioProgressId: newProgress.id,
     type: 'scenario_started',
     payload: {
-      scenario_key: scenario.key,
+      scenario_key: 'llm-planned',
       trigger_email_id: email.id,
-      step_count: scenario.steps.length,
+      step_count: plan.steps.length,
+      planned_steps: plan.steps.map((s) => s.kind),
     },
   });
 
-  log(`[ENGINE] handled — scenario=${scenario.key} (${scenario.steps.length} step(s))`);
+  log(`[ENGINE] handled — plan with ${plan.steps.length} step(s): ${plan.steps.map((s) => s.kind).join(', ')}`);
 
-  // Anytime intents (R9 status_update, R11/R45 other) have NO step list — the
-  // sheet only marks them as "things you might receive at any stage". They map
-  // to dedicated handlers instead of the step walker.
-  if (scenario.key.includes('|anytime|')) {
-    await handleAnytimeIntent({
-      scenarioKey: scenario.key,
-      progressId: newProgress.id,
-      email,
-      log,
-    });
-    return { success: true, matched: true, logs };
-  }
-
-  // Fire step 0.
+  // Fire step 0; executeScenario walks until stopAfterIndex is reached.
   await executeScenario({ salesOrderId: email.salesOrderId, log });
 
   return { success: true, matched: true, logs };
@@ -925,141 +828,7 @@ async function handleAnytimeIntent(args: {
 // pre-classified fields so each handler skips its own classifier call.
 // -----------------------------------------------------------------------------
 
-async function dispatchNonScenarioAction(
-  cls: Exclude<Awaited<ReturnType<typeof import('./reply-classifier').classifyReply>>, { action: 'scenario' }>,
-  ctx: {
-    emailId: string;
-    salesOrderId: string;
-    replyHtml: string;
-    log: (m: string) => void;
-    logs: string[];
-  },
-): Promise<{ success: boolean; matched: boolean; logs: string[] }> {
-  const { emailId, replyHtml, log, logs } = ctx;
-  log(`[ENGINE] dispatching non-scenario action=${cls.action}`);
-
-  const {
-    handleDispatchConfirmation,
-    handleVehicleSplitConfirmation,
-    handleVehicleDetailsReply,
-    handleProductionReply,
-    handleProductionConfirmation,
-  } = await import('./auto-gui-trigger');
-  const { emitEvent } = await import('./scenario-events');
-
-  await emitEvent({
-    salesOrderId: ctx.salesOrderId,
-    type: 'classifier_decision',
-    payload: {
-      action: cls.action,
-      reasoning: 'reasoning' in cls ? cls.reasoning : undefined,
-    },
-  });
-
-  switch (cls.action) {
-    case 'dispatch_confirmation_decision': {
-      const r = await handleDispatchConfirmation(emailId, replyHtml, { decision: cls.decision });
-      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
-    }
-    case '2nd_release_decision': {
-      const r = await handleSecondReleaseReply(emailId, replyHtml, { decision: cls.decision });
-      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
-    }
-    case 'vehicle_split_decision': {
-      const r = await handleVehicleSplitConfirmation(emailId, replyHtml, {
-        decision: cls.decision,
-        amendments: cls.amendments,
-      });
-      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
-    }
-    case 'vehicle_details_extraction': {
-      const r = await handleVehicleDetailsReply(emailId, replyHtml, ctx.salesOrderId, {
-        vehicles: cls.vehicles.map((v) => ({
-          bundleNumber: v.bundleNumber,
-          vehicleNumber: v.vehicleNumber,
-          driverMobile: v.driverMobile,
-          containerNumber: v.containerNumber,
-        })),
-      });
-      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
-    }
-    case 'production_timeline': {
-      const r = await handleProductionReply(emailId, replyHtml, { days: cls.days });
-      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
-    }
-    case 'production_confirmation': {
-      const r = await handleProductionConfirmation(emailId, replyHtml, {
-        decision: cls.decision,
-        additionalDays: cls.additionalDays,
-      });
-      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
-    }
-    case 'invoice_pdf': {
-      // Delegate to the legacy invoice-batching path. Same code today's
-      // email-reply-checker would have run after PDF extraction.
-      const { checkAndSendBatchToAman } = await import('./auto-gui-trigger');
-      const email = await prisma.email.findUnique({
-        where: { id: emailId },
-        include: { loadingSlipItem: true },
-      });
-      const bundleId = email?.loadingSlipItem?.bundleId ?? null;
-      const r = await checkAndSendBatchToAman(ctx.salesOrderId, bundleId);
-      return { success: r.success, matched: true, logs: [...logs, ...r.logs] };
-    }
-    case 'new_order': {
-      // NEW ORDER emails shouldn't reach handleReplyV2 — they go through the
-      // separate checkForNewEmails cron path. Flag as a bug.
-      log(`[ENGINE] BUG: new_order action reached handleReplyV2 (emailId=${emailId})`);
-      await emitEvent({
-        salesOrderId: ctx.salesOrderId,
-        type: 'scenario_aborted',
-        payload: { reason: 'new_order_in_reply_path' },
-      });
-      return { success: false, matched: false, logs };
-    }
-    case 'other': {
-      log(
-        `[ENGINE] LLM classified as 'other' — description="${cls.description}" question="${cls.suggested_question_for_supervisor}"`,
-      );
-      const { escalateToSupervisor } = await import('./supervisor-escalation');
-      const result = await escalateToSupervisor({
-        salesOrderId: ctx.salesOrderId,
-        triggerEmailId: emailId,
-        description: cls.description,
-        suggested_question_for_supervisor: cls.suggested_question_for_supervisor,
-        reasoning: cls.reasoning,
-        log,
-      });
-
-      if (!result.sent && result.reason === 'hop_limit_exceeded') {
-        // Mark the active scenario (if any) aborted so the dashboard reflects
-        // the dead-end and operators stop seeing the SO as "in flight."
-        const activeProgress = await prisma.scenarioProgress.findFirst({
-          where: {
-            salesOrderId: ctx.salesOrderId,
-            state: { notIn: ['completed', 'aborted', 'failed'] },
-          },
-          orderBy: { createdAt: 'desc' },
-        });
-        if (activeProgress) {
-          await prisma.scenarioProgress.update({
-            where: { id: activeProgress.id },
-            data: { state: 'aborted', error: 'supervisor_hop_limit_exceeded' },
-          });
-        }
-        await emitEvent({
-          salesOrderId: ctx.salesOrderId,
-          type: 'scenario_aborted',
-          payload: { reason: 'supervisor_hop_limit_exceeded', hops: result.hops },
-        });
-        return { success: false, matched: false, logs };
-      }
-      return { success: result.sent, matched: !result.sent ? false : true, logs };
-    }
-  }
-}
-
-// Helper used above for compact email excerpts in event payloads.
+// Helper used by handleReplyV2 for compact email excerpts in event payloads.
 function stripAndExcerpt(html: string, maxLen: number): string {
   const stripped = html
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -1100,28 +869,11 @@ export async function executeScenario(args: {
     return;
   }
 
-  // Sheet-driven step list with the in-code SCENARIOS registry as fallback.
-  const { getScenarioFromKey: getScenarioFromKeyForExec } = await import('./sheet-scenario-adapter');
-  const scenario = getScenarioFromKeyForExec(progress.scenarioKey) ?? SCENARIOS[progress.scenarioKey];
+  // Planner-mode: read the JSON-stored step list off ScenarioProgress.
+  const plan = readPlanFromProgress(progress);
   const { emitEvent } = await import('./scenario-events');
-  if (!scenario) {
-    log(`[ENGINE] Unknown scenarioKey ${progress.scenarioKey} — marking failed`);
-    await prisma.scenarioProgress.update({
-      where: { id: progress.id },
-      data: { state: 'failed', error: 'unknown scenarioKey' },
-    });
-    await emitEvent({
-      salesOrderId: args.salesOrderId,
-      scenarioProgressId: progress.id,
-      type: 'scenario_failed',
-      payload: { scenario_key: progress.scenarioKey, reason: 'unknown scenarioKey' },
-    });
-    return;
-  }
-
-  // Past the end? Mark completed.
-  if (progress.currentStepIndex >= scenario.steps.length) {
-    log(`[ENGINE] Scenario ${scenario.key} completed for SO ${args.salesOrderId}`);
+  if (plan.steps.length === 0) {
+    log(`[ENGINE] ScenarioProgress ${progress.id} has no generated steps — marking completed (no-op plan)`);
     await prisma.scenarioProgress.update({
       where: { id: progress.id },
       data: { state: 'completed' },
@@ -1130,14 +882,34 @@ export async function executeScenario(args: {
       salesOrderId: args.salesOrderId,
       scenarioProgressId: progress.id,
       type: 'scenario_completed',
-      payload: { scenario_key: scenario.key, step_count: scenario.steps.length },
+      payload: { scenario_key: progress.scenarioKey, step_count: 0 },
     });
     return;
   }
 
-  const step = scenario.steps[progress.currentStepIndex];
+  // Past the end? Or past the planner's stopAfterIndex? Mark completed.
+  if (
+    progress.currentStepIndex >= plan.steps.length ||
+    progress.currentStepIndex > plan.stopAfterIndex
+  ) {
+    log(`[ENGINE] Plan completed for SO ${args.salesOrderId} (idx=${progress.currentStepIndex}, stopAfter=${plan.stopAfterIndex})`);
+    await prisma.scenarioProgress.update({
+      where: { id: progress.id },
+      data: { state: 'completed' },
+    });
+    await emitEvent({
+      salesOrderId: args.salesOrderId,
+      scenarioProgressId: progress.id,
+      type: 'scenario_completed',
+      payload: { scenario_key: progress.scenarioKey, step_count: plan.steps.length },
+    });
+    return;
+  }
+
+  const step = plan.steps[progress.currentStepIndex];
+  const plannedStep = plan.plannedSteps[progress.currentStepIndex];
   log(
-    `[ENGINE] SO ${args.salesOrderId} firing step ${progress.currentStepIndex + 1}/${scenario.steps.length}: ${step.kind}${
+    `[ENGINE] SO ${args.salesOrderId} firing step ${progress.currentStepIndex + 1}/${plan.steps.length}: ${step.kind}${
       step.label ? ` (${step.label})` : ''
     }`
   );
@@ -1145,11 +917,17 @@ export async function executeScenario(args: {
     salesOrderId: args.salesOrderId,
     scenarioProgressId: progress.id,
     type: 'step_fired',
-    payload: { step_index: progress.currentStepIndex, kind: step.kind, label: step.label ?? null, scenario_key: scenario.key },
+    payload: {
+      step_index: progress.currentStepIndex,
+      kind: step.kind,
+      label: step.label ?? null,
+      scenario_key: progress.scenarioKey,
+      rationale: plannedStep?.rationale ?? null,
+    },
   });
 
   try {
-    const next = await fireStep(step, progress, scenario, log);
+    const next = await fireStep(step, progress, plannedStep, log);
     if (next === 'advance_now') {
       // No-op step — emit step_completed immediately, advance, and recurse.
       const sapOutput = await collectSapOutputForStep(args.salesOrderId, step.kind);
@@ -1160,7 +938,7 @@ export async function executeScenario(args: {
         payload: {
           step_index: progress.currentStepIndex,
           kind: step.kind,
-          scenario_key: scenario.key,
+          scenario_key: progress.scenarioKey,
           ...(sapOutput ? { sap_output: sapOutput } : {}),
         },
       });
@@ -1168,12 +946,28 @@ export async function executeScenario(args: {
         where: { id: progress.id },
         data: { currentStepIndex: progress.currentStepIndex + 1, state: 'ready' },
       });
+      // Check if we've reached the planner-defined stop point.
+      const nextIndex = progress.currentStepIndex + 1;
+      if (nextIndex > plan.stopAfterIndex) {
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'completed' },
+        });
+        await emitEvent({
+          salesOrderId: args.salesOrderId,
+          scenarioProgressId: progress.id,
+          type: 'scenario_completed',
+          payload: { scenario_key: progress.scenarioKey, step_count: plan.steps.length },
+        });
+        return;
+      }
       await executeScenario({ salesOrderId: args.salesOrderId, log });
       return;
     }
     if (next === 'complete_segment') {
-      // Segmented execution: outbound email step fired, scenario terminates
-      // here. The next inbound email re-classifies and creates a new scenario.
+      // An outbound email fired. Per planner contract, this is where we pause
+      // (stop_after_index typically points at this step). Mark completed; the
+      // next inbound email will trigger a fresh planNextSteps call.
       const sapOutput = await collectSapOutputForStep(args.salesOrderId, step.kind);
       await emitEvent({
         salesOrderId: args.salesOrderId,
@@ -1182,7 +976,7 @@ export async function executeScenario(args: {
         payload: {
           step_index: progress.currentStepIndex,
           kind: step.kind,
-          scenario_key: scenario.key,
+          scenario_key: progress.scenarioKey,
           ...(sapOutput ? { sap_output: sapOutput } : {}),
         },
       });
@@ -1194,9 +988,9 @@ export async function executeScenario(args: {
         salesOrderId: args.salesOrderId,
         scenarioProgressId: progress.id,
         type: 'scenario_completed',
-        payload: { scenario_key: scenario.key, step_count: scenario.steps.length, kind: 'segment_boundary' },
+        payload: { scenario_key: progress.scenarioKey, step_count: plan.steps.length, kind: 'segment_boundary' },
       });
-      log(`[ENGINE] Segment boundary on ${step.kind} — scenario ${scenario.key} marked completed (segmented mode)`);
+      log(`[ENGINE] Segment boundary on ${step.kind} — plan completed for SO ${args.salesOrderId}`);
       return;
     }
     // Otherwise the step set its own pause state inside fireStep.
@@ -1227,31 +1021,33 @@ type FireResult = 'pause' | 'advance_now' | 'complete_segment';
 async function fireStep(
   step: Step,
   progress: { id: string; salesOrderId: string; classifierOutput: string },
-  _scenario: Scenario,
+  _plannedStep: PlannedStep | undefined,
   log: (msg: string) => void,
 ): Promise<FireResult> {
-  // classifierOutput is JSON of ScenarioSelection in Phase E, but legacy
-  // rows (Phase D) stored BranchReplyIntent. Both share the {materials} shape
-  // with {material_code, batch, operation, quantity}, so the field accesses
-  // below work for both.
-  type ClassifierMaterialShape = {
-    material_code: string;
-    batch?: string;
-    operation?: 'keep' | 'increase' | 'decrease' | 'delete';
-    quantity?: number;
-  };
-  const classification = JSON.parse(progress.classifierOutput) as {
-    materials: ClassifierMaterialShape[];
-  };
+  // In planner mode, fireStep cases that need data from the inbound reply
+  // call loadTriggerReply() + extractMaterialModifications() themselves —
+  // the LLM planner only emits step kinds, never data. Cases that work off
+  // DB state alone (stock_precheck, zso_visibility, zload1, ...) don't need
+  // any extraction at all.
 
   switch (step.kind) {
     // -------- Pre-VA02 free-stock gate (replaces "Zmatana" Step 2) --------
     case 'stock_precheck': {
       const { runStockPrecheck } = await import('./stock-precheck');
+      const { extractMaterialModifications } = await import('./material-modification-extractor');
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] stock_precheck — no trigger reply; assuming sufficient and advancing');
+        return 'advance_now';
+      }
+      const mods = await extractMaterialModifications({
+        salesOrderId: progress.salesOrderId,
+        replyHtml: trigger.replyHtml,
+      });
       const result = await runStockPrecheck({
         salesOrderId: progress.salesOrderId,
         classification: {
-          materials: classification.materials.map((m) => ({
+          materials: mods.materials.map((m) => ({
             material_code: m.material_code,
             operation: m.operation ?? 'keep',
             quantity: m.quantity ?? 0,
@@ -1321,22 +1117,33 @@ async function fireStep(
     // -------- SAP transactions --------
     case 'va02': {
       // VA02 in SAP changes the order quantity to a new (typically larger)
-      // value. We only run it for materials whose quantity is being INCREASED.
-      //   - decreases   → handled at LS time via ZLOAD2 (post-LS) or by the
-      //                   release-plan dispatching less than the order qty
-      //                   (pre-LS); no VA02 needed.
-      //   - deletes     → handled by dropping the material from the release
-      //                   plan / dispatching qty = 0; no VA02 needed.
-      // Running VA02 for a decrease/delete would push wrong (or zero)
-      // quantities into SAP, so filter those out here.
-      const soNumber = await soNumberFor(progress.salesOrderId);
-      const items = classification.materials
-        .filter((m) => m.operation === 'increase')
-        .map((m) => ({ material: m.material_code, orderQuantity: m.quantity ?? 0 }));
+      // value. Run ONLY for materials whose quantity is being INCREASED;
+      // decreases and deletes are handled downstream (zload2, zloading_close).
+      //
+      // The planner emitted this step kind without data; we extract the
+      // modification list from the trigger reply ourselves.
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] va02 — no trigger reply found; cannot extract modifications. Aborting.');
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'va02 step but no trigger reply on ScenarioProgress' },
+        });
+        return 'pause';
+      }
+      const { extractMaterialModifications } = await import('./material-modification-extractor');
+      const mods = await extractMaterialModifications({
+        salesOrderId: progress.salesOrderId,
+        replyHtml: trigger.replyHtml,
+      });
+      const items = mods.increases
+        .filter((m) => m.quantity !== undefined && m.quantity > 0)
+        .map((m) => ({ material: m.material_code, orderQuantity: m.quantity! }));
       if (items.length === 0) {
-        log('[ENGINE] va02 step has no increase materials in classifier output — skipping');
+        log('[ENGINE] va02 — extractor found no increase materials in reply; skipping');
         return 'advance_now';
       }
+      const soNumber = await soNumberFor(progress.salesOrderId);
       log(`[ENGINE] va02 firing for ${items.length} increase line(s): ${items.map((i) => `${i.material}→${i.orderQuantity}`).join(', ')}`);
       await triggerVa02(soNumber, items);
       await markAwaitingCallback(progress.id);
@@ -1365,7 +1172,58 @@ async function fireStep(
     }
 
     case 'zload2': {
-      // ZLOAD2 is keyed on LS number, not SO. Find an LSI for this SO.
+      // ZLOAD2 revises existing LS quantities (post-LS modification). Keyed
+      // on LS number; we pick any LSI for this SO. Extract the modification
+      // list from the trigger reply.
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] zload2 — no trigger reply found; cannot extract modifications. Aborting.');
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'zload2 step but no trigger reply on ScenarioProgress' },
+        });
+        return 'pause';
+      }
+      const { extractMaterialModifications } = await import('./material-modification-extractor');
+      const mods = await extractMaterialModifications({
+        salesOrderId: progress.salesOrderId,
+        replyHtml: trigger.replyHtml,
+      });
+      const requested = [...mods.increases, ...mods.decreases]
+        .filter((m) => m.quantity !== undefined && m.quantity > 0);
+      if (requested.length === 0) {
+        log('[ENGINE] zload2 — extractor found no inc/dec materials in reply; skipping');
+        return 'advance_now';
+      }
+      // ZLOAD2 needs the batch for each material — the branch's reply text
+      // rarely includes it. Look up each material's batch from the existing
+      // Material rows for this SO (they were populated by ZSO-VISIBILITY).
+      // If a material isn't found in the table, fall back to '' and let the
+      // downstream trigger function complain — better than silently dropping.
+      const materialRows = await prisma.material.findMany({
+        where: { salesOrderId: progress.salesOrderId },
+        select: { material: true, batch: true },
+      });
+      const batchByCode = new Map<string, string>();
+      for (const row of materialRows) {
+        if (row.batch && !batchByCode.has(row.material)) {
+          batchByCode.set(row.material, row.batch);
+        }
+      }
+      const items = requested.map((m) => ({
+        material: m.material_code,
+        batch: batchByCode.get(m.material_code) ?? '',
+        orderQuantity: m.quantity!,
+      }));
+      const missingBatch = items.filter((it) => !it.batch).map((it) => it.material);
+      if (missingBatch.length > 0) {
+        log(`[ENGINE] zload2 — batch missing for ${missingBatch.length} material(s): ${missingBatch.join(', ')}. Aborting.`);
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: `zload2 batch lookup failed: ${missingBatch.join(', ')}` },
+        });
+        return 'pause';
+      }
       const lsi = await prisma.loadingSlipItem.findFirst({
         where: { salesOrderId: progress.salesOrderId },
         select: { lsNumber: true },
@@ -1373,31 +1231,36 @@ async function fireStep(
       if (!lsi?.lsNumber) {
         throw new Error(`No LoadingSlipItem.lsNumber found for SO ${progress.salesOrderId}`);
       }
-      const items = classification.materials
-        .filter((m) => m.operation === 'increase' || m.operation === 'decrease')
-        .map((m) => ({
-          material: m.material_code,
-          batch: m.batch ?? '',
-          orderQuantity: m.quantity ?? 0,
-        }));
-      if (items.length === 0) {
-        log('[ENGINE] zload2 step has no inc/dec materials — skipping');
-        return 'advance_now';
-      }
+      log(`[ENGINE] zload2 firing on LS ${lsi.lsNumber} for ${items.length} line(s): ${items.map((i) => `${i.material}/${i.batch}→${i.orderQuantity}`).join(', ')}`);
       await triggerZload2(lsi.lsNumber, items);
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
 
     case 'zloading_close': {
-      const soNumber = await soNumberFor(progress.salesOrderId);
-      const codes = classification.materials
-        .filter((m) => m.operation === 'delete')
-        .map((m) => m.material_code);
+      // ZLOAD_Delete — remove materials from existing LS. Extract delete
+      // operations from the trigger reply.
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] zloading_close — no trigger reply found; aborting.');
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'zloading_close step but no trigger reply' },
+        });
+        return 'pause';
+      }
+      const { extractMaterialModifications } = await import('./material-modification-extractor');
+      const mods = await extractMaterialModifications({
+        salesOrderId: progress.salesOrderId,
+        replyHtml: trigger.replyHtml,
+      });
+      const codes = mods.deletes.map((m) => m.material_code);
       if (codes.length === 0) {
-        log('[ENGINE] zloading_close step has no delete materials — skipping');
+        log('[ENGINE] zloading_close — extractor found no delete materials; skipping');
         return 'advance_now';
       }
+      const soNumber = await soNumberFor(progress.salesOrderId);
+      log(`[ENGINE] zloading_close firing for ${codes.length} material(s): ${codes.join(', ')}`);
       await triggerZloadingClose(soNumber, codes);
       await markAwaitingCallback(progress.id);
       return 'pause';
@@ -1632,28 +1495,85 @@ async function fireStep(
     }
 
     case 'email_to_plant': {
-      // LS-to-plant emails are sent from handleVehicleDetailsReply once vehicle
-      // details land. For the engine's purposes this step is fire-and-forget:
-      // we don't re-send here, we just advance (the email goes out from the
-      // existing pipeline; the engine's role is to track the milestone).
-      // In segmented mode this is still a segment boundary (it's an outbound).
-      log('[ENGINE] email_to_plant — existing pipeline sends LS to plant on vehicle reply');
+      // Branch's vehicle-details reply has arrived; extract truck/driver/LR,
+      // persist on the Bundle, and forward LS PDFs to the plant. The existing
+      // handleVehicleDetailsReply does extraction + persistence + sending in
+      // one call (its own internal LLM extractor handles the parsing).
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] email_to_plant — no trigger reply; cannot extract vehicle details. Aborting.');
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'email_to_plant step but no trigger reply' },
+        });
+        return 'pause';
+      }
+      const { handleVehicleDetailsReply } = await import('./auto-gui-trigger');
+      const result = await handleVehicleDetailsReply(trigger.emailId, trigger.replyHtml, progress.salesOrderId);
+      for (const line of result.logs) log(line);
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
       return 'advance_now';
     }
 
-    case 'email_2nd_release': {
-      const classBranch = classification as BranchReplyIntent;
-      const triggerEmail = await prisma.email.findUnique({
-        where: { id: (await loadProgress(progress.id)).triggerEmailId ?? '' },
-        select: { gmailThreadId: true, gmailMessageId: true },
+    case 'process_plant_invoice': {
+      // Plant replied with an invoice PDF on plant_ls. The PDF was already
+      // uploaded to R2 by the email-reply-checker pre-pass (Email.replyPdfUrl
+      // is populated). Fire the batch sender (ZLOAD3 + ZSO_Auto) which reads
+      // the PDFs by SO/bundle.
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: progress.salesOrderId },
+        include: { loadingSlipItem: { select: { bundleId: true } } as { select: { bundleId: true } } } as never,
       }).catch(() => null);
+      // We don't actually need the include — the batch sender resolves
+      // bundleId from the trigger email's LSI directly.
+      const trigger = await loadTriggerReply(progress.id);
+      const triggerEmailRow = trigger
+        ? await prisma.email.findUnique({
+            where: { id: trigger.emailId },
+            include: { loadingSlipItem: true },
+          })
+        : null;
+      const bundleId = triggerEmailRow?.loadingSlipItem?.bundleId ?? null;
+      const { checkAndSendBatchToAman } = await import('./auto-gui-trigger');
+      const r = await checkAndSendBatchToAman(progress.salesOrderId, bundleId);
+      for (const line of r.logs) log(line);
+      // Suppress the unused `so` warning above — it was a defensive pre-load.
+      void so;
+      return 'advance_now';
+    }
+
+    case 'email_2nd_release': {
+      // Ask branch to confirm the post-VA02 plan. Extract the modification
+      // list from the trigger reply (same as va02 reads it).
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] email_2nd_release — no trigger reply; cannot summarise modifications. Aborting.');
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'email_2nd_release but no trigger reply' },
+        });
+        return 'pause';
+      }
+      const { extractMaterialModifications } = await import('./material-modification-extractor');
+      const mods = await extractMaterialModifications({
+        salesOrderId: progress.salesOrderId,
+        replyHtml: trigger.replyHtml,
+      });
+      // sendSecondReleaseEmail expects BranchReplyIntent['materials'] shape:
+      // { material_code, batch, operation, quantity }
+      const modifications = mods.materials.map((m) => ({
+        material_code: m.material_code,
+        batch: '',
+        operation: m.operation ?? 'keep' as const,
+        quantity: m.quantity ?? 0,
+      }));
       await sendSecondReleaseEmail({
         salesOrderId: progress.salesOrderId,
-        modifications: classBranch.materials,
-        threadAnchor: triggerEmail
-          ? { gmailThreadId: triggerEmail.gmailThreadId, gmailMessageId: triggerEmail.gmailMessageId }
-          : null,
+        modifications,
+        threadAnchor: {
+          gmailThreadId: trigger.gmailThreadId,
+          gmailMessageId: trigger.gmailMessageId,
+        },
         log,
       });
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
@@ -1663,18 +1583,34 @@ async function fireStep(
 
     case 'email_to_branch_notifying_plant_change': {
       // R46-R51 — branch needs to ack plant-proposed modifications before we
-      // touch SAP. The classification carries the plant's proposed materials.
-      const classBranch = classification as BranchReplyIntent;
-      const triggerEmail = await prisma.email.findUnique({
-        where: { id: (await loadProgress(progress.id)).triggerEmailId ?? '' },
-        select: { gmailThreadId: true, gmailMessageId: true },
-      }).catch(() => null);
+      // touch SAP. Extract the plant's proposed materials from its reply.
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] email_to_branch_notifying_plant_change — no trigger reply; aborting.');
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'plant-change-notify step but no trigger reply' },
+        });
+        return 'pause';
+      }
+      const { extractMaterialModifications } = await import('./material-modification-extractor');
+      const mods = await extractMaterialModifications({
+        salesOrderId: progress.salesOrderId,
+        replyHtml: trigger.replyHtml,
+      });
+      const modifications = mods.materials.map((m) => ({
+        material_code: m.material_code,
+        batch: '',
+        operation: m.operation ?? 'keep' as const,
+        quantity: m.quantity ?? 0,
+      }));
       await sendPlantChangeNotificationEmail({
         salesOrderId: progress.salesOrderId,
-        modifications: classBranch?.materials ?? [],
-        threadAnchor: triggerEmail
-          ? { gmailThreadId: triggerEmail.gmailThreadId, gmailMessageId: triggerEmail.gmailMessageId }
-          : null,
+        modifications,
+        threadAnchor: {
+          gmailThreadId: trigger.gmailThreadId,
+          gmailMessageId: trigger.gmailMessageId,
+        },
         log,
       });
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
@@ -1871,31 +1807,25 @@ export async function advanceScenario(salesOrderId: string): Promise<void> {
   });
   if (!progress) return;
 
-  // Sheet-driven step list with legacy SCENARIOS as fallback.
-  const { getScenarioFromKey: getScenarioFromKeyForAdvanceLog } = await import('./sheet-scenario-adapter');
-  const scenario = getScenarioFromKeyForAdvanceLog(progress.scenarioKey) ?? SCENARIOS[progress.scenarioKey];
+  const plan = readPlanFromProgress(progress);
 
   // Emit step_completed for the step that just finished (the one at the
-  // current index BEFORE we increment). This is the source-of-truth marker
-  // for "step N is done" — the LLM uses it to compute stepsAlreadyExecuted
-  // in mid-flow re-entry.
-  if (scenario) {
-    const completedStep = scenario.steps[progress.currentStepIndex];
-    if (completedStep) {
-      const { emitEvent } = await import('./scenario-events');
-      const sapOutput = await collectSapOutputForStep(salesOrderId, completedStep.kind);
-      await emitEvent({
-        salesOrderId,
-        scenarioProgressId: progress.id,
-        type: 'step_completed',
-        payload: {
-          step_index: progress.currentStepIndex,
-          kind: completedStep.kind,
-          scenario_key: progress.scenarioKey,
-          ...(sapOutput ? { sap_output: sapOutput } : {}),
-        },
-      });
-    }
+  // current index BEFORE we increment).
+  const completedStep = plan.steps[progress.currentStepIndex];
+  if (completedStep) {
+    const { emitEvent } = await import('./scenario-events');
+    const sapOutput = await collectSapOutputForStep(salesOrderId, completedStep.kind);
+    await emitEvent({
+      salesOrderId,
+      scenarioProgressId: progress.id,
+      type: 'step_completed',
+      payload: {
+        step_index: progress.currentStepIndex,
+        kind: completedStep.kind,
+        scenario_key: progress.scenarioKey,
+        ...(sapOutput ? { sap_output: sapOutput } : {}),
+      },
+    });
   }
 
   await prisma.scenarioProgress.update({
@@ -1932,15 +1862,8 @@ export async function maybeAdvanceScenario(
   });
   if (!progress) return;
 
-  // Sheet-driven lookup with legacy SCENARIOS as fallback — same as other
-  // sites in this file. Without this, scenarios whose sheet step lists
-  // differ in length from the legacy registry would advance into undefined
-  // territory and stall.
-  const { getScenarioFromKey: getScenarioFromKeyForAdvance } = await import('./sheet-scenario-adapter');
-  const scenario = getScenarioFromKeyForAdvance(progress.scenarioKey) ?? SCENARIOS[progress.scenarioKey];
-  if (!scenario) return;
-
-  const currentStep = scenario.steps[progress.currentStepIndex];
+  const plan = readPlanFromProgress(progress);
+  const currentStep = plan.steps[progress.currentStepIndex];
   if (!currentStep) return;
 
   // Guard: workStep, if provided, must match the StepKind of the current step.

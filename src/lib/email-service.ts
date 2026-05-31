@@ -82,6 +82,24 @@ export async function sendLSEmail(
       },
     });
 
+    // Audit-trail event so the LLM planner sees the plant_ls milestone.
+    try {
+      const { emitEvent } = await import('./scenario-events');
+      await emitEvent({
+        salesOrderId,
+        type: 'email_sent',
+        payload: {
+          emailType: 'plant_ls',
+          recipient: plantEmail,
+          subject,
+          ls_number: lsNumber,
+          gmailMessageId: messageId,
+        },
+      });
+    } catch {
+      // Audit emission must never break the primary flow.
+    }
+
     console.log(`[Email] Created email record for LS ${lsNumber}`);
 
     return { messageId, threadId };

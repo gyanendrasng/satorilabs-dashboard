@@ -127,15 +127,15 @@ export async function checkForReplies(): Promise<{
       // Route based on emailType
       const emailType = (email as any).emailType as string | null;
 
-      // ─── Unified classifier (Phase 3) ──────────────────────────────────
-      // When UNIFIED_CLASSIFIER_ENABLED=true, route ALL replies through
-      // handleReplyV2. The dispatcher inside scenario-engine maps the LLM's
-      // classification (scenario / dispatch_confirmation_decision / etc.) to
-      // the appropriate refactored handler with pre-classified fields.
-      // Per-type branches below stay as the flag-off fallback.
-      const unifiedFlag = (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
-      if (unifiedFlag && email.salesOrderId) {
-        log(`[EmailChecker] Unified classifier → handleReplyV2 for emailType=${emailType ?? 'null'} SO ${soNumber}`);
+      // ─── LLM planner (default path) ─────────────────────────────────────
+      // Route ALL SO-tied replies through handleReplyV2, which now uses the
+      // LLM planner (src/lib/llm-planner.ts). The planner reads the audit
+      // trail + email thread and emits a step list to execute up to the next
+      // outbound email. Per-type branches below remain only as a defensive
+      // fallback if LLM_PLANNER_DISABLED=true is set.
+      const plannerDisabled = (process.env.LLM_PLANNER_DISABLED ?? 'false').toLowerCase() === 'true';
+      if (!plannerDisabled && email.salesOrderId) {
+        log(`[EmailChecker] Planner → handleReplyV2 for emailType=${emailType ?? 'null'} SO ${soNumber}`);
         const sender: 'branch' | 'plant' = emailType === 'plant_ls' ? 'plant' : 'branch';
         const { handleReplyV2 } = await import('./scenario-engine');
         const originalEmailHtml = await getMessageBody(email.gmailMessageId);
@@ -514,53 +514,24 @@ export async function checkForNewEmails(): Promise<{
 
         const stripped = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        // Extract customer_id + SO numbers. When the unified classifier flag
-        // is on, route through `classifyReply` (action='new_order'). The
-        // legacy path (`extractOrderInfoWithAI` + regex fallback) stays
-        // available for flag-off behavior.
+        // Extract customer_id + SO numbers via the dedicated small LLM
+        // extraction (extractOrderInfoWithAI) with a regex fallback. The
+        // planner does NOT handle NEW ORDER intake — that's pure data
+        // extraction (customer_id + so_numbers), not workflow planning.
         let customerId: string | null = null;
         let soNumbers: string[] = [];
-        const unifiedFlag = (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
-        if (unifiedFlag) {
-          try {
-            const { classifyReply } = await import('./reply-classifier');
-            const cls = await classifyReply({
-              soNumber: null,
-              sender: null,
-              stage: null,
-              emailThread: stripped,
-              materials: [],
-              validKeys: [],
-              triggerEmailType: null,
-              gmailMessageId: msg.id,
-            });
-            if (cls.action === 'new_order') {
-              customerId = cls.customer_id;
-              soNumbers = cls.so_numbers;
-              log(`[NewEmail] unified classifier extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
-            } else {
-              log(`[NewEmail] unified classifier returned action="${cls.action}" — no SO numbers extracted`);
-            }
-          } catch (clsErr) {
-            log(`[NewEmail] classifyReply failed (${clsErr instanceof Error ? clsErr.message : String(clsErr)}), falling back to regex`);
-            const fb = extractOrderInfoFallback(stripped);
-            customerId = fb.customerId;
-            soNumbers = fb.soNumbers;
-          }
-        } else {
-          try {
-            const extracted = await extractOrderInfoWithAI(stripped);
-            customerId = extracted.customerId;
-            soNumbers = extracted.soNumbers;
-            log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
-          } catch (aiErr) {
-            log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
-            const fb = extractOrderInfoFallback(stripped);
-            customerId = fb.customerId;
-            soNumbers = fb.soNumbers;
-            if (soNumbers.length > 0) {
-              log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
-            }
+        try {
+          const extracted = await extractOrderInfoWithAI(stripped);
+          customerId = extracted.customerId;
+          soNumbers = extracted.soNumbers;
+          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+        } catch (aiErr) {
+          log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
+          const fb = extractOrderInfoFallback(stripped);
+          customerId = fb.customerId;
+          soNumbers = fb.soNumbers;
+          if (soNumbers.length > 0) {
+            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
           }
         }
 
@@ -637,11 +608,10 @@ export async function checkForNewEmails(): Promise<{
         }
         log(`[NewEmail] PO ${poNumber}: ${createdSoNumbers.length} new SO(s), ${soNumbers.length - createdSoNumbers.length} already existed (total ${soNumbers.length})`);
 
-        // Persist the classifier decision as a `classifier_decision` event
-        // per SO, mirroring what handleReplyV2 does for replies. Lets the
-        // dashboard / audit queries surface the classifier output uniformly
-        // across all email types.
-        if (unifiedFlag && soNumbers.length > 0) {
+        // Persist `email_received` + `classifier_decision` events per SO so
+        // the LLM planner's audit trail captures the NEW ORDER inbound as
+        // the first link in the event chain.
+        if (soNumbers.length > 0) {
           try {
             const { emitEvent } = await import('./scenario-events');
             const allSos = await prisma.salesOrder.findMany({
@@ -649,6 +619,17 @@ export async function checkForNewEmails(): Promise<{
               select: { id: true, soNumber: true },
             });
             for (const so of allSos) {
+              await emitEvent({
+                salesOrderId: so.id,
+                type: 'email_received',
+                payload: {
+                  emailType: 'new_order',
+                  sender: 'branch',
+                  subject: subject ?? '',
+                  body_excerpt: stripped.slice(0, 300),
+                  gmailMessageId: msg.id,
+                },
+              });
               await emitEvent({
                 salesOrderId: so.id,
                 type: 'classifier_decision',
@@ -662,7 +643,7 @@ export async function checkForNewEmails(): Promise<{
               });
             }
           } catch (evErr) {
-            log(`[NewEmail] classifier_decision event emit warning: ${evErr instanceof Error ? evErr.message : evErr}`);
+            log(`[NewEmail] audit-trail event emit warning: ${evErr instanceof Error ? evErr.message : evErr}`);
           }
         }
 

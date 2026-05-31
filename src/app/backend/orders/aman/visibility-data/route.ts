@@ -151,6 +151,36 @@ export async function POST(request: Request) {
       `[VisibilityData] Persisted ${persisted}/${materials.length} Material row(s) for SO ${soNumber}${skipped > 0 ? ` (${skipped} skipped — missing code)` : ''}`
     );
 
+    // Audit-trail event so the LLM planner sees ZSO-VISIBILITY as a
+    // completed milestone the next time it builds a plan for this SO.
+    try {
+      const { emitEvent } = await import('@/lib/scenario-events');
+      const matSample = materials.slice(0, 3).map((m) => {
+        const code = m.material ?? m.material_code ?? '?';
+        const avail = m.available_stock_for_so ?? '?';
+        return `${code}=${avail}`;
+      }).join(', ');
+      const more = materials.length > 3 ? `, +${materials.length - 3} more` : '';
+      await emitEvent({
+        salesOrderId: salesOrder.id,
+        type: 'step_completed',
+        payload: {
+          kind: 'zso_visibility',
+          scenario_key: 'cron-driven',
+          sap_output: {
+            materials: materials.map((m) => ({
+              material: m.material ?? m.material_code,
+              ordered: m.order_quantity,
+              available: m.available_stock_for_so,
+            })),
+          },
+          summary: `materials ${matSample}${more}`,
+        },
+      });
+    } catch {
+      // Audit emission must never break the primary flow.
+    }
+
     // Step 2: buffer the per-SO email body + materials (raw JSON, for combined-email assembly).
     const materialsJson = JSON.stringify(materials);
     await prisma.email.create({

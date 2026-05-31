@@ -267,6 +267,14 @@ model ScenarioProgress {
   // | 'completed' | 'aborted' | 'failed'
   state            String   @default("ready")
   classifierOutput String              // JSON of ScenarioSelection (or legacy BranchReplyClassification)
+  // LLM planner mode (scenarioKey='llm-planned'):
+  //   generatedSteps   = JSON array of PlannedStep { kind, rationale?, args? }
+  //   stopAfterIndex   = index in generatedSteps where the walker pauses
+  //                      (typically the index of the last outbound email)
+  //   plannerRationale = the LLM's overall reasoning, kept for audit
+  generatedSteps   String?
+  stopAfterIndex   Int?
+  plannerRationale String?
   triggerEmailId   String?
   lastWorkId       String?
   lastEmailId      String?

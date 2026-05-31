@@ -882,12 +882,13 @@ export async function sendVehicleDetailsForBundle(
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
   }
 
+  const leadSoIdForBundle = bundle.items[0]?.salesOrderId ?? bundle.materials[0]?.salesOrderId;
   await prisma.email.create({
     data: {
       bundleId,
       purchaseOrderId: bundle.purchaseOrderId,
       // also link to the lead SO so existing reply-checker SO logging stays sane
-      salesOrderId: bundle.items[0]?.salesOrderId ?? bundle.materials[0]?.salesOrderId,
+      salesOrderId: leadSoIdForBundle,
       gmailMessageId: sent.messageId,
       gmailThreadId: sent.threadId,
       recipientEmail: BRANCH_EMAIL,
@@ -898,6 +899,26 @@ export async function sendVehicleDetailsForBundle(
       sentBody: body,
     },
   });
+
+  // Audit-trail event for the LLM planner — keyed to the bundle's lead SO.
+  if (leadSoIdForBundle) {
+    try {
+      const { emitEvent } = await import('./scenario-events');
+      await emitEvent({
+        salesOrderId: leadSoIdForBundle,
+        type: 'email_sent',
+        payload: {
+          emailType: 'vehicle_details',
+          recipient: BRANCH_EMAIL,
+          subject,
+          bundle_number: bundle.bundleNumber,
+          gmailMessageId: sent.messageId,
+        },
+      });
+    } catch {
+      // Audit emission must never break the primary flow.
+    }
+  }
 
   log(`[VehicleDetails] Sent vehicle-details email for Bundle ${bundle.bundleNumber} (PO ${bundle.purchaseOrder.poNumber})`);
   return { sent: true, logs };
@@ -1037,6 +1058,32 @@ export async function sendCombinedVehicleDetailsEmailForPo(
       sentBody: body,
     },
   });
+
+  // Audit-trail event per SO in the PO so the LLM planner sees this milestone
+  // for every SO that lands a reply on this thread.
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    const soIdsInPo = new Set<string>();
+    for (const b of po.bundles) {
+      for (const it of b.items) if (it.salesOrderId) soIdsInPo.add(it.salesOrderId);
+      for (const m of b.materials) if (m.salesOrderId) soIdsInPo.add(m.salesOrderId);
+    }
+    for (const sid of soIdsInPo) {
+      await emitEvent({
+        salesOrderId: sid,
+        type: 'email_sent',
+        payload: {
+          emailType: 'vehicle_details',
+          recipient: BRANCH_EMAIL,
+          subject,
+          bundle_count: po.bundles.length,
+          gmailMessageId: sent.messageId,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
 
   log(`[VehicleDetails] Sent combined vehicle-details email for PO ${po.poNumber} (${po.bundles.length} bundle(s))`);
   return { sent: true, logs };
@@ -1308,6 +1355,28 @@ export async function sendDispatchConfirmationEmail(args: {
       dispatchRound: po.dispatchRound,
     },
   });
+
+  // Audit-trail event for the LLM planner — one per SO in the plan.
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    for (const plan of plans) {
+      await emitEvent({
+        salesOrderId: plan.salesOrderId,
+        type: 'email_sent',
+        payload: {
+          emailType: 'dispatch_confirmation',
+          recipient: BRANCH_EMAIL,
+          subject,
+          body_excerpt: body.slice(0, 200),
+          gmailMessageId: sent.messageId,
+          dispatchRound: po.dispatchRound,
+          total_tonnes: totalTonnes,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
 
   log(`[DispatchConfirm] Confirmation email sent to ${BRANCH_EMAIL} for PO ${po.poNumber} (${plans.length} SO(s), ${totalTonnes.toFixed(2)} t)`);
 }
@@ -2334,6 +2403,29 @@ export async function assembleAndSendCombinedEmail(
     },
   });
 
+  // Audit-trail event so the LLM planner sees the ls_dispatch milestone
+  // when reasoning about the next inbound reply. Emit one per included SO
+  // (multi-SO PO emails are joint outbound but per-SO downstream flow).
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    for (const so of includedSOs) {
+      await emitEvent({
+        salesOrderId: so.id,
+        type: 'email_sent',
+        payload: {
+          emailType: 'ls_dispatch',
+          recipient: BRANCH_EMAIL,
+          subject,
+          body_excerpt: combinedBody.slice(0, 200),
+          gmailMessageId: messageId,
+          dispatchRound: currentRound,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
+
   // Mark all buffered rows for this PO as consumed
   await prisma.email.updateMany({
     where: {
@@ -2582,44 +2674,13 @@ export async function handleVehicleDetailsReply(
 
   const soNumber = email.salesOrder!.soNumber;
 
-  // Phase 2: when the unified dispatcher has already extracted vehicle data,
-  // skip the legacy modification-intercept + OpenAI extraction below and jump
-  // straight to the per-vehicle save logic.
+  // In planner-driven mode this function runs as the deterministic worker
+  // for the `email_to_plant` step. The planner has already decided that the
+  // inbound reply is a vehicle-details reply (not a modification request);
+  // we do NOT re-enter the reply pipeline. Job is strictly: extract → save
+  // bundle → forward LS to plant. No reentrancy. No reclassification.
   if (preExtracted) {
     log(`[VehicleDetails] using pre-extracted vehicles (${preExtracted.vehicles.length} set(s))`);
-  }
-
-  // Scenario-engine intercept: branch may piggyback a modification request on
-  // a vehicle-details reply ("vehicle is GJ12X, but please reduce X to 50").
-  // When the flag is on, classify intent first. If 'modify', hand off to the
-  // engine and bail out of vehicle-extraction entirely. The engine drives the
-  // appropriate post-LS modification scenario.
-  // Skipped when pre-extracted (dispatcher already classified as
-  // vehicle_details_extraction — if it were a modification, dispatcher would
-  // have routed to action='scenario' instead).
-  if (
-    !preExtracted &&
-    (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
-  ) {
-    try {
-      const { handleReplyV2 } = await import('./scenario-engine');
-      const r = await handleReplyV2({
-        emailId,
-        replyHtml,
-        originalEmailHtml: email.sentBody ?? '',
-        sourceEmailType: 'branch',
-      });
-      if (r.matched) {
-        log(`[VehicleDetails] Reply was a modification request — handed off to scenario engine for SO ${soNumber}`);
-        logs.push(...r.logs);
-        return { success: r.success, logs };
-      }
-      // Engine returned matched=false (intent wasn't 'modify' or no scenario
-      // matched). Fall through to the existing vehicle-extraction path.
-    } catch (engineErr) {
-      log(`[VehicleDetails] Engine pre-classifier warning: ${engineErr instanceof Error ? engineErr.message : engineErr}`);
-      // Fall through on engine error — never block vehicle extraction.
-    }
   }
 
   log(`[VehicleDetails] Extracting vehicle details from reply for SO ${soNumber}`);
