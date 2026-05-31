@@ -74,7 +74,10 @@ export async function POST(request: Request) {
       const bundles = await prisma.bundle.findMany({
         where: {
           purchaseOrderId: salesOrder.purchaseOrderId,
-          items: { some: { salesOrderId: salesOrder.id } },
+          // After the LoadingSlip refactor, a bundle reaches LSIs through
+          // its LoadingSlips. Pick bundles that contain at least one LS for
+          // this SO.
+          loadingSlips: { some: { salesOrderId: salesOrder.id } },
         },
         select: { id: true },
       });
@@ -131,8 +134,9 @@ export async function POST(request: Request) {
     const needPositionalMapping = rows.some((r) => !r.ls_number);
     let positionalLsis: Array<{ id: string; lsNumber: string; orderQuantity: number | null }> = [];
     if (needPositionalMapping) {
+      // After the LoadingSlip refactor, LSIs reach a bundle via their parent LS.
       const where = bundleId
-        ? { salesOrderId: salesOrder.id, bundleId }
+        ? { salesOrderId: salesOrder.id, loadingSlip: { bundleId } }
         : { salesOrderId: salesOrder.id };
       const lsisInOrder = await prisma.loadingSlipItem.findMany({
         where,
@@ -204,9 +208,11 @@ export async function POST(request: Request) {
       });
     }
 
-    // Mark replied emails processed and LSIs completed (scoped to bundle when known).
+    // Mark replied emails processed and LSIs completed (scoped to bundle when
+    // known). After the LoadingSlip refactor, LSIs reach a bundle via their
+    // parent LS, so we join through loadingSlip.bundleId.
     const lsiWhere = bundleId
-      ? { salesOrderId: salesOrder.id, bundleId }
+      ? { salesOrderId: salesOrder.id, loadingSlip: { bundleId } }
       : { salesOrderId: salesOrder.id };
     const lsiList = await prisma.loadingSlipItem.findMany({
       where: lsiWhere,

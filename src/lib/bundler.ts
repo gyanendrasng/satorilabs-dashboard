@@ -139,14 +139,23 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
   }
   const capacityKg = weightageT * 1000;
 
-  // Idempotency: detach Materials and LSIs from existing bundles, drop bundles.
+  // Idempotency: detach existing bundle linkages. With the LoadingSlip
+  // refactor, LSIs reach a bundle through their parent LS — so we:
+  //   1. Detach LSIs from LSs (set loadingSlipId=NULL).
+  //   2. Delete LSs for this PO (FK cascade on Bundle takes them out too,
+  //      but explicit removal here keeps the sequence obvious).
+  //   3. Detach Materials from bundles.
+  //   4. Delete Bundles.
   await prisma.material.updateMany({
     where: { salesOrder: { purchaseOrderId }, bundleId: { not: null } },
     data: { bundleId: null },
   });
   await prisma.loadingSlipItem.updateMany({
-    where: { salesOrder: { purchaseOrderId }, bundleId: { not: null } },
-    data: { bundleId: null },
+    where: { salesOrder: { purchaseOrderId }, loadingSlipId: { not: null } },
+    data: { loadingSlipId: null },
+  });
+  await prisma.loadingSlip.deleteMany({
+    where: { salesOrder: { purchaseOrderId } },
   });
   await prisma.bundle.deleteMany({ where: { purchaseOrderId } });
 
@@ -191,46 +200,9 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
 }
 
 /**
- * After ZLOAD1 lands and a LoadingSlipItem is created, copy the matching
- * Material.bundleId onto the LSI so downstream (vehicle details, plant
- * email, ZLOAD3-B1) can group LSIs by bundle.
- *
- * Match by salesOrderId + material code. With same-material grouping enforced
- * in `packMaterialsIntoBundles`, all candidate Materials should share the
- * same bundleId — the bundleNumber-asc sort below is now a defensive tie-
- * breaker. We log a warning if multiple distinct bundleIds appear (means
- * the invariant was violated, e.g. by an overflow split).
+ * (Removed) linkLsiToBundle copied Material.bundleId onto LoadingSlipItem
+ * so downstream code could group LSIs by bundle. With the LoadingSlip
+ * refactor, LSIs reach their bundle via LoadingSlip.bundleId, set by
+ * /backend/orders/aman/zload1-data when SAP returns the LS PDF. No
+ * post-hoc linking step is needed.
  */
-export async function linkLsiToBundle(loadingSlipItemId: string): Promise<void> {
-  const lsi = await prisma.loadingSlipItem.findUnique({
-    where: { id: loadingSlipItemId },
-    select: { id: true, salesOrderId: true, material: true, bundleId: true },
-  });
-  if (!lsi || lsi.bundleId) return;
-
-  const candidates = await prisma.material.findMany({
-    where: {
-      salesOrderId: lsi.salesOrderId,
-      material: lsi.material,
-      bundleId: { not: null },
-    },
-    include: { bundle: { select: { bundleNumber: true } } },
-  });
-  if (candidates.length === 0) return;
-
-  const distinctBundles = new Set(candidates.map((c) => c.bundleId));
-  if (distinctBundles.size > 1) {
-    console.warn(
-      `[Bundler] linkLsiToBundle: ${candidates.length} candidates for SO ${lsi.salesOrderId} / ${lsi.material} span ${distinctBundles.size} bundles — likely an overflow split. Picking smallest bundleNumber.`
-    );
-  }
-
-  candidates.sort((a, b) => (a.bundle?.bundleNumber ?? 999) - (b.bundle?.bundleNumber ?? 999));
-  const winner = candidates[0];
-  if (!winner.bundleId) return;
-
-  await prisma.loadingSlipItem.update({
-    where: { id: loadingSlipItemId },
-    data: { bundleId: winner.bundleId },
-  });
-}

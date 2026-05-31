@@ -56,7 +56,10 @@ export async function checkForReplies(): Promise<{
     },
     include: {
       salesOrder: true,
-      loadingSlipItem: true,
+      loadingSlip: { select: { id: true, bundleId: true, lsNumber: true } },
+      loadingSlipItem: {
+        include: { loadingSlip: { select: { id: true, bundleId: true } } },
+      },
     },
   });
 
@@ -273,7 +276,13 @@ export async function checkForReplies(): Promise<{
         // bundleId comes from the LSI the email is tied to; null = legacy
         // (whole-SO) behavior.
         if (email.salesOrderId) {
-          const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
+          // Prefer the email's direct LS link (new path); fall back to the
+          // LSI → LoadingSlip chain for legacy emails. Either way resolves
+          // to the bundle that ZLOAD3-B1 should batch over.
+          const lsiBundleId =
+            email.loadingSlip?.bundleId ??
+            email.loadingSlipItem?.loadingSlip?.bundleId ??
+            null;
           const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
           logs.push(...batchResult.logs);
         }
@@ -307,7 +316,10 @@ export async function checkForReplies(): Promise<{
 
       // Check if all emails for this (Bundle, SO) pair now have replies.
       if (email.salesOrderId) {
-        const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
+        const lsiBundleId =
+          email.loadingSlip?.bundleId ??
+          email.loadingSlipItem?.loadingSlip?.bundleId ??
+          null;
         const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
         logs.push(...batchResult.logs);
       }

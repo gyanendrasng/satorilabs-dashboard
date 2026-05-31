@@ -68,10 +68,19 @@ export async function sendLSEmail(
 
     console.log(`[Email] Successfully sent LS ${lsNumber} for SO ${soNumber} - messageId: ${messageId}, threadId: ${threadId}`);
 
+    // Resolve the LoadingSlip this LSI belongs to so the Email row can
+    // link directly to the LS. Per-LS replies on plant_ls then route by
+    // `loadingSlipId` rather than guessing via LSI.
+    const lsi = await prisma.loadingSlipItem.findUnique({
+      where: { id: loadingSlipItemId },
+      select: { loadingSlipId: true },
+    });
+
     // Create Email record in database
     await prisma.email.create({
       data: {
         salesOrderId,
+        loadingSlipId: lsi?.loadingSlipId ?? null,
         loadingSlipItemId,
         gmailMessageId: messageId,
         gmailThreadId: threadId,

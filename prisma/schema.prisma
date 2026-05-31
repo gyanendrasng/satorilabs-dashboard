@@ -146,8 +146,8 @@ model Bundle {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  items         LoadingSlipItem[]
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  loadingSlips  LoadingSlip[]
   materials     Material[]
   emails        Email[]
   shipments     Shipment[]
@@ -238,6 +238,7 @@ model SalesOrder {
   updatedAt           DateTime @updatedAt
 
   purchaseOrder      PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  loadingSlips       LoadingSlip[]
   items              LoadingSlipItem[]
   emails             Email[]
   invoice            Invoice?
@@ -373,21 +374,54 @@ model Material {
   @@map("material")
 }
 
-model LoadingSlipItem {
-  id           String  @id @default(cuid())
+// One LoadingSlip = one plant's shipment within a bundle. A bundle (= one
+// truck) may carry multiple LSs when SKUs in the bundle come from different
+// plants. ZLOAD1 creates these in SAP; we mirror them here keyed on lsNumber.
+//
+// Lifecycle:
+//   ZLOAD1 returns LS numbers + a PDF per LS → row created with bundleId set.
+//   plant_ls email sent → status='sent_to_plant'.
+//   plant invoice PDF arrives + ZLOAD3-B1 done → status='invoiced'.
+//   VT01N done → status='completed'.
+model LoadingSlip {
+  id           String   @id @default(cuid())
+  lsNumber     String   @unique
+  bundleId     String
   salesOrderId String
-  bundleId     String?
-  shipmentId   String?
-  lsNumber     String
-  material     String
-  status       String  @default("pending") // pending, in-progress, completed
+  plantEmail   String   // recipient of plant_ls email (today: process.env.PLANT_EMAIL)
+  fileUrl      String?  // R2 key for the LS PDF returned by ZLOAD1
+  status       String   @default("pending") // pending, sent_to_plant, invoiced, completed
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  bundle     Bundle            @relation(fields: [bundleId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder        @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  items      LoadingSlipItem[]
+  emails     Email[]
+
+  @@map("loading_slip")
+}
+
+model LoadingSlipItem {
+  id            String  @id @default(cuid())
+  salesOrderId  String
+  loadingSlipId String? // FK to LoadingSlip (NULL only transiently during back-fill)
+  shipmentId    String?
+  lsNumber      String  // Denormalised from LoadingSlip.lsNumber for back-compat queries
+  material      String
+  // Batch identifier as printed on the SAP loading slip. The same material
+  // code can appear on the same LS multiple times under different batches
+  // (e.g. OV5FJ × {C8, C11, C14}). Batch is therefore part of the LSI's
+  // composite identity, not optional metadata. Defaults to empty string
+  // for legacy / fallback rows where the batch isn't known.
+  batch         String  @default("")
+  status        String  @default("pending") // pending, in-progress, completed
 
   // Aman fields (read-only, populated via API later)
   materialDescription String?
   orderQuantity       Int?
   orderWeight         Decimal?
   grnNumber           String? // GRN Number (from Aman Stage 4)
-  fileUrl             String? // R2 key for the LS file (XLS/PDF)
 
   // Per-LS SAP fields populated by /processing-data (ZLOAD3-B1 callback).
   // Material doc and loaded quantity legitimately vary per LS in a request.
@@ -408,19 +442,25 @@ model LoadingSlipItem {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
-  emails     Email[]
-  bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
-  shipment   Shipment?  @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  salesOrder  SalesOrder   @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  emails      Email[]
+  loadingSlip LoadingSlip? @relation(fields: [loadingSlipId], references: [id], onDelete: SetNull)
+  shipment    Shipment?    @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
 
-  @@unique([lsNumber, material])
+  // LSI is uniquely (loadingSlipId, material, batch) — same material on
+  // the same LS but different batches counts as separate rows.
+  // (lsNumber, material, batch) is a back-compat index while loadingSlipId
+  // can still be NULL during back-fill.
+  @@unique([loadingSlipId, material, batch])
+  @@unique([lsNumber, material, batch])
   @@map("loading_slip_item")
 }
 
 model Email {
   id                String    @id @default(cuid())
   salesOrderId      String?   // Direct link to SalesOrder (lead SO for combined dispatch emails)
-  loadingSlipItemId String?   // Optional link to LoadingSlipItem (for LS-specific emails)
+  loadingSlipId     String?   // For plant_ls emails — links to a LoadingSlip (one per plant per bundle)
+  loadingSlipItemId String?   // Optional link to LoadingSlipItem (legacy; prefer loadingSlipId for plant_ls)
   purchaseOrderId   String?   // For multi-SO dispatch emails grouped under one PO
   bundleId          String?   // For per-bundle (per-truck) emails — vehicle details, etc.
   gmailMessageId    String    @unique // Gmail message ID for reply tracking
@@ -455,6 +495,7 @@ model Email {
   supervisorHops     Int     @default(0)
 
   salesOrder      SalesOrder?      @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  loadingSlip     LoadingSlip?     @relation(fields: [loadingSlipId], references: [id], onDelete: Cascade)
   loadingSlipItem LoadingSlipItem? @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
   purchaseOrder   PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   bundle          Bundle?          @relation(fields: [bundleId], references: [id], onDelete: Cascade)

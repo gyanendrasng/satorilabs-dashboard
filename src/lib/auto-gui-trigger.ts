@@ -43,11 +43,13 @@ export async function checkAndSendBatchToAman(
   const scopeLabel = bundleId ? `(Bundle ${bundleId.slice(-6)}, SO ${salesOrderId})` : `SO ${salesOrderId}`;
   log(`[BatchSender] Checking if all replies received for ${scopeLabel}`);
 
-  // Items are filtered to the (bundle, SO) pair when bundleId is provided.
+  // Load the LoadingSlips for this (SO, bundle) pair. Each LS has a plant_ls
+  // email; the reply PDF lives on that Email row (replyPdfUrl, R2 key). When
+  // bundleId is unspecified, take every LS on this SO.
   const salesOrder = await prisma.salesOrder.findUnique({
     where: { id: salesOrderId },
     include: {
-      items: {
+      loadingSlips: {
         where: bundleId ? { bundleId } : undefined,
         include: { emails: true },
       },
@@ -89,50 +91,52 @@ export async function checkAndSendBatchToAman(
     }
   }
 
-  log(`[BatchSender] ${scopeLabel} has ${salesOrder.items.length} item(s):`);
-  for (const item of salesOrder.items) {
-    const repliedEmail = item.emails.find((e) => e.status === 'replied' && e.replyPdfUrl);
+  const loadingSlips = salesOrder.loadingSlips;
+
+  log(`[BatchSender] ${scopeLabel} has ${loadingSlips.length} loading slip(s):`);
+  for (const ls of loadingSlips) {
+    const repliedEmail = ls.emails.find((e) => e.status === 'replied' && e.replyPdfUrl);
     const status = repliedEmail ? `replied (PDF: ${repliedEmail.replyPdfUrl})` : 'waiting';
-    log(`  - LS ${item.lsNumber}: ${status}`);
+    log(`  - LS ${ls.lsNumber}: ${status}`);
   }
 
-  if (salesOrder.items.length === 0) {
-    log(`[BatchSender] No items in scope for ${scopeLabel} — nothing to fire`);
+  if (loadingSlips.length === 0) {
+    log(`[BatchSender] No loading slips in scope for ${scopeLabel} — nothing to fire`);
     return { success: false, logs };
   }
 
-  const allReplied = salesOrder.items.every((item) =>
-    item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
+  const allReplied = loadingSlips.every((ls) =>
+    ls.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
   );
 
   if (!allReplied) {
-    const repliedCount = salesOrder.items.filter((item) =>
-      item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
+    const repliedCount = loadingSlips.filter((ls) =>
+      ls.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
     ).length;
     log(
-      `[BatchSender] Not ready yet for ${scopeLabel}: ${repliedCount}/${salesOrder.items.length} items have replies`
+      `[BatchSender] Not ready yet for ${scopeLabel}: ${repliedCount}/${loadingSlips.length} LS(s) have replies`
     );
     return { success: false, logs };
   }
 
-  log(`[BatchSender] All ${salesOrder.items.length} item(s) replied for ${scopeLabel}. Enqueueing ZLOAD3-B1...`);
+  log(`[BatchSender] All ${loadingSlips.length} LS(s) replied for ${scopeLabel}. Enqueueing ZLOAD3-B1...`);
 
   const attachments: Array<{ filename: string; content_base64: string }> = [];
 
   try {
-    for (const item of salesOrder.items) {
-      const repliedEmail = item.emails.find(
+    for (const ls of loadingSlips) {
+      const repliedEmail = ls.emails.find(
         (e) => e.status === 'replied' && e.replyPdfUrl
       );
       if (!repliedEmail || !repliedEmail.replyPdfUrl) {
-        log(`[BatchSender] Item LS ${item.lsNumber} missing replyPdfUrl despite allReplied check — aborting`);
+        log(`[BatchSender] LS ${ls.lsNumber} missing replyPdfUrl despite allReplied check — aborting`);
         return { success: false, logs };
       }
-      log(`[BatchSender] Downloading PDF from R2 for LS ${item.lsNumber}: ${repliedEmail.replyPdfUrl}`);
+      log(`[BatchSender] Downloading PDF from R2 for LS ${ls.lsNumber}: ${repliedEmail.replyPdfUrl}`);
       const pdfBuffer = await downloadFromS3(repliedEmail.replyPdfUrl);
-      log(`[BatchSender] Downloaded PDF for LS ${item.lsNumber}: ${pdfBuffer.length} bytes`);
+      log(`[BatchSender] Downloaded PDF for LS ${ls.lsNumber}: ${pdfBuffer.length} bytes`);
       attachments.push({
-        filename: `${item.lsNumber}.pdf`,
+        filename: `${ls.lsNumber}.pdf`,
         content_base64: pdfBuffer.toString('base64'),
       });
     }
@@ -811,8 +815,11 @@ export async function sendVehicleDetailsForBundle(
     where: { id: bundleId },
     include: {
       purchaseOrder: true,
-      items: {
-        include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+      loadingSlips: {
+        include: {
+          items: true,
+          salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } },
+        },
       },
       materials: {
         include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
@@ -834,11 +841,14 @@ export async function sendVehicleDetailsForBundle(
     return { sent: false, logs };
   }
 
-  // Prefer LSI lines (if ZLOAD1 has run); otherwise list Materials (pre-ZLOAD1).
-  const lsLines = bundle.items.length > 0
-    ? bundle.items
-        .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
-        .join('\n')
+  // Flatten LSIs across all LSs in the bundle (a bundle can hold ≥1 LS
+  // when its SKUs come from multiple plants). Fall back to Material rows
+  // when ZLOAD1 hasn't fired yet.
+  const lsiLines = bundle.loadingSlips.flatMap((ls) =>
+    ls.items.map((it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`)
+  );
+  const lsLines = lsiLines.length > 0
+    ? lsiLines.join('\n')
     : bundle.materials
         .map((m) => `  - SO ${m.salesOrder.soNumber} / Material ${m.material} (Batch ${m.batch}, ${m.dispatchQuantity ?? m.orderQuantity} units)`)
         .join('\n');
@@ -862,9 +872,9 @@ export async function sendVehicleDetailsForBundle(
   ].join('\n');
 
   // Reply in the original NEW ORDER thread of any SO in this bundle, when possible.
-  const itemAnchor = bundle.items.find((it) => it.salesOrder.originalThreadId && it.salesOrder.originalMessageId)?.salesOrder;
+  const lsAnchor = bundle.loadingSlips.find((ls) => ls.salesOrder.originalThreadId && ls.salesOrder.originalMessageId)?.salesOrder;
   const matAnchor = bundle.materials.find((m) => m.salesOrder.originalThreadId && m.salesOrder.originalMessageId)?.salesOrder;
-  const anchor = itemAnchor ?? matAnchor;
+  const anchor = lsAnchor ?? matAnchor;
   let sent: { messageId: string; threadId: string };
   try {
     if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
@@ -882,7 +892,7 @@ export async function sendVehicleDetailsForBundle(
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
   }
 
-  const leadSoIdForBundle = bundle.items[0]?.salesOrderId ?? bundle.materials[0]?.salesOrderId;
+  const leadSoIdForBundle = bundle.loadingSlips[0]?.salesOrderId ?? bundle.materials[0]?.salesOrderId;
   await prisma.email.create({
     data: {
       bundleId,
@@ -963,8 +973,11 @@ export async function sendCombinedVehicleDetailsEmailForPo(
       bundles: {
         orderBy: { bundleNumber: 'asc' },
         include: {
-          items: {
-            include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+          loadingSlips: {
+            include: {
+              items: true,
+              salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } },
+            },
           },
           materials: {
             include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
@@ -982,14 +995,18 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     return { sent: false, logs };
   }
 
-  // Build one section per bundle.
+  // Build one section per bundle. Each bundle has ≥1 LSs (one per plant);
+  // each LS has its SKU lines.
   const bundleBlocks: string[] = [];
   for (const bundle of po.bundles) {
     const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
-    const lsLines = bundle.items.length > 0
-      ? bundle.items
-          .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
-          .join('\n')
+    const lsiLines = bundle.loadingSlips.flatMap((ls) =>
+      ls.items.map(
+        (it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`
+      )
+    );
+    const lsLines = lsiLines.length > 0
+      ? lsiLines.join('\n')
       : bundle.materials
           .map((m) => `  - SO ${m.salesOrder.soNumber} / Material ${m.material} (Batch ${m.batch}, ${m.dispatchQuantity ?? m.orderQuantity} units)`)
           .join('\n');
@@ -1020,7 +1037,7 @@ export async function sendCombinedVehicleDetailsEmailForPo(
 
   // Reply in the original NEW ORDER thread of any SO in this PO, when possible.
   const allSoAnchors = po.bundles
-    .flatMap((b) => [...b.items.map((it) => it.salesOrder), ...b.materials.map((m) => m.salesOrder)])
+    .flatMap((b) => [...b.loadingSlips.map((ls) => ls.salesOrder), ...b.materials.map((m) => m.salesOrder)])
     .filter((so) => so.originalThreadId && so.originalMessageId);
   const anchor = allSoAnchors[0];
   let sent: { messageId: string; threadId: string };
@@ -1042,7 +1059,7 @@ export async function sendCombinedVehicleDetailsEmailForPo(
 
   // Use lead SO for legacy `salesOrderId` linkage so reply-checker keeps logs sane.
   const leadSoId =
-    po.bundles[0]?.items[0]?.salesOrderId ?? po.bundles[0]?.materials[0]?.salesOrderId;
+    po.bundles[0]?.loadingSlips[0]?.salesOrderId ?? po.bundles[0]?.materials[0]?.salesOrderId;
 
   await prisma.email.create({
     data: {
@@ -1065,7 +1082,7 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     const { emitEvent } = await import('./scenario-events');
     const soIdsInPo = new Set<string>();
     for (const b of po.bundles) {
-      for (const it of b.items) if (it.salesOrderId) soIdsInPo.add(it.salesOrderId);
+      for (const ls of b.loadingSlips) if (ls.salesOrderId) soIdsInPo.add(ls.salesOrderId);
       for (const m of b.materials) if (m.salesOrderId) soIdsInPo.add(m.salesOrderId);
     }
     for (const sid of soIdsInPo) {
@@ -2003,53 +2020,57 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
  * same materials_key in the payload.
  */
 export async function triggerZloadingClose(
-  soNumber: string,
+  lsNumber: string,
   materials: string[]
 ): Promise<void> {
   if (materials.length === 0) {
-    console.log(`[ZLOADING_CLOSE] No materials provided for SO ${soNumber} — skipping`);
+    console.log(`[ZLOADING_CLOSE] No materials provided for LS ${lsNumber} — skipping`);
     return;
   }
 
   const normalized = Array.from(new Set(materials)).sort();
   const materialsKey = JSON.stringify(normalized);
 
-  // JSON substring match is robust to key ordering because we search for the
-  // canonical materials_key value, which is itself a stable JSON string.
+  // Dedup on (lsNumber, materials). Two close requests for the same materials
+  // on the same LS are a no-op.
   const existing = await prisma.workQueue.findFirst({
     where: {
       step: 'zloading_close',
       state: { in: ['queued', 'firing', 'done'] },
-      payload: { contains: `"materials_key":${JSON.stringify(materialsKey)}` },
+      AND: [
+        { payload: { contains: `"transaction_code":"ZLOADING_CLOSE"` } },
+        { payload: { contains: `"ls_number":"${lsNumber}"` } },
+        { payload: { contains: `"materials_key":${JSON.stringify(materialsKey)}` } },
+      ],
     },
     select: { id: true, state: true },
   });
   if (existing) {
     console.log(
-      `[ZLOADING_CLOSE] Already exists for SO ${soNumber} materials=${materialsKey} (${existing.state}) — skipping`
+      `[ZLOADING_CLOSE] Already exists for LS ${lsNumber} materials=${materialsKey} (${existing.state}) — skipping`
     );
     return;
   }
 
-  const closeClauses = normalized.map((m) => `Close material ${m}`).join(', ');
+  const closeClauses = normalized.map((m) => `close material ${m}`).join(', ');
   const instruction =
     `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
-    `Transaction ZLOADING_CLOSE for Sales Order number ${soNumber}. ${closeClauses}.`;
+    `Transaction ZLOADING_CLOSE for Loading Slip number ${lsNumber}: ${closeClauses}.`;
 
-  const so = await prisma.salesOrder.findFirst({
-    where: { soNumber },
-    select: { id: true },
+  // Find any LSI on this LS to link the WorkQueue row to its SalesOrder.
+  const lsi = await prisma.loadingSlipItem.findFirst({
+    where: { lsNumber },
+    select: { salesOrderId: true },
   });
 
   await enqueueWork({
-    salesOrderId: so?.id ?? null,
+    salesOrderId: lsi?.salesOrderId ?? null,
     step: 'zloading_close',
     payload: {
       instruction,
       transaction_code: 'ZLOADING_CLOSE',
-      so_number: soNumber,
       meta: {
-        so_number: soNumber,
+        ls_number: lsNumber,
         materials: normalized,
         materials_key: materialsKey,
       },
@@ -2057,7 +2078,7 @@ export async function triggerZloadingClose(
   });
   await pumpQueue();
   console.log(
-    `[ZLOADING_CLOSE] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${normalized.join(', ')})`
+    `[ZLOADING_CLOSE] Enqueued for LS ${lsNumber} (${normalized.length} material(s): ${normalized.join(', ')})`
   );
 }
 
@@ -2889,10 +2910,11 @@ export async function handleVehicleDetailsReply(
     }
 
     // Send LS PDFs to plant for every bundle that just got complete details.
-    // Each saved bundle's LSIs go out with that bundle's vehicle info.
+    // One plant_ls email per LoadingSlip; each LS belongs to exactly one
+    // bundle so the bundle's vehicle info is the right one to attach.
     const completedBundleIds = saved.map((s) => s.bundleId);
-    const lsItems = completedBundleIds.length > 0
-      ? await prisma.loadingSlipItem.findMany({
+    const loadingSlipsForPlant = completedBundleIds.length > 0
+      ? await prisma.loadingSlip.findMany({
           where: { bundleId: { in: completedBundleIds }, fileUrl: { not: null } },
           include: {
             bundle: {
@@ -2901,7 +2923,7 @@ export async function handleVehicleDetailsReply(
           },
         })
       : email.bundleId
-        ? await prisma.loadingSlipItem.findMany({
+        ? await prisma.loadingSlip.findMany({
             where: { bundleId: email.bundleId, fileUrl: { not: null } },
             include: {
               bundle: {
@@ -2909,37 +2931,33 @@ export async function handleVehicleDetailsReply(
               },
             },
           })
-        : (await prisma.loadingSlipItem.findMany({
+        : (await prisma.loadingSlip.findMany({
             where: { salesOrderId, fileUrl: { not: null } },
-          })).map((it) => ({ ...it, bundle: null as null | { id: string; vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } }));
+          })).map((ls) => ({ ...ls, bundle: null as null | { id: string; vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } }));
 
-    if (lsItems.length === 0) {
+    if (loadingSlipsForPlant.length === 0) {
       log(`[VehicleDetails] No LS files found, skipping plant email`);
     } else {
-      for (const item of lsItems) {
+      for (const ls of loadingSlipsForPlant) {
         try {
-          const pdfBuffer = await downloadFromS3(item.fileUrl!);
-          const filename = item.fileUrl!.split('/').pop() || `${item.lsNumber}.pdf`;
-          // Look up the LSI's own SO (for bundle emails this can differ
-          // from the email's anchor SO).
-          const itemSo = await prisma.salesOrder.findUnique({
-            where: { id: item.salesOrderId },
+          const pdfBuffer = await downloadFromS3(ls.fileUrl!);
+          const filename = ls.fileUrl!.split('/').pop() || `${ls.lsNumber}.pdf`;
+          const lsSo = await prisma.salesOrder.findUnique({
+            where: { id: ls.salesOrderId },
             select: { soNumber: true },
           });
-          const itemSoNumber = itemSo?.soNumber ?? soNumber;
-          // Use the LSI's own bundle vehicle details when available; for the
-          // legacy non-bundle path, fall back to the SalesOrder fields.
-          const itemBundle = (item as { bundle?: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } | null }).bundle;
+          const lsSoNumber = lsSo?.soNumber ?? soNumber;
+          const lsBundle = (ls as { bundle?: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } | null }).bundle;
           let vehicleForEmail: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null };
-          if (itemBundle) {
+          if (lsBundle) {
             vehicleForEmail = {
-              vehicleNumber: itemBundle.vehicleNumber,
-              driverMobile: itemBundle.driverMobile,
-              containerNumber: itemBundle.containerNumber,
+              vehicleNumber: lsBundle.vehicleNumber,
+              driverMobile: lsBundle.driverMobile,
+              containerNumber: lsBundle.containerNumber,
             };
           } else {
             const soRow = await prisma.salesOrder.findUnique({
-              where: { id: item.salesOrderId },
+              where: { id: ls.salesOrderId },
               select: { vehicleNumber: true, driverMobile: true, containerNumber: true },
             });
             vehicleForEmail = {
@@ -2948,18 +2966,29 @@ export async function handleVehicleDetailsReply(
               containerNumber: soRow?.containerNumber ?? null,
             };
           }
+          // sendLSEmail historically takes an LSI id as its first arg; pick
+          // any LSI on this LS for that legacy linkage (one of them works —
+          // they're all under the same LS).
+          const anchorLsi = await prisma.loadingSlipItem.findFirst({
+            where: { loadingSlipId: ls.id },
+            select: { id: true },
+          });
+          if (!anchorLsi) {
+            log(`[VehicleDetails] LS ${ls.lsNumber} has no LSI rows — skipping plant email`);
+            continue;
+          }
           await sendLSEmail(
-            item.id,
-            item.salesOrderId,
-            itemSoNumber,
-            item.lsNumber,
+            anchorLsi.id,
+            ls.salesOrderId,
+            lsSoNumber,
+            ls.lsNumber,
             pdfBuffer,
             vehicleForEmail,
             filename
           );
-          log(`[VehicleDetails] Sent LS ${item.lsNumber} to plant for SO ${itemSoNumber} (vehicle ${vehicleForEmail.vehicleNumber ?? 'n/a'})`);
+          log(`[VehicleDetails] Sent LS ${ls.lsNumber} to plant for SO ${lsSoNumber} (vehicle ${vehicleForEmail.vehicleNumber ?? 'n/a'})`);
         } catch (sendErr) {
-          log(`[VehicleDetails] Failed to send LS ${item.lsNumber} to plant: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
+          log(`[VehicleDetails] Failed to send LS ${ls.lsNumber} to plant: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
         }
       }
     }

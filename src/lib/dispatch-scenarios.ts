@@ -127,11 +127,10 @@ export async function deriveStage(salesOrderId: string): Promise<Stage> {
     where: { id: salesOrderId },
     select: {
       status: true,
-      // Files only matter for "LS exists" detection (post-ZLOAD1).
-      items: {
-        select: { fileUrl: true },
+      // "LS exists" = at least one LoadingSlip row created by /zload1-data.
+      loadingSlips: {
+        select: { id: true },
         take: 1,
-        where: { fileUrl: { not: null } },
       },
       // VT01N evidence — shipment row in a post-create status.
       shipments: {
@@ -154,11 +153,7 @@ export async function deriveStage(salesOrderId: string): Promise<Stage> {
         },
       },
       // plant_ls email outbound = "LS forwarded to plant". The presence of
-      // a sent row signals we've moved past After-Vehicle-Placement. A reply
-      // on the plant_ls thread does NOT by itself mean "invoice arrived" —
-      // the plant might be replying with a modification request instead.
-      // Invoice arrival is signalled by the Invoice row created from the
-      // ZLOAD3 processing-data callback (above).
+      // a sent row signals we've moved past After-Vehicle-Placement.
       emails: {
         select: { id: true, emailType: true, status: true },
         where: { emailType: 'plant_ls' },
@@ -201,8 +196,8 @@ export async function deriveStage(salesOrderId: string): Promise<Stage> {
     return 'after_vehicle_placement';
   }
 
-  // Stage 3 — LS file(s) exist (ZLOAD1 ran), but no vehicle yet.
-  if (so.status === 'ls_created' && so.items.length > 0) {
+  // Stage 3 — LoadingSlip row(s) exist (ZLOAD1 ran), but no vehicle yet.
+  if (so.status === 'ls_created' && so.loadingSlips.length > 0) {
     return 'after_ls_before_invoice';
   }
 

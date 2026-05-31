@@ -1172,9 +1172,14 @@ async function fireStep(
     }
 
     case 'zload2': {
-      // ZLOAD2 revises existing LS quantities (post-LS modification). Keyed
-      // on LS number; we pick any LSI for this SO. Extract the modification
-      // list from the trigger reply.
+      // ZLOAD2 revises existing LS quantities. CRITICAL: it MUST be fired
+      // against the specific LS that actually carries the material being
+      // modified. SAP opens the LS, expects the material to be on it, and
+      // fails outright otherwise.
+      //
+      // Each material we modify is resolved to its LS via the LSI table
+      // (LSI = which materials sit on which LS). When the branch modifies
+      // materials that live on different LSs, we fire ONE ZLOAD2 per LS.
       const trigger = await loadTriggerReply(progress.id);
       if (!trigger) {
         log('[ENGINE] zload2 — no trigger reply found; cannot extract modifications. Aborting.');
@@ -1195,11 +1200,10 @@ async function fireStep(
         log('[ENGINE] zload2 — extractor found no inc/dec materials in reply; skipping');
         return 'advance_now';
       }
-      // ZLOAD2 needs the batch for each material — the branch's reply text
-      // rarely includes it. Look up each material's batch from the existing
-      // Material rows for this SO (they were populated by ZSO-VISIBILITY).
-      // If a material isn't found in the table, fall back to '' and let the
-      // downstream trigger function complain — better than silently dropping.
+
+      // Resolve each requested material → its (lsNumber, batch). Source of
+      // truth is the LSI table: a row for (salesOrderId, material) tells us
+      // which LS holds that material. Batch comes from the Material row.
       const materialRows = await prisma.material.findMany({
         where: { salesOrderId: progress.salesOrderId },
         select: { material: true, batch: true },
@@ -1210,36 +1214,89 @@ async function fireStep(
           batchByCode.set(row.material, row.batch);
         }
       }
-      const items = requested.map((m) => ({
-        material: m.material_code,
-        batch: batchByCode.get(m.material_code) ?? '',
-        orderQuantity: m.quantity!,
-      }));
-      const missingBatch = items.filter((it) => !it.batch).map((it) => it.material);
-      if (missingBatch.length > 0) {
-        log(`[ENGINE] zload2 — batch missing for ${missingBatch.length} material(s): ${missingBatch.join(', ')}. Aborting.`);
+
+      // Group materials by LS. One ZLOAD2 call per LS. Each LSI carries
+      // its own batch (post-LoadingSlip refactor), so we read batch from
+      // the LSI directly. The Material.batch fallback is only used when
+      // an LSI hasn't been populated yet (pre-PDF-parser fallback rows).
+      type LsBucket = { lsNumber: string; items: Array<{ material: string; batch: string; orderQuantity: number }> };
+      const byLs = new Map<string, LsBucket>();
+      const unresolved: string[] = [];
+      const ambiguous: string[] = [];
+
+      for (const m of requested) {
+        // Find every LSI row that carries this material on this SO. With
+        // per-batch LSIs the same material can have multiple rows (across
+        // batches and/or LSs). If we get >1 distinct (lsNumber, batch)
+        // combinations, the modification is ambiguous — branch said
+        // "reduce M-A by 20" but M-A lives on 3 different lines. Surface
+        // to the operator rather than guess.
+        const lsiRows = await prisma.loadingSlipItem.findMany({
+          where: { salesOrderId: progress.salesOrderId, material: m.material_code },
+          select: { lsNumber: true, batch: true },
+        });
+        if (lsiRows.length === 0) {
+          unresolved.push(m.material_code);
+          continue;
+        }
+        const distinctTargets = new Set(lsiRows.map((r) => `${r.lsNumber}|${r.batch}`));
+        if (distinctTargets.size > 1) {
+          ambiguous.push(
+            `${m.material_code} → ${[...distinctTargets].join(' / ')}`
+          );
+          continue;
+        }
+        const target = lsiRows[0];
+        // Prefer the LSI's own batch (authoritative per PDF). Fall back to
+        // the SO-level Material.batch if the LSI was created via the
+        // PENDING fallback and never enriched.
+        const batch = target.batch || batchByCode.get(m.material_code);
+        if (!batch) {
+          unresolved.push(`${m.material_code} (no batch on LSI or Material)`);
+          continue;
+        }
+        let bucket = byLs.get(target.lsNumber);
+        if (!bucket) {
+          bucket = { lsNumber: target.lsNumber, items: [] };
+          byLs.set(target.lsNumber, bucket);
+        }
+        bucket.items.push({ material: m.material_code, batch, orderQuantity: m.quantity! });
+      }
+
+      if (unresolved.length > 0) {
+        log(`[ENGINE] zload2 — cannot resolve LS for: ${unresolved.join(', ')}. Aborting.`);
         await prisma.scenarioProgress.update({
           where: { id: progress.id },
-          data: { state: 'failed', error: `zload2 batch lookup failed: ${missingBatch.join(', ')}` },
+          data: { state: 'failed', error: `zload2 LS lookup failed: ${unresolved.join(', ')}` },
         });
         return 'pause';
       }
-      const lsi = await prisma.loadingSlipItem.findFirst({
-        where: { salesOrderId: progress.salesOrderId },
-        select: { lsNumber: true },
-      });
-      if (!lsi?.lsNumber) {
-        throw new Error(`No LoadingSlipItem.lsNumber found for SO ${progress.salesOrderId}`);
+      if (ambiguous.length > 0) {
+        log(`[ENGINE] zload2 — material spans multiple (LS, batch) targets and the branch reply didn't disambiguate: ${ambiguous.join(' ; ')}. Aborting — needs operator input.`);
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: `zload2 ambiguous targets: ${ambiguous.join('; ')}` },
+        });
+        return 'pause';
       }
-      log(`[ENGINE] zload2 firing on LS ${lsi.lsNumber} for ${items.length} line(s): ${items.map((i) => `${i.material}/${i.batch}→${i.orderQuantity}`).join(', ')}`);
-      await triggerZload2(lsi.lsNumber, items);
+      if (byLs.size === 0) {
+        log('[ENGINE] zload2 — no LS buckets formed; skipping');
+        return 'advance_now';
+      }
+
+      log(`[ENGINE] zload2 firing across ${byLs.size} LS(s): ${[...byLs.values()].map((b) => `LS ${b.lsNumber} → ${b.items.map((i) => `${i.material}/${i.batch}→${i.orderQuantity}`).join(',')}`).join(' | ')}`);
+      for (const bucket of byLs.values()) {
+        await triggerZload2(bucket.lsNumber, bucket.items);
+      }
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
 
     case 'zloading_close': {
-      // ZLOAD_Delete — remove materials from existing LS. Extract delete
-      // operations from the trigger reply.
+      // ZLOAD_Delete — remove materials from existing LS. Like ZLOAD2 the
+      // SAP transaction is keyed on a specific LS number, so we must
+      // resolve each material → its LS via the LSI table and fan out one
+      // call per distinct LS.
       const trigger = await loadTriggerReply(progress.id);
       if (!trigger) {
         log('[ENGINE] zloading_close — no trigger reply found; aborting.');
@@ -1259,9 +1316,46 @@ async function fireStep(
         log('[ENGINE] zloading_close — extractor found no delete materials; skipping');
         return 'advance_now';
       }
-      const soNumber = await soNumberFor(progress.salesOrderId);
-      log(`[ENGINE] zloading_close firing for ${codes.length} material(s): ${codes.join(', ')}`);
-      await triggerZloadingClose(soNumber, codes);
+
+      // Group delete codes by LS. A material can sit on multiple LSs (or
+      // multiple batches on the same LS); deletion removes ALL lines for
+      // that material on whatever LSs it appears, since the branch said
+      // "drop M-C" without qualifying by batch.
+      const byLs = new Map<string, Set<string>>();
+      const unresolved: string[] = [];
+      for (const code of codes) {
+        const lsiRows = await prisma.loadingSlipItem.findMany({
+          where: { salesOrderId: progress.salesOrderId, material: code },
+          select: { lsNumber: true },
+        });
+        if (lsiRows.length === 0) {
+          unresolved.push(code);
+          continue;
+        }
+        for (const r of lsiRows) {
+          const bucket = byLs.get(r.lsNumber) ?? new Set<string>();
+          bucket.add(code);
+          byLs.set(r.lsNumber, bucket);
+        }
+      }
+
+      if (unresolved.length > 0) {
+        log(`[ENGINE] zloading_close — no LSI found for: ${unresolved.join(', ')}. Aborting (cannot determine which LS to close on).`);
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: `zloading_close LS lookup failed: ${unresolved.join(', ')}` },
+        });
+        return 'pause';
+      }
+      if (byLs.size === 0) {
+        log('[ENGINE] zloading_close — no LS buckets formed; skipping');
+        return 'advance_now';
+      }
+
+      log(`[ENGINE] zloading_close firing across ${byLs.size} LS(s): ${[...byLs.entries()].map(([ls, ms]) => `LS ${ls} → ${[...ms].join(',')}`).join(' | ')}`);
+      for (const [lsNumber, materialsForLs] of byLs.entries()) {
+        await triggerZloadingClose(lsNumber, [...materialsForLs]);
+      }
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
@@ -1518,27 +1612,30 @@ async function fireStep(
     case 'process_plant_invoice': {
       // Plant replied with an invoice PDF on plant_ls. The PDF was already
       // uploaded to R2 by the email-reply-checker pre-pass (Email.replyPdfUrl
-      // is populated). Fire the batch sender (ZLOAD3 + ZSO_Auto) which reads
-      // the PDFs by SO/bundle.
-      const so = await prisma.salesOrder.findUnique({
-        where: { id: progress.salesOrderId },
-        include: { loadingSlipItem: { select: { bundleId: true } } as { select: { bundleId: true } } } as never,
-      }).catch(() => null);
-      // We don't actually need the include — the batch sender resolves
-      // bundleId from the trigger email's LSI directly.
+      // is populated). Fire the batch sender (ZLOAD3-B1) which reads PDFs
+      // by SO/bundle.
+      //
+      // bundleId resolution: the trigger email is the plant_ls reply, which
+      // links to a LoadingSlip (Email.loadingSlipId). That LS knows its
+      // bundle. For older plant_ls emails that only have loadingSlipItemId,
+      // fall back to LSI → LoadingSlip → Bundle.
       const trigger = await loadTriggerReply(progress.id);
       const triggerEmailRow = trigger
         ? await prisma.email.findUnique({
             where: { id: trigger.emailId },
-            include: { loadingSlipItem: true },
+            include: {
+              loadingSlip: { select: { bundleId: true } },
+              loadingSlipItem: { select: { loadingSlip: { select: { bundleId: true } } } },
+            },
           })
         : null;
-      const bundleId = triggerEmailRow?.loadingSlipItem?.bundleId ?? null;
+      const bundleId =
+        triggerEmailRow?.loadingSlip?.bundleId ??
+        triggerEmailRow?.loadingSlipItem?.loadingSlip?.bundleId ??
+        null;
       const { checkAndSendBatchToAman } = await import('./auto-gui-trigger');
       const r = await checkAndSendBatchToAman(progress.salesOrderId, bundleId);
       for (const line of r.logs) log(line);
-      // Suppress the unused `so` warning above — it was a defensive pre-load.
-      void so;
       return 'advance_now';
     }
 
