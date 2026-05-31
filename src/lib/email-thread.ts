@@ -1,14 +1,14 @@
 /**
- * Renders the email thread for a SalesOrder as plain text, chronological.
- * Used by the LLM scenario selector so it can reason about the full
- * conversation, not just the latest reply.
+ * Renders the email thread for a SalesOrder as a chat-style transcript,
+ * oldest first, with the latest inbound clearly tagged so the LLM planner
+ * can see "this is the message you're responding to."
  *
- * Pulls every Email row tied to the SO OR to its PurchaseOrder (for multi-SO
- * combined emails like ls_dispatch). Outbound = the email we sent. Inbound =
- * the reply we received on that thread (stored as replyHtml on the same row).
+ * Pulls every Email row tied to the SO OR to its PurchaseOrder. Each row
+ * may emit one OUTBOUND turn and (if a reply exists) one INBOUND turn.
  *
- * For each row we may emit ONE or TWO entries (the outbound and, if a reply
- * exists, the inbound). Default cap: last 8 entries.
+ * Default cap is generous (last 50 turns) — modification flows can run
+ * deep and the planner has to see the full history to avoid replaying
+ * an earlier stage.
  */
 import { prisma } from './prisma';
 
@@ -30,7 +30,7 @@ export async function renderEmailThreadForSO(args: {
   salesOrderId: string;
   maxMessages?: number;
 }): Promise<string> {
-  const maxMessages = args.maxMessages ?? 8;
+  const maxMessages = args.maxMessages ?? 50;
 
   // Get the SO so we can also pull PO-level emails.
   const so = await prisma.salesOrder.findUnique({
@@ -94,16 +94,31 @@ export async function renderEmailThreadForSO(args: {
     }
   }
 
-  // Keep the most recent `maxMessages` entries.
+  // Oldest first; keep the most recent `maxMessages` entries.
   entries.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
   const trimmed = entries.slice(-maxMessages);
 
+  // Tag the most recent INBOUND so the LLM sees "this is the message
+  // you're replying to" without having to compare timestamps.
+  let latestInboundIdx = -1;
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    if (trimmed[i].direction === 'INBOUND') {
+      latestInboundIdx = i;
+      break;
+    }
+  }
+
   return trimmed
-    .map((e) => {
+    .map((e, i) => {
+      const turn = `Turn ${i + 1}`;
       const iso = e.timestamp.toISOString();
-      const dirLabel = e.direction === 'OUTBOUND' ? `OUTBOUND to ${e.counterparty}` : `INBOUND from ${e.counterparty}`;
+      const dirLabel =
+        e.direction === 'OUTBOUND'
+          ? `US → ${e.counterparty}`
+          : `${e.counterparty} → US`;
       const typeLabel = e.emailType ? ` [type=${e.emailType}]` : '';
-      return `[${iso}] ${dirLabel}${typeLabel} — Subject: "${e.subject}"\n  Body: ${e.body}`;
+      const marker = i === latestInboundIdx ? '   ← LATEST INBOUND (plan for THIS)' : '';
+      return `--- ${turn} [${iso}] ${dirLabel}${typeLabel}${marker} ---\nSubject: ${e.subject}\n${e.body}`;
     })
     .join('\n\n');
 }
