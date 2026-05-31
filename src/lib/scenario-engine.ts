@@ -595,15 +595,21 @@ export async function handleReplyV2(args: {
     },
   });
 
-  // Ensure the trigger Email row records this reply BEFORE the planner reads
-  // the thread. In production the cron does this; defending against harness
-  // paths that skip it.
-  if (!email.replyHtml) {
-    await prisma.email.update({
-      where: { id: email.id },
-      data: { replyHtml: args.replyHtml, repliedAt: email.repliedAt ?? new Date() },
-    });
-  }
+  // Ensure the trigger Email row records this reply AND transitions out of
+  // the cron's pending-reply set. Without flipping status/workflowState
+  // here the next cron tick re-picks this row (still `status='sent'`,
+  // `workflowState!='completed'`), re-classifies the same thread, and
+  // re-fires whatever the plan emits — exactly the duplicate-ZLOAD1 bug
+  // we hit in prod.
+  await prisma.email.update({
+    where: { id: email.id },
+    data: {
+      replyHtml: email.replyHtml ?? args.replyHtml,
+      repliedAt: email.repliedAt ?? new Date(),
+      status: 'replied',
+      workflowState: 'completed',
+    },
+  });
 
   // Abort any prior non-terminal ScenarioProgress. The planner builds a fresh
   // plan per inbound; there's no notion of "continuing" a prior plan — once
@@ -620,6 +626,21 @@ export async function handleReplyV2(args: {
       where: { id: activeProgress.id },
       data: { state: 'aborted', error: 'superseded by new inbound email' },
     });
+
+    // Cancel still-queued SAP work the aborted plan enqueued. Anything
+    // already `firing` or `done` we leave alone — auto_gui2 is running it
+    // or has run it. Only `queued` rows are safe to cancel here.
+    const cancelled = await prisma.workQueue.updateMany({
+      where: {
+        salesOrderId: email.salesOrderId,
+        state: 'queued',
+      },
+      data: { state: 'cancelled', finishedAt: new Date() },
+    });
+    if (cancelled.count > 0) {
+      log(`[ENGINE] Cancelled ${cancelled.count} queued WorkQueue row(s) from aborted plan ${activeProgress.id}`);
+    }
+
     await emitEvent({
       salesOrderId: email.salesOrderId,
       scenarioProgressId: activeProgress.id,
@@ -627,6 +648,7 @@ export async function handleReplyV2(args: {
       payload: {
         scenario_key: activeProgress.scenarioKey,
         reason: 'superseded by new inbound email',
+        cancelled_work_count: cancelled.count,
       },
     });
     log(`[ENGINE] Aborted prior plan ${activeProgress.id} (was at step ${activeProgress.currentStepIndex}) — superseded by new inbound`);

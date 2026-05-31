@@ -1497,6 +1497,29 @@ export async function handleDispatchConfirmation(
     logs.push(t);
   };
 
+  // Scenario engine path. When the planner picks up a dispatch_confirmation
+  // reply it emits a `zload1` step which calls `fanOutZload1ForPo` itself.
+  // Running the legacy fan-out below ALSO calls `fanOutZload1ForPo`, which
+  // wipes and recreates the bundles, producing 2× the work_queue rows for
+  // the same SO. Short-circuit when the engine handles the reply — same
+  // pattern handleBranchReply uses.
+  if (
+    (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
+  ) {
+    const { handleReplyV2 } = await import('./scenario-engine');
+    const r = await handleReplyV2({
+      emailId,
+      replyHtml,
+      originalEmailHtml: '',
+      sourceEmailType: 'branch',
+    });
+    if (r.matched) {
+      log(`[DispatchConfirm] handled by scenario engine — skipping legacy fan-out`);
+      return { success: r.success, logs: [...logs, ...r.logs] };
+    }
+    log(`[DispatchConfirm] engine didn't match — falling through to legacy path`);
+  }
+
   try {
     const email = await prisma.email.findUnique({ where: { id: emailId } });
     if (!email || !email.purchaseOrderId) {
@@ -2627,6 +2650,42 @@ async function triggerZload1(
   const bundleSuffix = bundleNumber ? ` (Bundle ${bundleNumber})` : '';
   const instruction = `VPN is connected, SAP is logged in. Execute ZLOAD1 for sales order ${soNumber}${bundleSuffix}. Materials to dispatch:\n${materialsList}`;
 
+  // Idempotency: ZLOAD1's natural key is (SO, bundleNumber). The bundle
+  // cuid changes when computeBundlesForPo re-plans, but bundleNumber is
+  // stable within a PO. If a queued/firing/done row already exists for
+  // this (SO, bundleNumber), skip — re-firing produces duplicate LSs in
+  // SAP and orphaned work_queue rows after a re-plan.
+  //
+  // When bundleNumber is absent (legacy callers / single-bundle pre-refactor
+  // path) we fall back to dedup on (SO + sorted materials). This is the
+  // same shape triggerZload2/triggerZloadingClose use.
+  const sortedMaterials = [...materials].sort((a, b) =>
+    a.material_code === b.material_code
+      ? (a.batch || '').localeCompare(b.batch || '')
+      : a.material_code.localeCompare(b.material_code)
+  );
+  const dedupKey = bundleNumber
+    ? `so:${soNumber}|bundle:${bundleNumber}`
+    : `so:${soNumber}|materials:${JSON.stringify(sortedMaterials.map((m) => `${m.material_code}/${m.batch}/${m.quantity}`))}`;
+
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zload1',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"ZLOAD1"` } },
+        { payload: { contains: `"dedup_key":${JSON.stringify(dedupKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOAD1] Skipping duplicate for SO ${soNumber}${bundleSuffix} — existing row ${existing.id} (${existing.state})`
+    );
+    return;
+  }
+
   const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
 
   await enqueueWork({
@@ -2640,6 +2699,7 @@ async function triggerZload1(
         so_number: soNumber,
         ...(bundleId ? { bundle_id: bundleId } : {}),
         ...(bundleNumber ? { bundle_number: bundleNumber } : {}),
+        dedup_key: dedupKey,
       },
     },
   });
