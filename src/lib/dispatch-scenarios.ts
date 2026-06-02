@@ -67,6 +67,7 @@ export type StepKind =
   | 'email_to_branch_notifying_plant_change'  // NEW — sendPlantChangeNotificationEmail (R46-R51)
   | 'email_order_status'              // NEW — sendOrderStatusEmail (R9 Seeking Order Update auto-reply)
   | 'process_plant_invoice'           // plant replied with invoice PDF → checkAndSendBatchToAman
+  | 'process_tonnage_reply'           // branch replied to tonnage_inquiry → extract tonnage, write to PO.weightage
   | 'await_plant_invoice'             // sentinel — engine pauses; plant reply advances it
   | 'await_vt01n';                    // sentinel — engine pauses; VT01N enqueue advances it
 

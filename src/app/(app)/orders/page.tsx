@@ -292,9 +292,9 @@ export default function OrdersPage() {
                         </CardTitle>
                       </div>
                       <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                        {po.customer && (
-                          <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs" title={`Truck capacity for ${po.customer.name}`}>
-                            {po.customer.weightage} t
+                        {po.weightage != null && (
+                          <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs" title={`Truck capacity for this PO`}>
+                            {po.weightage} t
                           </span>
                         )}
                         {po.salesOrders.length > 1 && (() => {

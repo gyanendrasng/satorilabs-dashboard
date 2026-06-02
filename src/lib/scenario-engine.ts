@@ -211,23 +211,94 @@ export async function sendSecondReleaseEmail(args: {
     return null;
   }
 
-  const lines = modifications
-    .filter((m) => m.operation && m.operation !== 'keep')
-    .map((m) => {
-      const op = m.operation ?? 'keep';
-      const qty = m.quantity ?? 0;
-      if (op === 'delete') return `  - Delete material ${m.material_code}`;
-      return `  - ${op === 'increase' ? 'Increase' : 'Decrease'} ${m.material_code} → ${qty}`;
-    });
+  // Build the body in two sections:
+  //   (a) CHANGES — the diff the branch requested, so the plant sees exactly
+  //       what's new vs the first release.
+  //   (b) REVISED DISPATCH PLAN — every material on the SO with its FINAL
+  //       quantity, so the plant has the complete picture without having to
+  //       reconcile against an earlier email.
+  //
+  // Source of truth for "previous quantity": Material.dispatchQuantity, which
+  // VA02 doesn't touch on our side — it still reflects the first-round
+  // confirmed values at this point in the flow.
+  const soMaterials = await prisma.material.findMany({
+    where: { salesOrderId },
+    select: {
+      material: true,
+      materialDescription: true,
+      batch: true,
+      orderQuantity: true,
+      dispatchQuantity: true,
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+
+  // Index modifications by material code for quick lookup.
+  const modsByCode = new Map<string, BranchReplyIntent['materials'][number]>();
+  for (const m of modifications) {
+    if (m.operation && m.operation !== 'keep') modsByCode.set(m.material_code, m);
+  }
+
+  // (a) CHANGES section — diff only.
+  const changeLines: string[] = [];
+  for (const m of soMaterials) {
+    const mod = modsByCode.get(m.material);
+    if (!mod) continue;
+    const op = mod.operation ?? 'keep';
+    const desc = m.materialDescription || m.material;
+    const wasQty = m.dispatchQuantity ?? m.orderQuantity ?? 0;
+    if (op === 'delete') {
+      changeLines.push(`  - Delete ${desc} (Batch ${m.batch}) — was ${wasQty}`);
+    } else if (op === 'increase' || op === 'decrease') {
+      const newQty = mod.quantity ?? 0;
+      const verb = op === 'increase' ? 'Increase' : 'Decrease';
+      changeLines.push(`  - ${verb} ${desc} (Batch ${m.batch}): ${wasQty} → ${newQty}`);
+    }
+  }
+  // If a modification refers to a material code we don't have on the SO
+  // (rare — typically a typo in the branch reply), include it bare so the
+  // plant at least sees the request and can flag it.
+  for (const [code, mod] of modsByCode.entries()) {
+    if (soMaterials.some((m) => m.material === code)) continue;
+    const op = mod.operation ?? 'keep';
+    const qty = mod.quantity ?? 0;
+    changeLines.push(
+      op === 'delete'
+        ? `  - Delete material ${code} (no matching Material row on SO — flag for review)`
+        : `  - ${op === 'increase' ? 'Increase' : 'Decrease'} ${code} → ${qty} (no matching Material row on SO — flag for review)`
+    );
+  }
+
+  // (b) REVISED DISPATCH PLAN — every material with its final quantity.
+  const planLines: string[] = [];
+  for (const m of soMaterials) {
+    const mod = modsByCode.get(m.material);
+    const op = mod?.operation ?? 'keep';
+    const desc = m.materialDescription || m.material;
+    let finalQty: number | null;
+    if (op === 'delete') finalQty = null; // removed
+    else if (op === 'increase' || op === 'decrease') finalQty = mod?.quantity ?? 0;
+    else finalQty = m.dispatchQuantity ?? m.orderQuantity ?? 0;
+
+    if (finalQty === null) {
+      planLines.push(`  - ${desc} (Batch ${m.batch}): REMOVED`);
+    } else {
+      planLines.push(`  - ${desc} (Batch ${m.batch}): ${finalQty}`);
+    }
+  }
 
   const body = [
     `Hi,`,
     ``,
-    `We have updated SO ${so.soNumber} with the following changes:`,
+    `We have updated SO ${so.soNumber}.`,
     ``,
-    ...lines,
+    changeLines.length > 0 ? `Changes:` : `Changes: (none extracted)`,
+    ...(changeLines.length > 0 ? changeLines : []),
     ``,
-    `Please do the second release and confirm.`,
+    `Revised dispatch plan (full):`,
+    ...(planLines.length > 0 ? planLines : ['  (no materials on this SO)']),
+    ``,
+    `Please do the second release with the revised plan above and confirm.`,
     ``,
     `Thanks.`,
   ].join('\n');
@@ -301,7 +372,7 @@ export async function sendSecondReleaseEmail(args: {
     // Event emission must never break the primary flow.
   }
 
-  log(`[2ndRelease] Sent for SO ${so.soNumber} (${lines.length} change(s))`);
+  log(`[2ndRelease] Sent for SO ${so.soNumber} (${changeLines.length} change(s), ${planLines.length} line(s) in plan)`);
   return sent;
 }
 
@@ -1549,11 +1620,11 @@ async function fireStep(
       }
 
       const totalKg = items.reduce((s, it) => s + it.weight_kg, 0);
-      const poCustomer = await prisma.purchaseOrder.findUnique({
+      const poForCap = await prisma.purchaseOrder.findUnique({
         where: { id: so.purchaseOrderId },
-        select: { customer: { select: { weightage: true } } },
+        select: { weightage: true },
       });
-      const capacityTonnes = poCustomer?.customer?.weightage ? Number(poCustomer.customer.weightage) : 45;
+      const capacityTonnes = poForCap?.weightage ? Number(poForCap.weightage) : 0;
 
       // Anchor in the scenario's trigger email so the dispatch_confirmation
       // lands in the same Gmail thread (best-effort; falls back to a fresh
@@ -1658,6 +1729,73 @@ async function fireStep(
       const { checkAndSendBatchToAman } = await import('./auto-gui-trigger');
       const r = await checkAndSendBatchToAman(progress.salesOrderId, bundleId);
       for (const line of r.logs) log(line);
+      return 'advance_now';
+    }
+
+    case 'process_tonnage_reply': {
+      // Branch replied to a tonnage_inquiry email with the vehicle tonnage.
+      // Parse the number out of the reply (any unit form: "35", "35 t",
+      // "35 tonnes", "35000 kg") and write it to po.weightage. The next
+      // inbound (or planner-triggered re-evaluation) resumes dispatch.
+      const trigger = await loadTriggerReply(progress.id);
+      if (!trigger) {
+        log('[ENGINE] process_tonnage_reply — no trigger reply; cannot parse tonnage. Aborting.');
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'process_tonnage_reply but no trigger reply' },
+        });
+        return 'pause';
+      }
+
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: progress.salesOrderId },
+        select: { purchaseOrderId: true, soNumber: true },
+      });
+      if (!so?.purchaseOrderId) {
+        log(`[ENGINE] process_tonnage_reply — SO ${progress.salesOrderId} has no purchaseOrderId.`);
+        return 'advance_now';
+      }
+
+      // Strip HTML, then try units in this order: kg first (so a stray
+      // "35000 kg" doesn't get read as 35000 t), then tonnes/t/mt, then
+      // a bare number near the words "tonnage" / "capacity" / "truck" /
+      // "vehicle". Returns the value in tonnes.
+      const text = trigger.replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+      let tonnes: number | null = null;
+      const kgMatch = text.match(/(\d+(?:\.\d+)?)\s*kg\b/i);
+      if (kgMatch) {
+        const kg = parseFloat(kgMatch[1]);
+        if (kg > 0) tonnes = kg / 1000;
+      }
+      if (tonnes === null) {
+        const tMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:tonnes?|tons?|mt|t)\b/i);
+        if (tMatch) {
+          const t = parseFloat(tMatch[1]);
+          if (t > 0) tonnes = t;
+        }
+      }
+      if (tonnes === null) {
+        const ctxMatch = text.match(/(?:tonnage|capacity|truck|vehicle)[^\d]{0,30}(\d+(?:\.\d+)?)/i);
+        if (ctxMatch) {
+          const t = parseFloat(ctxMatch[1]);
+          if (t > 0 && t < 1000) tonnes = t; // sanity: tonnes is < 1000
+        }
+      }
+
+      if (tonnes === null) {
+        log(`[ENGINE] process_tonnage_reply — could not parse tonnage from reply: "${text.slice(0, 120)}"`);
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: 'tonnage not found in reply' },
+        });
+        return 'pause';
+      }
+
+      await prisma.purchaseOrder.update({
+        where: { id: so.purchaseOrderId },
+        data: { weightage: tonnes },
+      });
+      log(`[ENGINE] process_tonnage_reply — set po.weightage=${tonnes} t for PO ${so.purchaseOrderId} (SO ${so.soNumber})`);
       return 'advance_now';
     }
 

@@ -914,9 +914,9 @@ export default function WorkPage() {
                           </div>
                         </div>
                         <div className="flex items-center gap-4 text-sm text-slate-400">
-                          {po.customer && (
-                            <span className="px-2 py-0.5 rounded bg-slate-700 text-slate-200 text-xs" title={`Truck capacity for ${po.customer.name}`}>
-                              {po.customer.weightage} t
+                          {po.weightage != null && (
+                            <span className="px-2 py-0.5 rounded bg-slate-700 text-slate-200 text-xs" title={`Truck capacity for this PO`}>
+                              {po.weightage} t
                             </span>
                           )}
                           {po.salesOrders.length > 1 && (() => {

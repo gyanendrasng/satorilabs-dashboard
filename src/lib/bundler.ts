@@ -1,5 +1,19 @@
 import { prisma } from './prisma';
 
+/**
+ * Thrown by computeBundlesForPo when the PO has no `weightage` yet — the
+ * NEW ORDER email didn't include vehicle tonnage and the branch hasn't
+ * replied to the tonnage_inquiry email. Callers should catch this
+ * specifically and surface "waiting for tonnage" rather than treat it as
+ * a generic failure.
+ */
+export class BundlerWeightageMissingError extends Error {
+  constructor(poNumber: string) {
+    super(`PO ${poNumber}: vehicle tonnage not known yet — waiting for branch to share via tonnage_inquiry reply`);
+    this.name = 'BundlerWeightageMissingError';
+  }
+}
+
 export type BundlerInput = { id: string; material: string; weightKg: number };
 export type BundlerBin = { bundleNumber: number; totalKg: number; itemIds: string[] };
 
@@ -126,18 +140,17 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
 }> {
   const po = await prisma.purchaseOrder.findUnique({
     where: { id: purchaseOrderId },
-    include: { customer: true },
   });
   if (!po) throw new Error(`PurchaseOrder ${purchaseOrderId} not found`);
 
-  const rawWeightage = po.customer?.weightage ? Number(po.customer.weightage) : 0;
-  const weightageT = rawWeightage > 0 ? rawWeightage : 35;
+  // Vehicle capacity comes from the NEW ORDER email and is stored on the
+  // PO directly. If it's null, the branch never told us — the intake
+  // already sent a tonnage_inquiry email; we just can't bundle yet.
+  const rawWeightage = po.weightage ? Number(po.weightage) : 0;
   if (rawWeightage <= 0) {
-    console.warn(
-      `[Bundler] PO ${po.poNumber}: customer weightage missing/zero, defaulting to 35 t per truck`
-    );
+    throw new BundlerWeightageMissingError(po.poNumber);
   }
-  const capacityKg = weightageT * 1000;
+  const capacityKg = rawWeightage * 1000;
 
   // Idempotency: detach existing bundle linkages. With the LoadingSlip
   // refactor, LSIs reach a bundle through their parent LS — so we:

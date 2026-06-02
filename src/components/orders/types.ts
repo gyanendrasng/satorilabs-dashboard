@@ -86,7 +86,6 @@ export interface SalesOrder {
 export interface Customer {
   id: string;
   name: string;
-  weightage: string; // tonnes; serialized as string by Prisma Decimal
 }
 
 export interface PurchaseOrder {
@@ -95,6 +94,8 @@ export interface PurchaseOrder {
   customerName: string;
   customerId: string | null;
   customer: Customer | null;
+  /** Vehicle tonnage; null when branch hasn't shared it yet. */
+  weightage: string | null; // tonnes; serialized as string by Prisma Decimal
   status: string;
   stage: number;
   createdAt: string;

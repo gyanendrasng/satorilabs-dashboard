@@ -1,5 +1,5 @@
 import { prisma } from './prisma';
-import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, listMessages, getMessageSubject } from './gmail';
+import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject } from './gmail';
 import {
   checkAndSendBatchToAman,
   handleBranchReply,
@@ -532,18 +532,21 @@ export async function checkForNewEmails(): Promise<{
         // extraction (customer_id + so_numbers), not workflow planning.
         let customerId: string | null = null;
         let soNumbers: string[] = [];
+        let vehicleTonnage: number | null = null;
         try {
           const extracted = await extractOrderInfoWithAI(stripped);
           customerId = extracted.customerId;
           soNumbers = extracted.soNumbers;
-          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+          vehicleTonnage = extracted.vehicleTonnage;
+          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}, vehicleTonnage=${vehicleTonnage ?? '(none)'}`);
         } catch (aiErr) {
           log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
           const fb = extractOrderInfoFallback(stripped);
           customerId = fb.customerId;
           soNumbers = fb.soNumbers;
+          vehicleTonnage = fb.vehicleTonnage;
           if (soNumbers.length > 0) {
-            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}, vehicleTonnage=${vehicleTonnage ?? '(none)'}`);
           }
         }
 
@@ -579,13 +582,20 @@ export async function checkForNewEmails(): Promise<{
         const subject = await getMessageSubject(msg.id);
         const purchaseOrder = await prisma.purchaseOrder.upsert({
           where: { poNumber },
-          update: customer ? { customerId: customer.id } : {},
+          update: {
+            ...(customer ? { customerId: customer.id } : {}),
+            // Only set weightage on update if extraction succeeded; never
+            // overwrite a previously-stored value with null (a later cron
+            // pass shouldn't undo a successful first extraction).
+            ...(vehicleTonnage !== null ? { weightage: vehicleTonnage } : {}),
+          },
           create: {
             poNumber,
             customerName: customer?.name || subject || `Branch Order (${soNumbers.length} SOs)`,
             customerId: customer?.id,
             status: 'in-progress',
             stage: 1,
+            weightage: vehicleTonnage,
           },
         });
 
@@ -656,6 +666,80 @@ export async function checkForNewEmails(): Promise<{
             }
           } catch (evErr) {
             log(`[NewEmail] audit-trail event emit warning: ${evErr instanceof Error ? evErr.message : evErr}`);
+          }
+        }
+
+        // If the NEW ORDER didn't include vehicle tonnage, fire a
+        // tonnage_inquiry email to branch right away (in the NEW ORDER
+        // thread). ZSO-VISIBILITY still runs in parallel — visibility is
+        // independent of bundling. The bundler later refuses to compute
+        // bundles until po.weightage is set, so dispatch_confirmation
+        // naturally waits for the branch reply.
+        if (vehicleTonnage === null) {
+          try {
+            const tonnageBody = [
+              `Hi,`,
+              ``,
+              `We received your dispatch request for SO ${soNumbers.join(', ')}.`,
+              ``,
+              `Could you please share the vehicle/truck tonnage (capacity) for this dispatch? We need it to plan the bundle/truck split.`,
+              ``,
+              `For example: "Vehicle Tonnage: 35 t" or "Truck Capacity: 35000 kg".`,
+              ``,
+              `Thanks.`,
+            ].join('\n');
+            const tonnageSubject = `Vehicle Tonnage Required - PO ${poNumber}`;
+            const rfc822Id = await getMessageRfc822Id(msg.id);
+            const sent = rfc822Id && BRANCH_EMAIL
+              ? await sendReplyEmail(BRANCH_EMAIL, tonnageSubject, tonnageBody, msg.threadId, rfc822Id)
+              : BRANCH_EMAIL
+                ? await sendPlainEmail(BRANCH_EMAIL, tonnageSubject, tonnageBody)
+                : null;
+            if (sent) {
+              await prisma.email.create({
+                data: {
+                  purchaseOrderId: purchaseOrder.id,
+                  salesOrderId: null,
+                  gmailMessageId: sent.messageId,
+                  gmailThreadId: sent.threadId,
+                  recipientEmail: BRANCH_EMAIL,
+                  subject: tonnageSubject,
+                  status: 'sent',
+                  emailType: 'tonnage_inquiry',
+                  workflowState: 'awaiting_reply',
+                  sentBody: tonnageBody,
+                },
+              });
+              log(`[NewEmail] No tonnage in NEW ORDER for PO ${poNumber} — sent tonnage_inquiry to ${BRANCH_EMAIL}`);
+
+              // Audit event per SO so the planner sees this milestone.
+              try {
+                const { emitEvent } = await import('./scenario-events');
+                const allSos = await prisma.salesOrder.findMany({
+                  where: { purchaseOrderId: purchaseOrder.id, soNumber: { in: soNumbers } },
+                  select: { id: true },
+                });
+                for (const so of allSos) {
+                  await emitEvent({
+                    salesOrderId: so.id,
+                    type: 'email_sent',
+                    payload: {
+                      emailType: 'tonnage_inquiry',
+                      recipient: BRANCH_EMAIL,
+                      subject: tonnageSubject,
+                      body_excerpt: tonnageBody.slice(0, 200),
+                      gmailMessageId: sent.messageId,
+                    },
+                  });
+                }
+              } catch {
+                // event emission must never break primary flow
+              }
+            } else {
+              log(`[NewEmail] BRANCH_EMAIL not configured — cannot send tonnage_inquiry for PO ${poNumber}`);
+            }
+          } catch (tonnageErr) {
+            log(`[NewEmail] tonnage_inquiry send failed for PO ${poNumber}: ${tonnageErr instanceof Error ? tonnageErr.message : String(tonnageErr)}`);
           }
         }
 

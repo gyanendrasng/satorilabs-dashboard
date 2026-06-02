@@ -91,6 +91,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string }> = [
   { kind: 'email_to_branch_notifying_plant_change', description: 'Notify branch that the plant has proposed a modification. Send when a plant reply asks for a quantity change.' },
   { kind: 'email_order_status', description: 'Auto-reply with the current SO status. Use when branch asks "where is my order?" (Seeking Order Update).' },
   { kind: 'process_plant_invoice', description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use when the latest plant reply has a PDF attachment.' },
+  { kind: 'process_tonnage_reply', description: 'Branch replied to a tonnage_inquiry email with the vehicle/truck tonnage. Use ONLY when the latest inbound is a reply on a tonnage_inquiry thread and contains a number that looks like a truck capacity (e.g. "35 t", "35000 kg"). The executor parses the reply, writes po.weightage, and the next inbound resumes normal dispatch.' },
   { kind: 'await_plant_invoice', description: 'Sentinel — pause execution until the plant emails an invoice. The next plant reply will resume.' },
   { kind: 'await_vt01n', description: 'Sentinel — pause until the operator (or pipeline) fires VT01N for the shipment.' },
 ];
@@ -295,6 +296,7 @@ trigger email type, to decide whose intent this is.
 ANYTIME / OTHER:
  12. For a "Seeking Order Update" inquiry: emit a single email_order_status step. STOP.
  13. When the plant has sent an invoice PDF on a plant_ls reply, emit process_plant_invoice. STOP.
+ 14. When the branch replies on a tonnage_inquiry thread with the vehicle tonnage (e.g. "35 t", "35000 kg", "vehicle is 40 tonnes"), emit a single process_tonnage_reply step. STOP. The executor writes po.weightage and the next inbound (or the cron's natural retry) resumes the normal dispatch flow.
 
 FORMATTING:
  14. stop_after_index is 0-based. If steps has 3 entries and you want to pause after firing all 3, set stop_after_index=2.

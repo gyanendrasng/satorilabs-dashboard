@@ -626,9 +626,15 @@ export async function handleVehicleSplitConfirmation(
 
     const po = await prisma.purchaseOrder.findUnique({
       where: { id: email.purchaseOrderId },
-      include: { customer: true },
     });
-    const capacityTonnes = po?.customer?.weightage ? Number(po.customer.weightage) : 45;
+    // PO-level vehicle tonnage; if missing, we can't compute capacity.
+    // Callers in this branch use capacityTonnes only as display copy in
+    // the email body, so fall back to 0 (renders as "0 t" which is a
+    // visible flag rather than a hidden bug) — but log loudly.
+    const capacityTonnes = po?.weightage ? Number(po.weightage) : 0;
+    if (!po?.weightage) {
+      log(`[VehicleSplit] PO ${email.purchaseOrderId} has no weightage set — using 0 t in body copy.`);
+    }
 
     let intent: 'split' | 'cancel' | 'amend' | 'ambiguous';
     let removeCodes: string[] = [];
@@ -1301,10 +1307,23 @@ export async function sendDispatchConfirmationEmail(args: {
     await persistDispatchPlan(plan);
   }
 
-  // 2) Compute bundles now (FFD bin-pack into trucks of customer.weightage*1000 kg)
+  // 2) Compute bundles now (FFD bin-pack into trucks of po.weightage*1000 kg)
   //    so the email can list items truck-by-truck. Bundler is idempotent, so
   //    handleDispatchConfirmation re-running it later produces the same result.
-  const bundleResult = await computeBundlesForPo(purchaseOrderId);
+  //    When po.weightage is null (NEW ORDER didn't include it; branch hasn't
+  //    replied to tonnage_inquiry yet), the bundler throws — surface clearly
+  //    and skip the email; the cron will retry when weightage lands.
+  let bundleResult;
+  try {
+    bundleResult = await computeBundlesForPo(purchaseOrderId);
+  } catch (err) {
+    const { BundlerWeightageMissingError } = await import('./bundler');
+    if (err instanceof BundlerWeightageMissingError) {
+      log(`[DispatchConfirm] ${err.message} — skipping dispatch_confirmation, will retry once branch replies with tonnage.`);
+      return;
+    }
+    throw err;
+  }
   log(`[DispatchConfirm] Pre-email bundling: ${bundleResult.bundleCount} bundle(s), total ${(bundleResult.totalKg / 1000).toFixed(3)} t / ${bundleResult.capacityKg / 1000} t per truck`);
 
   const bundlesForEmail = await prisma.bundle.findMany({
@@ -1409,7 +1428,17 @@ export async function fanOutZload1ForPo(
   purchaseOrderId: string,
   log: (msg: string) => void,
 ): Promise<{ fired: number; bundleCount: number }> {
-  const bundleResult = await computeBundlesForPo(purchaseOrderId);
+  let bundleResult;
+  try {
+    bundleResult = await computeBundlesForPo(purchaseOrderId);
+  } catch (err) {
+    const { BundlerWeightageMissingError } = await import('./bundler');
+    if (err instanceof BundlerWeightageMissingError) {
+      log(`[ZLOAD1-Fanout] ${err.message} — cannot fire ZLOAD1 yet.`);
+      return { fired: 0, bundleCount: 0 };
+    }
+    throw err;
+  }
   log(`[ZLOAD1-Fanout] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
 
   // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that SO
@@ -1665,11 +1694,11 @@ export async function handleBranchReply(
 
         const po = await prisma.purchaseOrder.findUnique({
           where: { id: email.purchaseOrderId },
-          include: { customer: true },
         });
-        const capacityTonnes = po?.customer?.weightage
-          ? Number(po.customer.weightage)
-          : 45;
+        // PO-level vehicle tonnage. Missing → use 0 so the gate trips
+        // (any positive total exceeds 0), which is the safe default
+        // when we don't know the truck size.
+        const capacityTonnes = po?.weightage ? Number(po.weightage) : 0;
 
         log(`[BranchReply] PO ${po?.poNumber}: total release weight ${totalTonnes.toFixed(2)} t (capacity ${capacityTonnes} t)`);
 
@@ -1731,11 +1760,11 @@ export async function handleBranchReply(
       const totalTonnes = r.plan.totalWeightKg / 1000;
       const so = await prisma.salesOrder.findUnique({
         where: { id: r.plan.salesOrderId },
-        include: { purchaseOrder: { include: { customer: true } } },
+        include: { purchaseOrder: true },
       });
-      const capacityTonnes = so?.purchaseOrder.customer?.weightage
-        ? Number(so.purchaseOrder.customer.weightage)
-        : 45;
+      const capacityTonnes = so?.purchaseOrder.weightage
+        ? Number(so.purchaseOrder.weightage)
+        : 0;
 
       if (totalTonnes > capacityTonnes) {
         log(`[BranchReply] Single-SO over capacity (${totalTonnes.toFixed(2)} t > ${capacityTonnes} t) — sending split inquiry`);
@@ -2360,9 +2389,9 @@ export async function assembleAndSendCombinedEmail(
       orderWeightKg: m.orderWeightKg ? Number(m.orderWeightKg) : null,
     })),
   }));
-  const capacityTonnes = purchaseOrder.customer?.weightage
-    ? Number(purchaseOrder.customer.weightage)
-    : 45;
+  const capacityTonnes = purchaseOrder.weightage
+    ? Number(purchaseOrder.weightage)
+    : 0;
   const combinedBody = buildDispatchApprovalHtml(purchaseOrder.poNumber, sections, capacityTonnes);
 
   // Aggregated v2 materials JSON (used by handleBranchReply to reconstruct per-SO context)

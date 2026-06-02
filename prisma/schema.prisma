@@ -113,6 +113,10 @@ model PurchaseOrder {
   // increments this so the next ls_dispatch / dispatch_confirmation on the PO
   // belong to a fresh round and are not skipped by idempotency guards.
   dispatchRound Int    @default(1)
+  // Vehicle capacity (tonnes). Extracted from the NEW ORDER email; if absent,
+  // we email the branch to ask and stay NULL until they reply. The bundler
+  // requires this to compute bundles — when NULL, bundling is blocked.
+  weightage    Decimal?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -189,11 +193,12 @@ model Shipment {
 
 // Customer record keyed by the externally-provided customer_id from the
 // NEW ORDER email. Auto-created on first sight with a generic name.
-// `weightage` is the customer's truck capacity in tonnes (default 35).
+// Customer is just an identity record now. Truck capacity (`weightage`) is
+// stored per-PurchaseOrder, extracted from the NEW ORDER email — different
+// orders from the same customer can use different vehicle sizes.
 model Customer {
   id        String   @id
   name      String   @default("New Customer")
-  weightage Decimal  @default(35)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
