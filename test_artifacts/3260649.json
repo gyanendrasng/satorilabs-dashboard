@@ -1,0 +1,101 @@
+{
+  "email_body": "Dear Sales Team,\n\nWe have completed the stock analysis for Sales Order 3260649. \n\nFor the following products, stock is already confirmed and we are good to proceed with the batches assigned in the order:\n- OE1WJ 300X600-5 ALMITOS LT GL REC-P: 150 units from Batch P\n- OT2FJ 300X300-10 GREY MATT-P: 200 units from Batch P\n- OV7FJ 600X1200-2 FIRMIN BLISS ANANSPDR-P: 50 units from Batch CP-09\n- OV6FJ 600x1200-2 FRYETT GREY CRVMDR-P: 200 units from Batch 28-07-2025\n- OE1WJ 300X600-5 UNITAS LT GLREC-P: 200 units from Batch P\n- OT2FJ 300X300-10 REC LENOX BLANCO MTDG-P: 200 units from Batch P\n- OA4FJ 600X600-4 BELMEN BEIGE SUMDR-P: 200 units from Batch 27\n- OA4FJ 600X600-4 BASSWOOD BRWN DGMT REC-P: 80 units from Batch 50\n- OV7FJ 600X1200-2 FIRMIN GY ANANT SPDR-P: 50 units from Batch CP-03\n- OV7FJ 600X600-4 EASTER BIANCO VPDR-P: 50 units from Batch B-14\n- OA4FJ 600X600-4 KITTS WOOD BEIGE MDR-P: 50 units from Batch 28\n\nRegarding the OP7WJ 300X450-5 LEXIS NERO HTELV MDR-P, we are not in a position to supply the entire quantity at the moment as there is currently zero free stock available (all physical stock is earmarked). You may choose to wait until the next production batch is available or ignore this material and process the rest of the order.\n\nPlease advise on how you would like to proceed.",
+  "materials": [
+    {
+      "material": "YE1ALLT000000Y1P",
+      "material_description": "OE1WJ 300X600-5 ALMITOS LT  GL REC-P",
+      "order_quantity": 150,
+      "available_stock_for_so": 150,
+      "batch": "P",
+      "order_weight_kg": 2040
+    },
+    {
+      "material": "YT20000030000D5P",
+      "material_description": "OT2FJ 300X300-10 GREY MATT-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 200,
+      "batch": "P",
+      "order_weight_kg": 2660
+    },
+    {
+      "material": "YV7FIRMBLAN00PJP",
+      "material_description": "OV7FJ 600X1200-2 FIRMIN BLISS ANANSPDR-P",
+      "order_quantity": 50,
+      "available_stock_for_so": 50,
+      "batch": "CP-09",
+      "order_weight_kg": 1365
+    },
+    {
+      "material": "YV6FRYE030000PJP",
+      "material_description": "OV6FJ 600x1200-2 FRYETT GREY CRVMDR-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 200,
+      "batch": "28-07-2025",
+      "order_weight_kg": 5440
+    },
+    {
+      "material": "YE1UNILT00000Y1P",
+      "material_description": "OE1WJ 300X600-5 UNITAS LT GLREC-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 200,
+      "batch": "P",
+      "order_weight_kg": 2720
+    },
+    {
+      "material": "YT2LEBL000000D5P",
+      "material_description": "OT2FJ 300X300-10 REC LENOX BLANCO MTDG-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 200,
+      "batch": "P",
+      "order_weight_kg": 2660
+    },
+    {
+      "material": "YA4BELM18000043P",
+      "material_description": "OA4FJ 600X600-4 BELMEN BEIGE SUMDR-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 200,
+      "batch": "27",
+      "order_weight_kg": 5300
+    },
+    {
+      "material": "YA4BASS02000043P",
+      "material_description": "OA4FJ 600X600-4 BASSWOOD BRWN DGMT REC-P",
+      "order_quantity": 80,
+      "available_stock_for_so": 80,
+      "batch": "50",
+      "order_weight_kg": 2120
+    },
+    {
+      "material": "YV7FIRM03AN00PJP",
+      "material_description": "OV7FJ 600X1200-2 FIRMIN GY ANANT SPDR-P",
+      "order_quantity": 50,
+      "available_stock_for_so": 50,
+      "batch": "CP-03",
+      "order_weight_kg": 1365
+    },
+    {
+      "material": "YV7EAST37000043P",
+      "material_description": "OV7FJ 600X600-4 EASTER BIANCO VPDR-P",
+      "order_quantity": 50,
+      "available_stock_for_so": 50,
+      "batch": "B-14",
+      "order_weight_kg": 1335
+    },
+    {
+      "material": "YA4KIWO18000043P",
+      "material_description": "OA4FJ 600X600-4 KITTS WOOD BEIGE MDR-P",
+      "order_quantity": 50,
+      "available_stock_for_so": 50,
+      "batch": "28",
+      "order_weight_kg": 1325
+    },
+    {
+      "material": "YP7LEHT200000UGP",
+      "material_description": "OP7WJ 300X450-5 LEXIS NERO HTELV MDR-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 0,
+      "batch": "P",
+      "order_weight_kg": 2020
+    }
+  ]
+}

@@ -753,6 +753,7 @@ const STANDARD_MATERIALS: VisibilityMaterial[] = [
 const NEW_ORDER_BODY = (soNumber: string, customerId: string) =>
   `Dear Sales Team,\n\nPlease create SO ${soNumber} for customer ${customerId}. Materials:\n` +
   `- YE1EDWO00001APJP — 50 units\n- YV6FRYENE0000PJP — 100 units\n- YA4COWOCR000043P — 250 units\n\n` +
+  `Vehicle Tonnage: 35 t\n\n` +
   `Regards,\nBranch`;
 
 const CASES: TestCase[] = [

@@ -895,7 +895,7 @@ async function runChain(env: Env, spec: ChainSpec): Promise<ChainResult> {
   // Pre-create Customer so checkForNewEmails sees a real row.
   await prisma.customer.upsert({
     where: { id: spec.customerId },
-    create: { id: spec.customerId, name: `Chain ${spec.id}`, weightage: 45 },
+    create: { id: spec.customerId, name: `Chain ${spec.id}` },
     update: {},
   });
 

@@ -403,7 +403,7 @@ export async function wipeAll(prisma: any) {
 export async function seedSO(prisma: any, opts: SeedOptions) {
   const stamp = Date.now();
   const cust = await prisma.customer.create({
-    data: { id: `CUST-${stamp}`, name: 'Test', weightage: 45 },
+    data: { id: `CUST-${stamp}`, name: 'Test' },
   });
   const po = await prisma.purchaseOrder.create({
     data: {
@@ -411,6 +411,7 @@ export async function seedSO(prisma: any, opts: SeedOptions) {
       customerId: cust.id,
       customerName: 'Test',
       stage: 3,
+      weightage: 45,
     },
   });
   const so = await prisma.salesOrder.create({
