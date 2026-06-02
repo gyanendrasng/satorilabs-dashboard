@@ -219,12 +219,61 @@ export async function POST(request: Request) {
         );
       }
 
+      // Resolve the real SAP material code per parsed PDF row.
+      //
+      // The PDF doesn't print SAP material codes; it only prints the
+      // product description (e.g. "OT2FJ 300X300-10 GREY MATT-P"). The
+      // parser previously extracted the first whitespace token of that
+      // description as `material` — but "OT2FJ" is a product family, not
+      // a SAP code. Two genuinely-different SKUs can share the same family
+      // prefix (e.g. "OT2FJ ... GREY MATT-P" → YT20000030000D5P vs
+      // "OT2FJ ... REC LENOX BLANCO MTDG-P" → YT2LEBL000000D5P), and the
+      // (loadingSlipId, family, batch) upsert collapses them into one row.
+      //
+      // ZSO-VISIBILITY already stored the SO's real Materials with both
+      // SAP code and description. Look up each PDF row's real code by
+      // (description, batch) against that table. Whitespace is normalised
+      // because the visibility payload sometimes carries double spaces
+      // ("ALMITOS LT  GL REC-P") that the PDF prints as single spaces.
+      const normaliseDesc = (s: string): string =>
+        s.toUpperCase().replace(/\s+/g, ' ').trim();
+
+      const soMaterials = await prisma.material.findMany({
+        where: { salesOrderId: salesOrder.id },
+        select: { material: true, materialDescription: true, batch: true },
+      });
+      const codeByDescBatch = new Map<string, string>();
+      for (const m of soMaterials) {
+        if (!m.materialDescription) continue;
+        const key = `${normaliseDesc(m.materialDescription)}|${m.batch}`;
+        // First write wins; if visibility-data ever has duplicates for the
+        // same (desc, batch) we log on read miss anyway.
+        if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
+      }
+
       for (const item of parsed.items) {
+        // Look up the real SAP code by (description, batch). If the SO's
+        // Material rows don't carry this (desc, batch) pair, fall back to
+        // the PDF's family prefix and log — that's a recoverable miss but
+        // worth attention.
+        const lookupKey = `${normaliseDesc(item.description)}|${item.batch}`;
+        const realMaterialCode = codeByDescBatch.get(lookupKey);
+
+        const materialForLsi = realMaterialCode ?? item.material;
+        if (!realMaterialCode) {
+          console.warn(
+            `[ZLOAD1 Data] No Material row matched PDF row on LS ${lsNumber}: ` +
+              `description="${item.description}", batch="${item.batch}". ` +
+              `Falling back to family prefix "${item.material}" — this row may collide ` +
+              `with another LSI if the family appears twice on this LS.`
+          );
+        }
+
         const lsi = await prisma.loadingSlipItem.upsert({
           where: {
             loadingSlipId_material_batch: {
               loadingSlipId: loadingSlip.id,
-              material: item.material,
+              material: materialForLsi,
               batch: item.batch,
             },
           },
@@ -232,7 +281,7 @@ export async function POST(request: Request) {
             salesOrderId: salesOrder.id,
             loadingSlipId: loadingSlip.id,
             lsNumber,
-            material: item.material,
+            material: materialForLsi,
             batch: item.batch,
             materialDescription: item.description,
             orderQuantity: item.qtyLoaded,
