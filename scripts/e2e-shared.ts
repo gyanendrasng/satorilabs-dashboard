@@ -88,7 +88,8 @@ export function inboxPushNewOrder(args: {
     args.body ??
     `Hi team,\n\nPlease create the following sales order:\n\n` +
       `Customer ID: ${args.customerId}\n` +
-      `SO Number: ${args.soNumber}\n\n` +
+      `SO Number: ${args.soNumber}\n` +
+      `Vehicle Tonnage: 35 t\n\n` +
       `Regards,\nBranch`;
   const msg: GmailInboxMessage = {
     id: `MOCK-NEWORDER-${stamp}`,
