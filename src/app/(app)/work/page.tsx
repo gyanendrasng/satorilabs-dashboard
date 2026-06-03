@@ -296,7 +296,7 @@ export default function WorkPage() {
   // Agent screen: connect directly to the auto_gui2 live-view's /video WebSocket
   // and render each JPEG frame into an <img>. Skips the source page's toolbar
   // and right-side logs panel — we have our own Logs tab.
-  const AGENT_SCREEN_HOST = 'ewa-brindled-isa.ngrok-free.dev';
+  const AGENT_SCREEN_HOST = 'vm.satorilabs.tech';
   const agentImgRef = useRef<HTMLImageElement>(null);
   const [agentFps, setAgentFps] = useState<number | null>(null);
   const [agentStatus, setAgentStatus] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
