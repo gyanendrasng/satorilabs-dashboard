@@ -33,6 +33,19 @@ export interface PlannedStep {
   kind: StepKind;
   /** Optional free-text reasoning from the LLM (kept for audit). */
   rationale?: string;
+  /**
+   * Planner-authored question text — used ONLY by the three question-asking
+   * step kinds (`email_clarify_branch`, `email_clarify_plant`,
+   * `email_supervisor_question`). The executor sends this verbatim as the
+   * body of the outbound email. Ignored by every other step kind.
+   */
+  question?: string;
+  /**
+   * Candidate answers/options the planner is weighing. Used by
+   * `email_supervisor_question` to surface the alternatives the planner is
+   * stuck between. Rendered as a bulleted list in the supervisor email.
+   */
+  options?: string[];
 }
 
 export interface PlanResult {
@@ -92,6 +105,9 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string }> = [
   { kind: 'email_order_status', description: 'Auto-reply with the current SO status. Use when branch asks "where is my order?" (Seeking Order Update).' },
   { kind: 'process_plant_invoice', description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use when the latest plant reply has a PDF attachment.' },
   { kind: 'process_tonnage_reply', description: 'Branch replied to a tonnage_inquiry email with the vehicle/truck tonnage. Use ONLY when the latest inbound is a reply on a tonnage_inquiry thread and contains a number that looks like a truck capacity (e.g. "35 t", "35000 kg"). The executor parses the reply, writes po.weightage, and the next inbound resumes normal dispatch.' },
+  { kind: 'email_clarify_branch', description: 'Reply in-thread to BRANCH asking a focused clarifying question. Use when the branch reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses; the branch reply will trigger a fresh plan.' },
+  { kind: 'email_clarify_plant', description: 'Reply in-thread to PLANT asking a focused clarifying question. Use when the plant reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses.' },
+  { kind: 'email_supervisor_question', description: 'Email the SUPERVISOR for guidance when you do not know which step to take. Use ONLY when the audit trail / email thread leave you genuinely unable to choose between options. Provide the exact question text as `question` and the alternatives you are weighing as `options` (each a short phrase). The executor sends the email and pauses; the supervisor reply will be classified by the next plan.' },
   { kind: 'await_plant_invoice', description: 'Sentinel — pause execution until the plant emails an invoice. The next plant reply will resume.' },
   { kind: 'await_vt01n', description: 'Sentinel — pause until the operator (or pipeline) fires VT01N for the shipment.' },
 ];
@@ -189,6 +205,8 @@ const VALID_STEP_KINDS = STEP_KINDS.map((s) => s.kind) as [StepKind, ...StepKind
 const PlannedStepSchema = z.object({
   kind: z.enum(VALID_STEP_KINDS),
   rationale: z.string().optional(),
+  question: z.string().optional(),
+  options: z.array(z.string()).optional(),
 });
 
 const PlanResultSchema = z.object({
@@ -215,6 +233,11 @@ OUTPUT FORMAT — RETURN STRICT JSON. NO MARKDOWN. NO PROSE OUTSIDE THE JSON.
   "escalate": false,
   "escalation_question": null
 }
+
+For the three question-asking step kinds — email_clarify_branch, email_clarify_plant, email_supervisor_question — the step object MUST also include:
+{ "kind": "email_clarify_branch", "rationale": "...", "question": "<exact text to send>" }
+{ "kind": "email_supervisor_question", "rationale": "...", "question": "<situation>", "options": ["option A", "option B", ...] }
+Omit "question" / "options" for any other step kind.
 
 RULES:
 1. Plan up to and including the NEXT outbound email. STOP at that email. The next inbound email will trigger a fresh plan call.
@@ -298,9 +321,23 @@ ANYTIME / OTHER:
  13. When the plant has sent an invoice PDF on a plant_ls reply, emit process_plant_invoice. STOP.
  14. When the branch replies on a tonnage_inquiry thread with the vehicle tonnage (e.g. "35 t", "35000 kg", "vehicle is 40 tonnes"), emit a single process_tonnage_reply step. STOP. The executor writes po.weightage and the next inbound (or the cron's natural retry) resumes the normal dispatch flow.
 
+WHEN A REPLY IS UNCLEAR / INCOMPLETE — ASK A CLARIFYING QUESTION:
+ 15. If the latest inbound is ambiguous, contradictory, or only partially answers what we asked, emit a single email_clarify_branch (or email_clarify_plant if the sender was the plant) step. STOP. Provide the exact question on the step as the "question" field. The reply will trigger a fresh plan.
+     - Example: we asked for vehicle tonnage AND truck number; the branch replied only with the truck number → emit email_clarify_branch with question="You shared the truck number. Could you also confirm the vehicle tonnage (in tonnes)?".
+     - Example: branch replied "modify the order" with no material code or quantity → emit email_clarify_branch asking for the specific material + new quantity.
+     - Keep the question SHORT (1–3 sentences). Quote back the part of their message you understood so they know you read it. Do not invent details. Do not ask more than one question per email unless they are tightly linked.
+     - Do NOT use clarification as a stalling move. If the reply is clearly actionable, ACT. Use a clarification only when proceeding without the missing fact would be wrong or destructive.
+
+WHEN YOU ARE STUCK — ASK THE SUPERVISOR:
+ 16. If you genuinely cannot decide what step to take next — for example the audit trail looks inconsistent, two rules above seem to conflict, or the email asks for something outside the standard process — emit a single email_supervisor_question step. STOP. On the step provide:
+     - "question": one or two sentences stating the situation in your own words. Include the SO number and what the inbound is asking for. Do NOT paste the full email — the supervisor sees the rendered thread already.
+     - "options": 2–4 short candidate next-actions you are weighing (each a short phrase like "Fire zload2 for material X" or "Send 2nd_release email to confirm with branch"). The supervisor will reply with which one to take, or with custom instructions.
+     - Do not use this as an escape hatch. Try to apply rules 1–15 first. The supervisor's reply will be picked up as a normal inbound and re-planned, so a vague "please advise" wastes time. Be specific.
+     - This step is for in-band confusion only. For PARSER / SYSTEM failures (planner errors, malformed inputs) leave steps=[] and set escalate=true with escalation_question instead.
+
 FORMATTING:
- 14. stop_after_index is 0-based. If steps has 3 entries and you want to pause after firing all 3, set stop_after_index=2.
- 15. If you have nothing to do (e.g. the email is "thanks"): set steps=[] and stop_after_index=-1.
+ 17. stop_after_index is 0-based. If steps has 3 entries and you want to pause after firing all 3, set stop_after_index=2.
+ 18. If you have nothing to do (e.g. the email is "thanks"): set steps=[] and stop_after_index=-1.
 `;
 
 async function buildUserPrompt(args: {

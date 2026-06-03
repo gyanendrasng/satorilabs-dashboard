@@ -66,6 +66,15 @@ export type StepKind =
   | 'email_to_plant'                  // reuse sendLSEmail (per-LSI)
   | 'email_to_branch_notifying_plant_change'  // NEW — sendPlantChangeNotificationEmail (R46-R51)
   | 'email_order_status'              // NEW — sendOrderStatusEmail (R9 Seeking Order Update auto-reply)
+  // Planner-authored questions. Each carries its question text (and, for the
+  // supervisor variant, a list of options the planner is weighing) on the
+  // PlannedStep itself. The executor sends the email, persists it in 'sent'
+  // status so the cron polls the thread, and pauses the scenario; the reply
+  // re-enters handleReplyV2 like any other inbound and lets the planner act
+  // on the clarification.
+  | 'email_clarify_branch'            // Ask BRANCH to clarify an ambiguous / incomplete reply
+  | 'email_clarify_plant'             // Ask PLANT to clarify an ambiguous / incomplete reply
+  | 'email_supervisor_question'       // Ask the SUPERVISOR which option to pursue when stuck
   | 'process_plant_invoice'           // plant replied with invoice PDF → checkAndSendBatchToAman
   | 'process_tonnage_reply'           // branch replied to tonnage_inquiry → extract tonnage, write to PO.weightage
   | 'await_plant_invoice'             // sentinel — engine pauses; plant reply advances it

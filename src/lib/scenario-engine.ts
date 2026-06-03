@@ -589,6 +589,132 @@ export async function sendPlantChangeNotificationEmail(args: {
   return sent;
 }
 
+// -----------------------------------------------------------------------------
+// Planner-authored questions — clarification (branch/plant) + supervisor.
+//
+// Three variants share the same machinery: send an outbound email whose body
+// is text the planner authored verbatim, persist the Email row with the right
+// emailType so the cron picks up the reply and routes it back through the
+// planner. Each pauses the scenario at this step; the inbound reply triggers
+// a fresh planNextSteps call which sees the full thread including the
+// question and the answer.
+// -----------------------------------------------------------------------------
+
+async function sendPlannerQuestionEmail(args: {
+  recipient: string;
+  recipientRole: 'branch' | 'plant' | 'supervisor';
+  salesOrderId: string;
+  triggerEmailId: string;
+  question: string;
+  options?: string[];
+  /** Anchor the message in the inbound's thread so the recipient sees context. */
+  threadAnchor: { gmailThreadId: string | null; gmailMessageId: string | null } | null;
+  emailType: 'branch_clarify' | 'plant_clarify' | 'supervisor_question';
+  log: (msg: string) => void;
+}): Promise<{ messageId: string; threadId: string } | null> {
+  const { recipient, recipientRole, salesOrderId, triggerEmailId, question, options, threadAnchor, emailType, log } = args;
+
+  if (!recipient) {
+    log(`[PlannerQ:${recipientRole}] no recipient address configured — skipping`);
+    return null;
+  }
+
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: salesOrderId },
+    select: { soNumber: true, purchaseOrderId: true },
+  });
+  if (!so) {
+    log(`[PlannerQ:${recipientRole}] SO ${salesOrderId} not found`);
+    return null;
+  }
+
+  // Body: just the question, with an optional numbered options list for the
+  // supervisor variant. We deliberately do NOT paste the full email thread —
+  // for branch/plant the question goes in-thread so they see context above
+  // it; for supervisor we send a fresh thread and the planner is expected to
+  // include the relevant background in the question itself (rule 16).
+  const bodyLines: string[] = ['Hi,', '', question.trim()];
+  if (options && options.length > 0) {
+    bodyLines.push('', 'Options being considered:');
+    options.forEach((opt, idx) => bodyLines.push(`  ${idx + 1}. ${opt.trim()}`));
+    bodyLines.push('', 'Please reply with the option number or your own instruction.');
+  }
+  bodyLines.push('', 'Thanks.');
+  const body = bodyLines.join('\n');
+
+  const subjectPrefix =
+    recipientRole === 'supervisor'
+      ? `Supervisor needed — SO ${so.soNumber}`
+      : `Clarification needed — SO ${so.soNumber}`;
+  const subject = subjectPrefix;
+
+  // Supervisor mails go in a fresh thread (cleaner inbox for the supervisor);
+  // branch/plant clarifications reply in-thread to give context.
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (
+      recipientRole !== 'supervisor' &&
+      threadAnchor?.gmailThreadId &&
+      threadAnchor.gmailMessageId
+    ) {
+      const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
+      if (rfc822Id) {
+        sent = await sendReplyEmail(recipient, subject, body, threadAnchor.gmailThreadId, rfc822Id);
+      } else {
+        sent = await sendPlainEmail(recipient, subject, body);
+      }
+    } else {
+      sent = await sendPlainEmail(recipient, subject, body);
+    }
+  } catch (err) {
+    log(`[PlannerQ:${recipientRole}] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
+    sent = await sendPlainEmail(recipient, subject, body);
+  }
+
+  await prisma.email.create({
+    data: {
+      salesOrderId,
+      purchaseOrderId: so.purchaseOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: recipient,
+      subject,
+      status: 'sent',
+      emailType,
+      workflowState: 'awaiting_reply',
+      sentBody: body,
+      relatedMaterials: JSON.stringify({
+        version: 'planner-question-v1',
+        triggerEmailId,
+        question,
+        options: options ?? [],
+      }),
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    await emitEvent({
+      salesOrderId,
+      type: 'email_sent',
+      payload: {
+        emailType,
+        recipient,
+        subject,
+        body_excerpt: body.slice(0, 200),
+        gmailMessageId: sent.messageId,
+        question,
+        options: options ?? [],
+      },
+    });
+  } catch {
+    // Event emission must never break the primary flow.
+  }
+
+  log(`[PlannerQ:${recipientRole}] Sent for SO ${so.soNumber} (question="${question.slice(0, 80)}${question.length > 80 ? '…' : ''}")`);
+  return sent;
+}
+
 /**
  * Branch replied to a '2nd_release' email. In planner mode this routes through
  * the unified `handleReplyV2` — the planner reads the audit trail (sees
@@ -1893,6 +2019,78 @@ async function fireStep(
       });
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
       return 'advance_now';
+    }
+
+    // -------- planner-authored questions: clarification + supervisor --------
+    case 'email_clarify_branch':
+    case 'email_clarify_plant':
+    case 'email_supervisor_question': {
+      // The planner wrote the exact question on the PlannedStep itself.
+      // We never re-author or paraphrase it.
+      const question = (_plannedStep?.question ?? '').trim();
+      if (!question) {
+        log(`[ENGINE] ${step.kind} — planner emitted this step without a question. Marking failed.`);
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: `${step.kind} step had empty question` },
+        });
+        return 'pause';
+      }
+
+      // Anchor the outbound on whatever inbound triggered this plan, so the
+      // recipient sees the context above our question (branch/plant case).
+      // For supervisor we still pass the anchor but the sender opts to start
+      // a new thread.
+      const trigger = await prisma.scenarioProgress.findUnique({
+        where: { id: progress.id },
+        select: { triggerEmailId: true },
+      });
+      const triggerEmail = trigger?.triggerEmailId
+        ? await prisma.email.findUnique({
+            where: { id: trigger.triggerEmailId },
+            select: { id: true, gmailThreadId: true, gmailMessageId: true },
+          })
+        : null;
+      const threadAnchor = triggerEmail
+        ? { gmailThreadId: triggerEmail.gmailThreadId, gmailMessageId: triggerEmail.gmailMessageId }
+        : null;
+
+      let recipient: string;
+      let recipientRole: 'branch' | 'plant' | 'supervisor';
+      let emailType: 'branch_clarify' | 'plant_clarify' | 'supervisor_question';
+      if (step.kind === 'email_clarify_branch') {
+        recipient = process.env.BRANCH_EMAIL || '';
+        recipientRole = 'branch';
+        emailType = 'branch_clarify';
+      } else if (step.kind === 'email_clarify_plant') {
+        recipient = process.env.PLANT_EMAIL || '';
+        recipientRole = 'plant';
+        emailType = 'plant_clarify';
+      } else {
+        recipient = process.env.SUPERVISOR_EMAIL || 'amanrai369@gmail.com';
+        recipientRole = 'supervisor';
+        emailType = 'supervisor_question';
+      }
+
+      await sendPlannerQuestionEmail({
+        recipient,
+        recipientRole,
+        salesOrderId: progress.salesOrderId,
+        triggerEmailId: triggerEmail?.id ?? '',
+        question,
+        options: _plannedStep?.options,
+        threadAnchor,
+        emailType,
+        log,
+      });
+
+      // Pause until the recipient replies. The cron's reply-checker will
+      // pick up their reply (status='sent', workflowState='awaiting_reply')
+      // and route it back through handleReplyV2 → planNextSteps, which now
+      // sees the question + answer in the thread.
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      await markAwaitingReply(progress.id);
+      return 'pause';
     }
 
     // -------- sentinels: pause until an existing pipeline reports back --------
