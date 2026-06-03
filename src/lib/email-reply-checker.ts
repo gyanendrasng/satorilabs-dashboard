@@ -677,6 +677,12 @@ export async function checkForNewEmails(): Promise<{
         // naturally waits for the branch reply.
         if (vehicleTonnage === null) {
           try {
+            // NOTE: Do NOT include numeric examples in the inquiry body.
+            // Gmail clients quote the prior thread inline on reply, and the
+            // tonnage parser in process_tonnage_reply would otherwise match
+            // our example number instead of the branch's actual answer.
+            // Keep the ask in plain prose so the reply has only one numeric
+            // candidate above the quote line.
             const tonnageBody = [
               `Hi,`,
               ``,
@@ -684,7 +690,7 @@ export async function checkForNewEmails(): Promise<{
               ``,
               `Could you please share the vehicle/truck tonnage (capacity) for this dispatch? We need it to plan the bundle/truck split.`,
               ``,
-              `For example: "Vehicle Tonnage: 35 t" or "Truck Capacity: 35000 kg".`,
+              `Please reply with the tonnage in tonnes (e.g. just the number followed by "t").`,
               ``,
               `Thanks.`,
             ].join('\n');
@@ -767,6 +773,22 @@ export async function checkForNewEmails(): Promise<{
           } catch (tonnageErr) {
             log(`[NewEmail] tonnage_inquiry send failed for PO ${poNumber}: ${tonnageErr instanceof Error ? tonnageErr.message : String(tonnageErr)}`);
           }
+        }
+
+        // ─── Tonnage gate ───────────────────────────────────────────────
+        // Strict gating: no SAP / customer-facing step proceeds until the
+        // branch has shared the truck tonnage for this PO. ZSO-VISIBILITY
+        // is read-only but it produces an ls_dispatch email; running it
+        // before tonnage is known leaks "we're processing your order" to
+        // the branch before we know the load fits any truck.
+        //
+        // SOs stay in visibilityState='queued'. The process_tonnage_reply
+        // handler kicks ZSO-VISIBILITY for every queued SO of the PO once
+        // PO.weightage lands.
+        if (vehicleTonnage === null) {
+          log(`[NewEmail] PO ${poNumber}: tonnage missing — ZSO-VISIBILITY deferred until branch replies on tonnage_inquiry`);
+          triggered++;
+          continue;
         }
 
         // Enqueue ZSO-VISIBILITY for every queued SO of this PO. The global

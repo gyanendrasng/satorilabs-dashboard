@@ -1882,11 +1882,41 @@ async function fireStep(
         return 'advance_now';
       }
 
-      // Strip HTML, then try units in this order: kg first (so a stray
-      // "35000 kg" doesn't get read as 35000 t), then tonnes/t/mt, then
-      // a bare number near the words "tonnage" / "capacity" / "truck" /
-      // "vehicle". Returns the value in tonnes.
-      const text = trigger.replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+      // ─── Reply text isolation ────────────────────────────────────────
+      // Gmail replies quote the prior thread inline. Our own tonnage_inquiry
+      // includes example phrases like "Vehicle Tonnage: 35 t" that the
+      // regex below would otherwise match before the branch's actual answer.
+      // Strip the quoted portion first.
+      //
+      // Two markers are common:
+      //   1. <blockquote class="gmail_quote"> wraps the entire quoted thread
+      //      (Gmail web + most clients that respect the convention).
+      //   2. "On <date>, <addr> wrote:" — fallback plain-text marker.
+      let isolated = trigger.replyHtml
+        // Drop the gmail quote block entirely.
+        .replace(/<blockquote[^>]*class="[^"]*gmail_quote[^"]*"[^>]*>[\s\S]*?<\/blockquote>/gi, ' ')
+        // Strip every other tag.
+        .replace(/<[^>]*>/g, ' ')
+        // Collapse whitespace early so the "On … wrote:" anchor isn't broken
+        // across newlines.
+        .replace(/\s+/g, ' ')
+        .trim();
+      // Plain-text quote anchor: cut from "On <day-of-week or date>, ... wrote:" onward.
+      const wroteIdx = isolated.search(/On\s+.{0,120}?\bwrote\s*:/i);
+      if (wroteIdx > 0) isolated = isolated.slice(0, wroteIdx).trim();
+
+      // Also drop our own outbound boilerplate if the client inlined it
+      // (some replies don't blockquote and don't use the "wrote:" anchor).
+      // The example phrasing on the tonnage_inquiry includes the literal
+      // "For example:" preface — anything after that is OUR text, not theirs.
+      const exampleIdx = isolated.search(/\bFor example\s*:/i);
+      if (exampleIdx > 0) isolated = isolated.slice(0, exampleIdx).trim();
+
+      const text = isolated || trigger.replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+
+      // Try units in this order: kg first (so "35000 kg" doesn't get read as
+      // 35000 t), then tonnes/t/mt, then a bare number near the words
+      // "tonnage" / "capacity" / "truck" / "vehicle". Returns tonnes.
       let tonnes: number | null = null;
       const kgMatch = text.match(/(\d+(?:\.\d+)?)\s*kg\b/i);
       if (kgMatch) {
@@ -1924,16 +1954,54 @@ async function fireStep(
       log(`[ENGINE] process_tonnage_reply — set po.weightage=${tonnes} t for PO ${so.purchaseOrderId} (SO ${so.soNumber})`);
 
       // ─── Auto-resume the PO ───────────────────────────────────────────
-      // Tonnage is a PO-level unblock. Any SO under this PO whose
-      // ls_dispatch was already replied to but never produced a
-      // dispatch_confirmation (because sendDispatchConfirmationEmail bailed
-      // on the missing weightage) is now ready to advance. Replay each one
-      // here so the branch doesn't have to send another message just to
-      // wake the system up.
+      // Tonnage is a PO-level unblock. There are two possible held states
+      // depending on when the branch finally answered:
       //
-      // Predicate: SO has a replied 'ls_dispatch' email AND no 'sent'
-      // dispatch_confirmation email at the current dispatchRound. That
-      // matches exactly the silent-skip state.
+      //   (A) ZSO-VISIBILITY was DEFERRED at NEW ORDER time (strict gate
+      //       in checkForNewEmails). SalesOrders are still in
+      //       visibilityState='queued'. Fire ZSO-VISIBILITY now — the rest
+      //       of the flow follows naturally.
+      //
+      //   (B) ZSO-VISIBILITY already ran (older NEW ORDERs predating the
+      //       strict gate, or partial-PO replays), ls_dispatch was replied
+      //       to, but dispatch_confirmation never went out because the
+      //       bundler had no tonnage. Re-fire dispatch_confirmation.
+      //
+      // Both blocks are no-ops when their predicate doesn't match, so the
+      // overall handler is idempotent.
+      try {
+        // (A) Fire any deferred ZSO-VISIBILITY.
+        const queuedSos = await prisma.salesOrder.findMany({
+          where: { purchaseOrderId: so.purchaseOrderId, visibilityState: 'queued' },
+          select: { id: true, soNumber: true },
+          orderBy: { createdAt: 'asc' },
+        });
+        if (queuedSos.length > 0) {
+          const { triggerZsoVisibility } = await import('./auto-gui-trigger');
+          for (const qso of queuedSos) {
+            await prisma.salesOrder.update({
+              where: { id: qso.id },
+              data: { visibilityState: 'firing' },
+            });
+            try {
+              await triggerZsoVisibility(qso.soNumber);
+              log(`[ENGINE] auto-resume: enqueued deferred ZSO-VISIBILITY for SO ${qso.soNumber}`);
+            } catch (visErr) {
+              log(
+                `[ENGINE] auto-resume: ZSO-VISIBILITY enqueue failed for SO ${qso.soNumber}: ${visErr instanceof Error ? visErr.message : String(visErr)}`
+              );
+            }
+          }
+        }
+      } catch (resumeErr) {
+        log(
+          `[ENGINE] auto-resume (visibility) failed for PO ${so.purchaseOrderId}: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`
+        );
+      }
+
+      // (B) Re-fire dispatch_confirmation for any SO whose ls_dispatch was
+      //     already replied to but never produced a dispatch_confirmation
+      //     (because the bundler bailed on the missing weightage).
       try {
         const po = await prisma.purchaseOrder.findUnique({
           where: { id: so.purchaseOrderId },
