@@ -4,6 +4,13 @@ import type { WorkQueue } from '@prisma/client';
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 
+/**
+ * When NEXT_PUBLIC_SAP_TEST_MODE is "true", every /chat request carries
+ * `test_mode: true` so auto_gui2 replays fixtures instead of driving real SAP
+ * (see TEST_MODE.md). Anything else (unset, "false", "0") means live SAP.
+ */
+export const SAP_TEST_MODE = process.env.NEXT_PUBLIC_SAP_TEST_MODE === 'true';
+
 export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51' | 'zloading_close' | 'va02' | 'zload2';
 
 /**
@@ -91,12 +98,13 @@ export async function pumpQueue(): Promise<WorkQueue | null> {
   const wireBody = {
     work_id: next.id,
     ...payload,
+    ...(SAP_TEST_MODE ? { test_mode: true } : {}),
     meta: { ...(payload.meta ?? {}), work_id: next.id },
   };
 
   const soNumber = (payload.meta?.so_number as string | undefined) ?? payload.so_number ?? 'unknown';
 
-  console.log(`[WorkQueue] → SEND work ${next.id} (${next.step}, SO ${soNumber}) → auto_gui2`);
+  console.log(`[WorkQueue] → SEND work ${next.id} (${next.step}, SO ${soNumber})${SAP_TEST_MODE ? ' [TEST_MODE]' : ''} → auto_gui2`);
 
   fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
     method: 'POST',

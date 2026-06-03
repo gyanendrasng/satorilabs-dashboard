@@ -208,6 +208,9 @@ export default function OrdersPage() {
 
     try {
       const instruction = `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}`;
+      // When SAP test mode is on, auto_gui2 replays fixtures instead of driving
+      // real SAP (see TEST_MODE.md). Same flag the server-side work queue reads.
+      const testMode = process.env.NEXT_PUBLIC_SAP_TEST_MODE === 'true';
 
       const res = await fetch(`${amanUrl}/chat`, {
         method: 'POST',
@@ -215,6 +218,7 @@ export default function OrdersPage() {
         body: JSON.stringify({
           instruction,
           transaction_code: 'ZLOAD3-A',
+          ...(testMode ? { test_mode: true, meta: { so_number: soNumber } } : {}),
         }),
       });
 
