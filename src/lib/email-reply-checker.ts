@@ -93,13 +93,26 @@ export async function checkForReplies(): Promise<{
       // Get all messages in the thread
       const messages = await getThreadMessages(email.gmailThreadId);
 
-      // Find reply messages (only messages AFTER our dispatch email in the thread)
+      // Find reply messages (only TRUE INBOUND messages AFTER our dispatch).
+      //
+      // The naive "messages after ours" filter is wrong when our own pipeline
+      // has sent MORE outbound messages on the same thread later (e.g. a
+      // clarification email after the initial dispatch). Those carry the
+      // 'SENT' label; treating them as "replies" feeds OUR own text back to
+      // the planner, which loops forever emitting clarifications about the
+      // last clarification.
+      //
+      // True inbound = Gmail labelled it INBOX *and* not SENT.
       const dispatchIdx = messages.findIndex(
         (msg) => msg.id === email.gmailMessageId
       );
-      const replyMessages = dispatchIdx >= 0
+      const candidates = dispatchIdx >= 0
         ? messages.slice(dispatchIdx + 1)
         : messages.filter((msg) => msg.id !== email.gmailMessageId);
+      const replyMessages = candidates.filter((msg) => {
+        const labels = (msg.labelIds as string[] | undefined) ?? [];
+        return labels.includes('INBOX') && !labels.includes('SENT');
+      });
 
       if (replyMessages.length === 0) {
         log(`[EmailChecker] No reply yet for SO ${soNumber} / LS ${lsNumber}`);
