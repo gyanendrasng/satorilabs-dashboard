@@ -100,7 +100,8 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string }> = [
   { kind: 'email_confirm_product_details', description: 'The ls_dispatch email — confirm product/batch details with branch. Sent automatically by the zso_visibility callback; do not emit explicitly unless you specifically want to re-send.' },
   { kind: 'email_confirm_bundle_details', description: 'The dispatch_confirmation email — confirm bundle/truck plan with branch. Send after ls_dispatch was replied to with a confirmation.' },
   { kind: 'email_to_branch_for_vehicle', description: 'Ask branch for vehicle details (truck no, driver, LR). Send after ZLOAD1 creates loading slips.' },
-  { kind: 'email_to_plant', description: 'Forward the LS PDF to the plant (plant_ls email). Send after branch provides vehicle details.' },
+  { kind: 'email_to_plant', description: 'Forward the LS PDF to the plant (plant_ls email). Use ONLY after branch provides vehicle details (truck/driver/LR). Sends EVERY LS for the affected bundles. Do NOT use after zload2/zloading_close — use email_modified_ls_to_plant for that.' },
+  { kind: 'email_modified_ls_to_plant', description: 'Forward the regenerated LS PDFs to the plant after a zload2 / zloading_close modification. Sends ONLY the LSs that were just touched by the preceding zload2/zloading_close steps in THIS plan — never every LS. Use this whenever the plan contains zload2 or zloading_close AND we need to notify the plant of the change.' },
   { kind: 'email_to_branch_notifying_plant_change', description: 'Notify branch that the plant has proposed a modification. Send when a plant reply asks for a quantity change.' },
   { kind: 'email_order_status', description: 'Auto-reply with the current SO status. Use when branch asks "where is my order?" (Seeking Order Update).' },
   { kind: 'process_plant_invoice', description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use when the latest plant reply has a PDF attachment.' },
@@ -351,14 +352,15 @@ trigger email type, to decide whose intent this is.
      (Audit trail shows va02 ✓ + zso_visibility ✓ × 2 + ls_dispatch ✓ × 2 + dispatch_confirmation ✓ × 2.)
      CHOOSE based on whether LoadingSlipItem rows already exist:
        (a) NO LSIs yet → EMIT zload1 → email_to_branch_for_vehicle. STOP.
-       (b) LSIs already exist (audit trail has a prior step_completed zload1 ✓ from BEFORE the modification) → EMIT zload2 → email_to_plant. STOP.
+       (b) LSIs already exist (audit trail has a prior step_completed zload1 ✓ from BEFORE the modification) → EMIT zload2 → email_modified_ls_to_plant. STOP.
      A prior "step_completed zload1" event in the audit trail = path (b). No prior zload1 = path (a).
 
  11. INBOUND: branch MODIFY-DECREASE / MODIFY-DELETE / MODIFY-DEC-DEL reply on a plant_ls email.
      (Audit trail: zload1 ✓ and plant_ls ✓ already happened. SENDER=branch.)
      The BRANCH is requesting the change — they are the customer authority.
-     EMIT: zload2 (decrease/inc-dec) AND/OR zloading_close (delete) → email_to_plant. STOP.
+     EMIT: zload2 (decrease/inc-dec) AND/OR zloading_close (delete) → email_modified_ls_to_plant. STOP.
      Do NOT emit email_to_branch_notifying_plant_change — that's for PLANT-proposed changes.
+     Do NOT emit plain email_to_plant here — it would send EVERY LS to the plant, including unmodified ones. Use email_modified_ls_to_plant which sends only the touched LSs.
      No va02, no 2nd release. Decreases / deletes don't change the SO; they only revise the LS.
 
 ANYTIME / OTHER:

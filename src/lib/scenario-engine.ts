@@ -1828,6 +1828,121 @@ async function fireStep(
       return 'advance_now';
     }
 
+    case 'email_modified_ls_to_plant': {
+      // Post-modification: forward ONLY the LSs that were just touched by
+      // the preceding zload2 / zloading_close steps in THIS plan. Does NOT
+      // extract vehicle details (the bundle already has them from the
+      // earlier vehicle_details exchange); does NOT forward unmodified LSs.
+      //
+      // Source of "which LSs were touched": WorkQueue rows for this SO
+      // with step ∈ {zload2, zloading_close} created since this scenario
+      // started. Each row's meta.ls_number is the target LS.
+      const progressRow = await prisma.scenarioProgress.findUnique({
+        where: { id: progress.id },
+        select: { createdAt: true },
+      });
+      const scenarioStartedAt = progressRow?.createdAt ?? new Date(0);
+
+      const modWork = await prisma.workQueue.findMany({
+        where: {
+          salesOrderId: progress.salesOrderId,
+          step: { in: ['zload2', 'zloading_close'] },
+          createdAt: { gte: scenarioStartedAt },
+        },
+        select: { id: true, step: true, payload: true },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      const touchedLsNumbers = new Set<string>();
+      for (const w of modWork) {
+        try {
+          const parsed = JSON.parse(w.payload) as { meta?: { ls_number?: string } };
+          const lsNum = parsed.meta?.ls_number;
+          if (lsNum) touchedLsNumbers.add(lsNum);
+        } catch {
+          // ignore — payload should always be valid JSON, but never break
+          // the email step over a parse error in a sibling row
+        }
+      }
+
+      if (touchedLsNumbers.size === 0) {
+        log('[ENGINE] email_modified_ls_to_plant — no zload2/zloading_close work rows found in this scenario; nothing to forward.');
+        return 'advance_now';
+      }
+
+      const modifiedSlips = await prisma.loadingSlip.findMany({
+        where: {
+          salesOrderId: progress.salesOrderId,
+          lsNumber: { in: [...touchedLsNumbers] },
+        },
+        include: {
+          bundle: {
+            select: { vehicleNumber: true, driverMobile: true, containerNumber: true },
+          },
+        },
+      });
+
+      if (modifiedSlips.length === 0) {
+        log(`[ENGINE] email_modified_ls_to_plant — no LoadingSlip rows for [${[...touchedLsNumbers].join(', ')}]; nothing to forward.`);
+        return 'advance_now';
+      }
+
+      const { downloadFromS3 } = await import('./s3');
+      const { sendLSEmail } = await import('./email-service');
+      const soRow = await prisma.salesOrder.findUnique({
+        where: { id: progress.salesOrderId },
+        select: { soNumber: true, vehicleNumber: true, driverMobile: true, containerNumber: true },
+      });
+      const soNumber = soRow?.soNumber ?? '';
+
+      log(`[ENGINE] email_modified_ls_to_plant — forwarding ${modifiedSlips.length} modified LS(s) to plant for SO ${soNumber}: [${modifiedSlips.map((s) => s.lsNumber).join(', ')}]`);
+
+      for (const ls of modifiedSlips) {
+        try {
+          if (!ls.fileUrl) {
+            log(`[ENGINE] email_modified_ls_to_plant — LS ${ls.lsNumber} has no fileUrl; skipping (was /zload2-data missing the PDF persist?)`);
+            continue;
+          }
+          const pdfBuffer = await downloadFromS3(ls.fileUrl);
+          const filename = ls.fileUrl.split('/').pop() || `${ls.lsNumber}.pdf`;
+          const vehicleForEmail = ls.bundle
+            ? {
+                vehicleNumber: ls.bundle.vehicleNumber,
+                driverMobile: ls.bundle.driverMobile,
+                containerNumber: ls.bundle.containerNumber,
+              }
+            : {
+                vehicleNumber: soRow?.vehicleNumber ?? null,
+                driverMobile: soRow?.driverMobile ?? null,
+                containerNumber: soRow?.containerNumber ?? null,
+              };
+          const anchorLsi = await prisma.loadingSlipItem.findFirst({
+            where: { loadingSlipId: ls.id },
+            select: { id: true },
+          });
+          if (!anchorLsi) {
+            log(`[ENGINE] email_modified_ls_to_plant — LS ${ls.lsNumber} has no LSI rows; skipping plant email`);
+            continue;
+          }
+          await sendLSEmail(
+            anchorLsi.id,
+            ls.salesOrderId,
+            soNumber,
+            ls.lsNumber,
+            pdfBuffer,
+            vehicleForEmail,
+            filename,
+          );
+          log(`[ENGINE] email_modified_ls_to_plant — sent revised LS ${ls.lsNumber} to plant`);
+        } catch (sendErr) {
+          log(`[ENGINE] email_modified_ls_to_plant — failed to send LS ${ls.lsNumber}: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}`);
+        }
+      }
+
+      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'advance_now';
+    }
+
     case 'process_plant_invoice': {
       // Plant replied with an invoice PDF on plant_ls. The PDF was already
       // uploaded to R2 by the email-reply-checker pre-pass (Email.replyPdfUrl

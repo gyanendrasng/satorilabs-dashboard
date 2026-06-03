@@ -63,7 +63,8 @@ export type StepKind =
   | 'email_confirm_product_details'   // reuse assembleAndSendCombinedEmail (ls_dispatch)
   | 'email_confirm_bundle_details'    // reuse sendDispatchConfirmationEmail
   | 'email_to_branch_for_vehicle'     // reuse sendCombinedVehicleDetailsEmailForPo
-  | 'email_to_plant'                  // reuse sendLSEmail (per-LSI)
+  | 'email_to_plant'                  // reuse sendLSEmail (per-LSI). Vehicle-details path: forwards EVERY LS of the affected bundles.
+  | 'email_modified_ls_to_plant'      // Post-modification: forward ONLY the LSs touched by the preceding zload2 / zloading_close steps. Does NOT extract vehicle details.
   | 'email_to_branch_notifying_plant_change'  // NEW — sendPlantChangeNotificationEmail (R46-R51)
   | 'email_order_status'              // NEW — sendOrderStatusEmail (R9 Seeking Order Update auto-reply)
   // Planner-authored questions. Each carries its question text (and, for the
