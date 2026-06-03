@@ -104,7 +104,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string }> = [
   { kind: 'email_to_branch_notifying_plant_change', description: 'Notify branch that the plant has proposed a modification. Send when a plant reply asks for a quantity change.' },
   { kind: 'email_order_status', description: 'Auto-reply with the current SO status. Use when branch asks "where is my order?" (Seeking Order Update).' },
   { kind: 'process_plant_invoice', description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use when the latest plant reply has a PDF attachment.' },
-  { kind: 'process_tonnage_reply', description: 'Branch replied to a tonnage_inquiry email with the vehicle/truck tonnage. Use ONLY when the latest inbound is a reply on a tonnage_inquiry thread and contains a number that looks like a truck capacity (e.g. "35 t", "35000 kg"). The executor parses the reply, writes po.weightage, and the next inbound resumes normal dispatch.' },
+  { kind: 'process_tonnage_reply', description: 'Branch replied to a tonnage_inquiry email with the vehicle/truck tonnage. Use ONLY when the latest inbound is a reply on a tonnage_inquiry thread and contains a number that looks like a truck capacity (e.g. "35 t", "35000 kg"). The executor parses the reply, writes po.weightage (PO-level — affects every SO under the PO), and the next inbound resumes normal dispatch. Note: tonnage_inquiry is a PO-scoped email anchored on the lead SO of the PO (project convention); the same PO.weightage benefits every SO.' },
   { kind: 'email_clarify_branch', description: 'Reply in-thread to BRANCH asking a focused clarifying question. Use when the branch reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses; the branch reply will trigger a fresh plan.' },
   { kind: 'email_clarify_plant', description: 'Reply in-thread to PLANT asking a focused clarifying question. Use when the plant reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses.' },
   { kind: 'email_supervisor_question', description: 'Email the SUPERVISOR for guidance when you do not know which step to take. Use ONLY when the audit trail / email thread leave you genuinely unable to choose between options. Provide the exact question text as `question` and the alternatives you are weighing as `options` (each a short phrase). The executor sends the email and pauses; the supervisor reply will be classified by the next plan.' },
@@ -135,6 +135,12 @@ interface SoStateSnapshot {
   invoiceReceived: boolean;
   shipmentCreated: boolean;
   materialLines: string[];
+  /** Per-PO truck capacity (tonnes). Null until branch shares — bundling is blocked. */
+  poWeightageTonnes: number | null;
+  /** A tonnage_inquiry email is sent and awaiting branch reply on this PO. */
+  tonnageInquiryPending: boolean;
+  /** Total SOs that share this PO (and therefore share this tonnage). */
+  poSoCount: number;
 }
 
 async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapshot | null> {
@@ -143,7 +149,12 @@ async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapsh
     include: {
       materials: { orderBy: { createdAt: 'asc' } },
       items: { select: { id: true } },
-      purchaseOrder: { include: { customer: true } },
+      purchaseOrder: {
+        include: {
+          customer: true,
+          salesOrders: { select: { id: true } },
+        },
+      },
       invoice: { select: { id: true } },
       shipments: { select: { id: true, status: true } },
     },
@@ -164,6 +175,23 @@ async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapsh
     return `  - ${m.material} (Batch ${batch}): ordered ${ord}, available ${avail}`;
   });
 
+  // PO-level tonnage state. Tonnage is per-PO (one truck → one capacity →
+  // applies to every SO of the PO). Bundling is blocked until this lands.
+  const poWeightage = so.purchaseOrder?.weightage ? Number(so.purchaseOrder.weightage) : null;
+  let tonnageInquiryPending = false;
+  if (so.purchaseOrder && (poWeightage === null || poWeightage <= 0)) {
+    const pendingInquiry = await prisma.email.findFirst({
+      where: {
+        purchaseOrderId: so.purchaseOrder.id,
+        emailType: 'tonnage_inquiry',
+        status: 'sent',
+        repliedAt: null,
+      },
+      select: { id: true },
+    });
+    tonnageInquiryPending = !!pendingInquiry;
+  }
+
   return {
     soNumber: so.soNumber,
     customer: so.purchaseOrder?.customer?.name ?? so.purchaseOrder?.customerName ?? null,
@@ -175,10 +203,19 @@ async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapsh
     invoiceReceived: !!so.invoice,
     shipmentCreated: so.shipments.length > 0,
     materialLines,
+    poWeightageTonnes: poWeightage,
+    tonnageInquiryPending,
+    poSoCount: so.purchaseOrder?.salesOrders.length ?? 1,
   };
 }
 
 function renderSoState(s: SoStateSnapshot): string {
+  const tonnageLine =
+    s.poWeightageTonnes !== null && s.poWeightageTonnes > 0
+      ? `- PO vehicle tonnage: ${s.poWeightageTonnes} t (per-PO; shared by ${s.poSoCount} SO${s.poSoCount === 1 ? '' : 's'})`
+      : s.tonnageInquiryPending
+        ? `- PO vehicle tonnage: (NOT SHARED YET — tonnage_inquiry sent, awaiting branch reply; affects ${s.poSoCount} SO${s.poSoCount === 1 ? '' : 's'})`
+        : `- PO vehicle tonnage: (NOT SHARED YET — no tonnage_inquiry on file; affects ${s.poSoCount} SO${s.poSoCount === 1 ? '' : 's'})`;
   return [
     'CURRENT SO STATE:',
     `- soNumber: ${s.soNumber}`,
@@ -187,6 +224,7 @@ function renderSoState(s: SoStateSnapshot): string {
     `- stage (derived): ${s.stage}`,
     `- material lines: ${s.materialCount}`,
     `- loading slips created: ${s.lsCount}`,
+    tonnageLine,
     `- plant_ls email sent: ${s.plantLsSent ? 'yes' : 'no'}`,
     `- plant invoice received: ${s.invoiceReceived ? 'yes' : 'no'}`,
     `- shipment created: ${s.shipmentCreated ? 'yes' : 'no'}`,
@@ -240,6 +278,13 @@ For the three question-asking step kinds — email_clarify_branch, email_clarify
 Omit "question" / "options" for any other step kind.
 
 RULES:
+0. **PO TONNAGE GATE (check this FIRST, before any other rule).**
+   Vehicle tonnage is a per-PO fact that controls bundle/truck packing for every SO of the PO. The CURRENT SO STATE block above tells you whether it's known. While "PO vehicle tonnage" is NOT SHARED YET:
+     - DO NOT emit any of: email_confirm_bundle_details, zload1, email_to_branch_for_vehicle, email_to_plant. Bundling is impossible without a truck capacity.
+     - If the state line says "tonnage_inquiry sent, awaiting branch reply" → return steps=[] with rationale "waiting on tonnage_inquiry reply before bundling; resume on next inbound". The branch will reply on the tonnage_inquiry thread; that reply will trigger process_tonnage_reply and unblock the flow automatically.
+     - If the state line says "no tonnage_inquiry on file" → emit a single email_clarify_branch step asking for the vehicle tonnage. STOP. Example question: "Could you share the vehicle/truck tonnage (capacity) for this dispatch? We need it to plan the bundle/truck split."
+     - If the latest inbound IS itself a reply on a tonnage_inquiry thread and contains tonnage, emit process_tonnage_reply (per rule 14) — that's the unblock.
+     - You MAY still emit non-bundle, non-truck steps that don't depend on tonnage (e.g. process_plant_invoice on a separate flow, email_order_status for a status question).
 1. Plan up to and including the NEXT outbound email. STOP at that email. The next inbound email will trigger a fresh plan call.
 2. Pick step kinds ONLY from the AVAILABLE STEP KINDS list. Out-of-vocab values are rejected.
 3. You emit step KINDS ONLY. Do NOT emit data values (quantities, materials, vehicle numbers, etc.). Each step's executor reads what it needs from the email thread / DB on its own. Your job is to choose the right sequence of milestones, nothing more.

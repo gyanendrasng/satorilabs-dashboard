@@ -289,7 +289,7 @@ interface ReleaseItem {
   weight_kg: number;
 }
 
-interface SoReleasePlan {
+export interface SoReleasePlan {
   soNumber: string;
   salesOrderId: string;
   items: ReleaseItem[];

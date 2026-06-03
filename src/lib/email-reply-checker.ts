@@ -696,10 +696,32 @@ export async function checkForNewEmails(): Promise<{
                 ? await sendPlainEmail(BRANCH_EMAIL, tonnageSubject, tonnageBody)
                 : null;
             if (sent) {
+              // ─── PROJECT CONVENTION: PO-scoped emails anchor to lead SO ───
+              // tonnage_inquiry is logically a PO-level email — the truck
+              // tonnage is stored on PurchaseOrder.weightage and applies to
+              // every SO of the PO. But the engine's routing layer
+              // (handleReplyV2) was built around per-SO replies and still
+              // refuses to process an Email with a null salesOrderId.
+              //
+              // The agreed convention for any email that conceptually scopes
+              // to the PO (not a single SO) is to anchor it on the PO's lead
+              // SO — the SO that joined the PO first (oldest createdAt).
+              // The reply then routes through the planner attached to that
+              // SO. The actual side-effect (here: writing PO.weightage) is
+              // PO-scoped and benefits every SO automatically.
+              //
+              // Future PO-level emails (multi-SO clarifications, supervisor
+              // questions about the whole order, etc.) should follow this
+              // same pattern: link to lead SO + carry purchaseOrderId.
+              const leadSo = await prisma.salesOrder.findFirst({
+                where: { purchaseOrderId: purchaseOrder.id, soNumber: { in: soNumbers } },
+                orderBy: { createdAt: 'asc' },
+                select: { id: true },
+              });
               await prisma.email.create({
                 data: {
                   purchaseOrderId: purchaseOrder.id,
-                  salesOrderId: null,
+                  salesOrderId: leadSo?.id ?? null,
                   gmailMessageId: sent.messageId,
                   gmailThreadId: sent.threadId,
                   recipientEmail: BRANCH_EMAIL,
@@ -712,16 +734,18 @@ export async function checkForNewEmails(): Promise<{
               });
               log(`[NewEmail] No tonnage in NEW ORDER for PO ${poNumber} — sent tonnage_inquiry to ${BRANCH_EMAIL}`);
 
-              // Audit event per SO so the planner sees this milestone.
+              // ONE PO-scoped audit event — tonnage is a single per-PO ask
+              // that affects every SO under the PO. Emitting per-SO would
+              // make the planner see N "we asked for tonnage" events for a
+              // multi-SO NEW ORDER when the reality is one ask. Attach the
+              // event to the lead SO (matches the Email row's salesOrderId)
+              // and put the full affected-SO list in the payload so the
+              // dashboard / planner can fan out if needed.
               try {
-                const { emitEvent } = await import('./scenario-events');
-                const allSos = await prisma.salesOrder.findMany({
-                  where: { purchaseOrderId: purchaseOrder.id, soNumber: { in: soNumbers } },
-                  select: { id: true },
-                });
-                for (const so of allSos) {
+                if (leadSo) {
+                  const { emitEvent } = await import('./scenario-events');
                   await emitEvent({
-                    salesOrderId: so.id,
+                    salesOrderId: leadSo.id,
                     type: 'email_sent',
                     payload: {
                       emailType: 'tonnage_inquiry',
@@ -729,6 +753,8 @@ export async function checkForNewEmails(): Promise<{
                       subject: tonnageSubject,
                       body_excerpt: tonnageBody.slice(0, 200),
                       gmailMessageId: sent.messageId,
+                      purchaseOrderId: purchaseOrder.id,
+                      affectsSos: soNumbers,
                     },
                   });
                 }

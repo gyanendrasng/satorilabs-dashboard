@@ -1922,6 +1922,96 @@ async function fireStep(
         data: { weightage: tonnes },
       });
       log(`[ENGINE] process_tonnage_reply — set po.weightage=${tonnes} t for PO ${so.purchaseOrderId} (SO ${so.soNumber})`);
+
+      // ─── Auto-resume the PO ───────────────────────────────────────────
+      // Tonnage is a PO-level unblock. Any SO under this PO whose
+      // ls_dispatch was already replied to but never produced a
+      // dispatch_confirmation (because sendDispatchConfirmationEmail bailed
+      // on the missing weightage) is now ready to advance. Replay each one
+      // here so the branch doesn't have to send another message just to
+      // wake the system up.
+      //
+      // Predicate: SO has a replied 'ls_dispatch' email AND no 'sent'
+      // dispatch_confirmation email at the current dispatchRound. That
+      // matches exactly the silent-skip state.
+      try {
+        const po = await prisma.purchaseOrder.findUnique({
+          where: { id: so.purchaseOrderId },
+          select: {
+            id: true,
+            poNumber: true,
+            dispatchRound: true,
+            salesOrders: { select: { id: true, soNumber: true, releasePlan: true } },
+          },
+        });
+        if (po) {
+          const currentRound = po.dispatchRound ?? 1;
+          const { sendDispatchConfirmationEmail } = await import('./auto-gui-trigger');
+
+          // Find ls_dispatch replies + dispatch_confirmation sends, per SO.
+          for (const sibling of po.salesOrders) {
+            const lsDispatchReplied = await prisma.email.findFirst({
+              where: {
+                purchaseOrderId: po.id,
+                emailType: 'ls_dispatch',
+                status: 'replied',
+                dispatchRound: currentRound,
+              },
+              orderBy: { sentAt: 'desc' },
+              select: { id: true, gmailThreadId: true, gmailMessageId: true },
+            });
+            if (!lsDispatchReplied) continue;
+
+            const dcSent = await prisma.email.findFirst({
+              where: {
+                salesOrderId: sibling.id,
+                emailType: 'dispatch_confirmation',
+                status: { in: ['sent', 'replied'] },
+                dispatchRound: currentRound,
+              },
+              select: { id: true },
+            });
+            if (dcSent) continue;
+
+            // Reconstruct the plan from the SO's stored releasePlan (set
+            // when ls_dispatch was originally assembled).
+            if (!sibling.releasePlan) {
+              log(`[ENGINE] auto-resume: SO ${sibling.soNumber} has no releasePlan — skipping`);
+              continue;
+            }
+            let plan: import('./auto-gui-trigger').SoReleasePlan;
+            try {
+              plan = JSON.parse(sibling.releasePlan);
+            } catch {
+              log(`[ENGINE] auto-resume: SO ${sibling.soNumber} releasePlan JSON invalid — skipping`);
+              continue;
+            }
+            const totalTonnes = (plan.totalWeightKg ?? 0) / 1000;
+
+            log(`[ENGINE] auto-resume: re-firing dispatch_confirmation for SO ${sibling.soNumber} (tonnage now ${tonnes} t)`);
+            await sendDispatchConfirmationEmail({
+              purchaseOrderId: po.id,
+              plans: [plan],
+              twoVehicles: false,
+              totalTonnes,
+              capacityTonnes: tonnes,
+              threadAnchor: {
+                gmailThreadId: lsDispatchReplied.gmailThreadId,
+                gmailMessageId: lsDispatchReplied.gmailMessageId,
+              },
+              log,
+            });
+          }
+        }
+      } catch (resumeErr) {
+        log(
+          `[ENGINE] auto-resume after tonnage failed for PO ${so.purchaseOrderId}: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`
+        );
+        // Auto-resume is best-effort. The next inbound on any sibling SO
+        // will trigger a fresh planner cycle that sees the now-set tonnage
+        // and emits dispatch_confirmation again.
+      }
+
       return 'advance_now';
     }
 
