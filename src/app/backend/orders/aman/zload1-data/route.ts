@@ -318,6 +318,31 @@ export async function POST(request: Request) {
             .map((it) => `${it.material}/${it.batch}×${it.qtyLoaded}`)
             .join(', ')
       );
+
+      // Now that we know every material on this LS, resolve the plant email
+      // by the shared 3-char plant code prefix and persist it on the LS row.
+      // sendLSEmail reads LoadingSlip.plantEmail downstream.
+      try {
+        const lsiMaterials = (
+          await prisma.loadingSlipItem.findMany({
+            where: { loadingSlipId: loadingSlip.id },
+            select: { material: true },
+          })
+        ).map((r) => r.material);
+        const { resolvePlantEmailForLoadingSlip } = await import('@/lib/plant-resolver');
+        const plantEmail = await resolvePlantEmailForLoadingSlip(lsiMaterials, lsNumber);
+        if (plantEmail) {
+          await prisma.loadingSlip.update({
+            where: { id: loadingSlip.id },
+            data: { plantEmail },
+          });
+          console.log(`[ZLOAD1 Data] LS ${lsNumber} plantEmail resolved → ${plantEmail}`);
+        }
+      } catch (resolveErr) {
+        console.warn(
+          `[ZLOAD1 Data] Plant email resolution failed for LS ${lsNumber}: ${resolveErr instanceof Error ? resolveErr.message : String(resolveErr)}`
+        );
+      }
     } else {
       // Legacy fallback: single PENDING placeholder. /initial-data will
       // fill it in if auto_gui2 supplies an `items` JSON.

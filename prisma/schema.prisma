@@ -348,6 +348,20 @@ model WorkQueue {
   @@map("work_queue")
 }
 
+// Static catalog of SAP plants. The primary key IS the SAP plant code
+// (e.g. "7651"), so callers that already know the code can look up the
+// plant email directly without an extra join.
+model Plant {
+  id        String   @id  // SAP plant code (e.g. "7651")
+  name      String
+  location  String
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("plant")
+}
+
 // SO-level material visibility data returned by ZSO-VISIBILITY.
 // Distinct from LoadingSlipItem (which is per-LS, created after ZLOAD1).
 model Material {

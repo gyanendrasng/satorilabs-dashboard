@@ -20,10 +20,21 @@ export async function sendLSEmail(
   vehicleDetails: VehicleDetails,
   originalFilename?: string
 ): Promise<{ messageId: string; threadId: string }> {
-  const plantEmail = process.env.PLANT_EMAIL;
+  // Recipient resolution: prefer the per-LS plantEmail stored on LoadingSlip
+  // (set by /zload1-data via the 3-char plant-code lookup against the Plant
+  // table). Fall back to the legacy PLANT_EMAIL env when missing.
+  const lsiRow = await prisma.loadingSlipItem.findUnique({
+    where: { id: loadingSlipItemId },
+    select: {
+      loadingSlipId: true,
+      loadingSlip: { select: { plantEmail: true } },
+    },
+  });
+  const envPlantEmail = process.env.PLANT_EMAIL || '';
+  const plantEmail = lsiRow?.loadingSlip?.plantEmail || envPlantEmail;
   if (!plantEmail) {
-    console.error('[Email] PLANT_EMAIL environment variable not configured');
-    throw new Error('PLANT_EMAIL environment variable not configured');
+    console.error('[Email] No plantEmail on LoadingSlip and PLANT_EMAIL env not configured');
+    throw new Error('plantEmail unresolved (no LoadingSlip.plantEmail and PLANT_EMAIL env unset)');
   }
 
   console.log(`[Email] Preparing to send LS ${lsNumber} for SO ${soNumber} to ${plantEmail}`);
@@ -68,19 +79,11 @@ export async function sendLSEmail(
 
     console.log(`[Email] Successfully sent LS ${lsNumber} for SO ${soNumber} - messageId: ${messageId}, threadId: ${threadId}`);
 
-    // Resolve the LoadingSlip this LSI belongs to so the Email row can
-    // link directly to the LS. Per-LS replies on plant_ls then route by
-    // `loadingSlipId` rather than guessing via LSI.
-    const lsi = await prisma.loadingSlipItem.findUnique({
-      where: { id: loadingSlipItemId },
-      select: { loadingSlipId: true },
-    });
-
     // Create Email record in database
     await prisma.email.create({
       data: {
         salesOrderId,
-        loadingSlipId: lsi?.loadingSlipId ?? null,
+        loadingSlipId: lsiRow?.loadingSlipId ?? null,
         loadingSlipItemId,
         gmailMessageId: messageId,
         gmailThreadId: threadId,
