@@ -134,6 +134,11 @@ const GMAIL_STUBS: Record<string, any> = {
     RECORDED_EMAILS.push({ fn: 'getMessageRfc822Id', args: [messageId], ts: Date.now() });
     return `<rfc822-${messageId}@mock>`;
   },
+  // Mark-read stub — no-op for tests; the dashboard fires this against the
+  // real Gmail API in prod, which we can't reach from the test harness.
+  markMessagesAsRead: async (messageIds: string[]) => {
+    RECORDED_EMAILS.push({ fn: 'markMessagesAsRead', args: [messageIds], ts: Date.now() });
+  },
   // Inbox-backed read APIs — drive the NEW ORDER cron path.
   listMessages: async (query: string, maxResults: number = 20) => {
     RECORDED_EMAILS.push({ fn: 'listMessages', args: [query, maxResults], ts: Date.now() });
