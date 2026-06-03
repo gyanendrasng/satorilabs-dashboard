@@ -50,6 +50,7 @@ export async function POST(request: Request) {
   const file = formData.get('file');
   const soNumberField = (formData.get('so_number') as string | null) ?? null;
   const workIdField = (formData.get('work_id') as string | null) ?? null;
+  const lsNumberField = (formData.get('ls_number') as string | null) ?? null;
 
   // Log every form field so we can see what auto_gui2 actually sent.
   for (const [k, v] of formData.entries()) {
@@ -69,15 +70,27 @@ export async function POST(request: Request) {
     );
   }
 
-  // Extract LS number from filename. SAP can zero-pad to 10 digits
-  // (e.g. "0000373283.PDF") — strip leading zeros to match LoadingSlip.lsNumber.
+  // Resolve LS number. Prefer the `ls_number` form field (authoritative —
+  // sent verbatim from the original triggerZload2 meta), and fall back to
+  // the filename only if the form field is missing.
+  //
+  // Filename fallback strips SAP's zero-padding (e.g. "0000373283.PDF"
+  // → "373283"). Filenames like "slip.pdf" (test-mode fixtures) used to
+  // resolve to lsNumber="slip" silently, and the LoadingSlip lookup would
+  // then miss every time. Form field first prevents that.
   const rawName = (file as { name?: string }).name ?? '';
   const stem = rawName.replace(/\.[^.]+$/, '').trim();
-  const lsNumber = stem.replace(/^0+/, '');
+  const lsNumberFromFilename = stem.replace(/^0+/, '');
+  const lsNumber = (lsNumberField && lsNumberField.trim().replace(/^0+/, '')) || lsNumberFromFilename;
   if (!lsNumber) {
     return NextResponse.json(
-      { error: `Could not extract LS number from filename "${rawName}"` },
+      { error: `Could not resolve LS number — ls_number form field empty and filename "${rawName}" has no number` },
       { status: 400 }
+    );
+  }
+  if (lsNumberField && lsNumberFromFilename && lsNumberField !== lsNumberFromFilename) {
+    console.warn(
+      `[ZLOAD2 Data] ls_number form field "${lsNumberField}" disagrees with filename-derived "${lsNumberFromFilename}". Trusting form field.`
     );
   }
 
