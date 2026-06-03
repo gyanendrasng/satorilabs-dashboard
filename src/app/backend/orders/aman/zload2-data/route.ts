@@ -1,6 +1,20 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
+import { parseLoadingSlipPdf, type ParsedLoadingSlip } from '@/lib/ls-pdf-parser';
+import {
+  sendEmail,
+  sendReplyEmailWithAttachment,
+  getMessageRfc822Id,
+} from '@/lib/gmail';
+import { resolvePlantEmailForLoadingSlip } from '@/lib/plant-resolver';
+
+/**
+ * Confidence threshold below which we stop trusting the PDF parser. Mirrors
+ * /zload1-data — if parse confidence falls below this we keep the existing
+ * LSI rows unchanged rather than overwrite them with garbage.
+ */
+const MIN_PARSER_CONFIDENCE = 0.85;
 
 /**
  * POST /backend/orders/aman/zload2-data
@@ -9,24 +23,17 @@ import { uploadToS3 } from '@/lib/s3';
  * an existing loading slip in SAP. Mirrors the ZLOAD2 send_data callback
  * contract documented in BACKEND_ENDPOINTS.md §3.2.
  *
- * Why this is its own endpoint (not /zload1-data):
- *   - ZLOAD1 creates a brand-new LS → must create LoadingSlip + LSI rows.
- *   - ZLOAD2 modifies an existing LS → LoadingSlip already exists; the LSI
- *     rows were already updated by the scenario engine before ZLOAD2 fired.
- *     The PDF returned here is the authoritative SAP confirmation; we just
- *     swap in the new fileUrl.
- *
- * Expected payload: multipart/form-data
- *   file          : the regenerated LS PDF
- *                   filename = "<lsNumber>.PDF" (SAP may zero-pad to 10 digits,
- *                   e.g. "0000373283.PDF")
- *   so_number     : (form field, optional) — pass-through from meta
- *   work_id       : (form field, optional) — pass-through from meta
- *   ...           : any other meta fields are accepted and logged but ignored
+ * Three responsibilities:
+ *   1. Persist the regenerated PDF to R2; update LoadingSlip.fileUrl.
+ *   2. Re-parse the PDF and reconcile LSI rows so the DB matches what SAP
+ *      actually saved (line counts/quantities/batches may have shifted).
+ *   3. Forward the updated PDF to the LS's plant — in-thread on the original
+ *      plant_ls email so the plant sees the modification as a follow-up on
+ *      the same chain.
  *
  * Completion of the SAP run itself is reported separately on /step-status —
- * the work_id transitions to `done` there. This endpoint is purely the
- * artifact upload; returning 2xx is enough.
+ * the work_id transitions to `done` there. This route is only the artifact
+ * upload + downstream propagation.
  */
 export async function POST(request: Request) {
   let formData: FormData;
@@ -47,7 +54,9 @@ export async function POST(request: Request) {
   // Log every form field so we can see what auto_gui2 actually sent.
   for (const [k, v] of formData.entries()) {
     if (v instanceof Blob) {
-      console.log(`[ZLOAD2 Data] field "${k}": Blob size=${v.size} type=${v.type} name=${(v as { name?: string }).name ?? '(none)'}`);
+      console.log(
+        `[ZLOAD2 Data] field "${k}": Blob size=${v.size} type=${v.type} name=${(v as { name?: string }).name ?? '(none)'}`
+      );
     } else {
       console.log(`[ZLOAD2 Data] field "${k}":`, String(v).slice(0, 200));
     }
@@ -74,12 +83,20 @@ export async function POST(request: Request) {
 
   const loadingSlip = await prisma.loadingSlip.findUnique({
     where: { lsNumber },
-    select: { id: true, lsNumber: true, salesOrderId: true, fileUrl: true },
+    select: {
+      id: true,
+      lsNumber: true,
+      salesOrderId: true,
+      bundleId: true,
+      fileUrl: true,
+      plantEmail: true,
+    },
   });
   if (!loadingSlip) {
-    // Don't fail loudly — the SAP run succeeded; not having a row to update
-    // is a data-consistency issue we want to see but not crash on. Auto-gui2
-    // treats anything 2xx as success.
+    // ZLOAD2 was fired against an LS we don't have a row for — this would
+    // mean a planner emitted zload2 for a slip that never came through
+    // /zload1-data. Surface it but don't fail the upload; auto_gui2 treats
+    // anything 2xx as success.
     console.warn(
       `[ZLOAD2 Data] No LoadingSlip row for lsNumber=${lsNumber} (filename "${rawName}", so=${soNumberField ?? 'n/a'}, work_id=${workIdField ?? 'n/a'}) — PDF will not be persisted`
     );
@@ -89,25 +106,18 @@ export async function POST(request: Request) {
     );
   }
 
-  // Resolve SO number for the R2 key. Prefer the form field (saves a query);
-  // fall back to the LoadingSlip → SalesOrder relation.
-  let soNumber = soNumberField;
-  if (!soNumber) {
-    const so = await prisma.salesOrder.findUnique({
-      where: { id: loadingSlip.salesOrderId },
-      select: { soNumber: true },
-    });
-    soNumber = so?.soNumber ?? 'unknown';
-  }
+  // ── 1. Upload PDF to R2 (overwrites the older ZLOAD1 PDF at the same key) ──
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: loadingSlip.salesOrderId },
+    select: { soNumber: true, id: true },
+  });
+  const soNumber = soNumberField ?? so?.soNumber ?? 'unknown';
 
-  // Upload to R2. Key matches the ZLOAD1 layout (ls-pdfs/<soNumber>/<lsNumber>.PDF)
-  // so subsequent readers (plant_ls sender, parsers) see one canonical PDF
-  // per LS regardless of whether it came from ZLOAD1 or a later ZLOAD2.
+  const fileBuffer = Buffer.from(await file.arrayBuffer());
   const s3Key = `ls-pdfs/${soNumber}/${lsNumber}.PDF`;
   try {
-    const buf = Buffer.from(await file.arrayBuffer());
-    await uploadToS3(s3Key, buf, 'application/pdf');
-    console.log(`[ZLOAD2 Data] Uploaded regenerated LS PDF to R2: ${s3Key} (${buf.length} bytes)`);
+    await uploadToS3(s3Key, fileBuffer, 'application/pdf');
+    console.log(`[ZLOAD2 Data] Uploaded regenerated LS PDF to R2: ${s3Key} (${fileBuffer.length} bytes)`);
   } catch (err) {
     console.error('[ZLOAD2 Data] R2 upload failed:', err);
     return NextResponse.json(
@@ -115,14 +125,245 @@ export async function POST(request: Request) {
       { status: 500 }
     );
   }
-
   await prisma.loadingSlip.update({
     where: { id: loadingSlip.id },
     data: { fileUrl: s3Key },
   });
 
-  // The corresponding ZLOAD2 step_completed audit event is emitted by
-  // /step-status when auto_gui2 acks the work_id. We don't double-emit here.
+  // ── 2. Re-parse and reconcile LSIs ──
+  // Same flow as /zload1-data: parse the PDF, look up the real SAP material
+  // codes via the SO's Material table (by description+batch), then upsert
+  // LSI rows. Quantities and batches reflect what SAP saved AFTER ZLOAD2.
+  // Stale lines (present before, gone in the regenerated PDF) get deleted.
+  let parsed: ParsedLoadingSlip | null = null;
+  try {
+    parsed = await parseLoadingSlipPdf(fileBuffer);
+    if (parsed.confidence < 1) {
+      console.warn(
+        `[ZLOAD2 Data] PDF parse confidence ${parsed.confidence.toFixed(2)} for LS ${lsNumber}` +
+          (parsed.warnings.length ? ` — ${parsed.warnings.join('; ')}` : '')
+      );
+    }
+  } catch (parseErr) {
+    console.warn(
+      `[ZLOAD2 Data] PDF parse failed for LS ${lsNumber}: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}. ` +
+        `Keeping pre-ZLOAD2 LSI rows.`
+    );
+  }
+
+  const useParsed =
+    parsed !== null &&
+    parsed.confidence >= MIN_PARSER_CONFIDENCE &&
+    parsed.items.length > 0;
+
+  if (useParsed && parsed) {
+    // Resolve real SAP codes from the SO's Material table by (description, batch).
+    const normaliseDesc = (s: string): string => s.toUpperCase().replace(/\s+/g, ' ').trim();
+    const soMaterials = await prisma.material.findMany({
+      where: { salesOrderId: loadingSlip.salesOrderId },
+      select: { material: true, materialDescription: true, batch: true },
+    });
+    const codeByDescBatch = new Map<string, string>();
+    for (const m of soMaterials) {
+      if (!m.materialDescription) continue;
+      const key = `${normaliseDesc(m.materialDescription)}|${m.batch}`;
+      if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
+    }
+
+    // Build the set of (material, batch) the regenerated PDF reports.
+    const keptKeys = new Set<string>();
+    for (const item of parsed.items) {
+      const lookupKey = `${normaliseDesc(item.description)}|${item.batch}`;
+      const realMaterialCode = codeByDescBatch.get(lookupKey);
+      const materialForLsi = realMaterialCode ?? item.material;
+      if (!realMaterialCode) {
+        console.warn(
+          `[ZLOAD2 Data] No Material row matched PDF row on LS ${lsNumber}: ` +
+            `description="${item.description}", batch="${item.batch}". ` +
+            `Falling back to family prefix "${item.material}".`
+        );
+      }
+
+      await prisma.loadingSlipItem.upsert({
+        where: {
+          loadingSlipId_material_batch: {
+            loadingSlipId: loadingSlip.id,
+            material: materialForLsi,
+            batch: item.batch,
+          },
+        },
+        create: {
+          salesOrderId: loadingSlip.salesOrderId,
+          loadingSlipId: loadingSlip.id,
+          lsNumber,
+          material: materialForLsi,
+          batch: item.batch,
+          materialDescription: item.description,
+          orderQuantity: item.qtyLoaded,
+          status: 'pending',
+        },
+        update: {
+          materialDescription: item.description,
+          ...(item.qtyLoaded !== undefined ? { orderQuantity: item.qtyLoaded } : {}),
+        },
+      });
+      keptKeys.add(`${materialForLsi}|${item.batch}`);
+    }
+
+    // Remove LSI rows that were on this LS before ZLOAD2 but are gone now.
+    // This is how ZLOAD_Delete-style removals are reflected when SAP returns
+    // the regenerated PDF without those lines.
+    const existingLsis = await prisma.loadingSlipItem.findMany({
+      where: { loadingSlipId: loadingSlip.id },
+      select: { id: true, material: true, batch: true },
+    });
+    const stale = existingLsis.filter((r) => !keptKeys.has(`${r.material}|${r.batch}`));
+    if (stale.length > 0) {
+      await prisma.loadingSlipItem.deleteMany({
+        where: { id: { in: stale.map((r) => r.id) } },
+      });
+      console.log(
+        `[ZLOAD2 Data] Removed ${stale.length} stale LSI row(s) from LS ${lsNumber}: ` +
+          stale.map((r) => `${r.material}/${r.batch}`).join(', ')
+      );
+    }
+
+    console.log(
+      `[ZLOAD2 Data] Reconciled LS ${lsNumber}: ${parsed.items.length} item(s) — ` +
+        parsed.items.map((it) => `${it.material}/${it.batch}×${it.qtyLoaded}`).join(', ')
+    );
+
+    // Re-resolve plantEmail in case ZLOAD2 introduced a material from a
+    // different plant (would violate the "one LS, one plant" invariant —
+    // the resolver logs loudly and falls back to env if so).
+    try {
+      const lsiMaterials = (
+        await prisma.loadingSlipItem.findMany({
+          where: { loadingSlipId: loadingSlip.id },
+          select: { material: true },
+        })
+      ).map((r) => r.material);
+      const resolvedPlantEmail = await resolvePlantEmailForLoadingSlip(lsiMaterials, lsNumber);
+      if (resolvedPlantEmail && resolvedPlantEmail !== loadingSlip.plantEmail) {
+        await prisma.loadingSlip.update({
+          where: { id: loadingSlip.id },
+          data: { plantEmail: resolvedPlantEmail },
+        });
+        console.log(
+          `[ZLOAD2 Data] LS ${lsNumber} plantEmail updated → ${resolvedPlantEmail} (was ${loadingSlip.plantEmail})`
+        );
+      }
+    } catch (resolveErr) {
+      console.warn(
+        `[ZLOAD2 Data] Plant email re-resolve failed for LS ${lsNumber}: ${resolveErr instanceof Error ? resolveErr.message : String(resolveErr)}`
+      );
+    }
+  }
+
+  // ── 3. Forward updated PDF to the plant ──
+  // Reply in-thread on the most recent plant_ls email for this LS. Falls
+  // back to a brand-new thread if no prior plant_ls exists (shouldn't
+  // happen — ZLOAD2 only fires after ZLOAD1 which led to a plant_ls send).
+  try {
+    const currentLs = await prisma.loadingSlip.findUnique({
+      where: { id: loadingSlip.id },
+      select: { plantEmail: true, salesOrderId: true },
+    });
+    const plantRecipient = currentLs?.plantEmail || process.env.PLANT_EMAIL || '';
+    if (!plantRecipient) {
+      console.warn(`[ZLOAD2 Data] No plant recipient available for LS ${lsNumber} — skipping plant notification`);
+    } else {
+      const subject = `Updated Loading Slip ${lsNumber} - SO ${soNumber}`;
+      const body = [
+        `The Loading Slip ${lsNumber} for Sales Order ${soNumber} has been updated.`,
+        ``,
+        `Please find the revised slip attached.`,
+      ].join('\n');
+      const attachment = {
+        filename: `${lsNumber}.PDF`,
+        content: fileBuffer,
+        mimeType: 'application/pdf',
+      };
+
+      // Find the most recent plant_ls email for this LS to anchor the reply.
+      const priorPlantLs = await prisma.email.findFirst({
+        where: {
+          loadingSlipId: loadingSlip.id,
+          emailType: 'plant_ls',
+        },
+        orderBy: { sentAt: 'desc' },
+        select: { id: true, gmailThreadId: true, gmailMessageId: true },
+      });
+
+      let sent: { messageId: string; threadId: string };
+      if (priorPlantLs?.gmailThreadId && priorPlantLs.gmailMessageId) {
+        try {
+          const rfc822Id = await getMessageRfc822Id(priorPlantLs.gmailMessageId);
+          if (rfc822Id) {
+            sent = await sendReplyEmailWithAttachment(
+              plantRecipient,
+              subject,
+              body,
+              priorPlantLs.gmailThreadId,
+              rfc822Id,
+              attachment
+            );
+            console.log(`[ZLOAD2 Data] Sent updated LS ${lsNumber} to ${plantRecipient} (in-thread reply on email ${priorPlantLs.id})`);
+          } else {
+            sent = await sendEmail(plantRecipient, subject, body, attachment);
+            console.log(`[ZLOAD2 Data] Sent updated LS ${lsNumber} to ${plantRecipient} (new thread — no rfc822Id for anchor)`);
+          }
+        } catch (replyErr) {
+          console.warn(
+            `[ZLOAD2 Data] in-thread send failed (${replyErr instanceof Error ? replyErr.message : replyErr}); falling back to new thread`
+          );
+          sent = await sendEmail(plantRecipient, subject, body, attachment);
+        }
+      } else {
+        sent = await sendEmail(plantRecipient, subject, body, attachment);
+        console.log(`[ZLOAD2 Data] Sent updated LS ${lsNumber} to ${plantRecipient} (new thread — no prior plant_ls found)`);
+      }
+
+      await prisma.email.create({
+        data: {
+          salesOrderId: loadingSlip.salesOrderId,
+          loadingSlipId: loadingSlip.id,
+          gmailMessageId: sent.messageId,
+          gmailThreadId: sent.threadId,
+          recipientEmail: plantRecipient,
+          subject,
+          status: 'sent',
+          emailType: 'plant_ls',
+          sentBody: body,
+        },
+      });
+
+      try {
+        const { emitEvent } = await import('@/lib/scenario-events');
+        await emitEvent({
+          salesOrderId: loadingSlip.salesOrderId,
+          type: 'email_sent',
+          payload: {
+            emailType: 'plant_ls',
+            recipient: plantRecipient,
+            subject,
+            ls_number: lsNumber,
+            gmailMessageId: sent.messageId,
+            updated_after: 'zload2',
+          },
+        });
+      } catch {
+        // Audit emission must never break the primary flow.
+      }
+    }
+  } catch (sendErr) {
+    console.error(
+      `[ZLOAD2 Data] Failed to forward updated LS ${lsNumber} to plant:`,
+      sendErr instanceof Error ? sendErr.message : sendErr
+    );
+    // Don't fail the upload — we still acked the SAP artifact. The operator
+    // can resend manually if needed.
+  }
 
   return NextResponse.json({
     received: true,
