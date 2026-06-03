@@ -1,5 +1,5 @@
 import { prisma } from './prisma';
-import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject } from './gmail';
+import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject, markMessagesAsRead } from './gmail';
 import {
   checkAndSendBatchToAman,
   handleBranchReply,
@@ -126,6 +126,12 @@ export async function checkForReplies(): Promise<{
         where: { id: email.id },
         data: { replyHtml: replyBodyHtml, repliedAt: new Date() },
       });
+
+      // Clear UNREAD on the branch/plant reply so the same message doesn't
+      // keep matching `is:unread` on subsequent cron ticks. Done right after
+      // we persist replyHtml — if a downstream router throws below, we still
+      // have the reply captured in our DB and don't want to reprocess it.
+      await markMessagesAsRead([latestReply.id]);
 
       // Route based on emailType
       const emailType = (email as any).emailType as string | null;
@@ -502,9 +508,11 @@ export async function checkForNewEmails(): Promise<{
     const processedThreadIds = new Set(processedEmails.map((e) => e.gmailThreadId));
 
     for (const msg of messages) {
-      // Skip if already processed
+      // Skip if already processed. Mark-read anyway so the same message
+      // doesn't keep matching `is:unread` and pollute every cron tick.
       if (processedMessageIds.has(msg.id) || processedThreadIds.has(msg.threadId)) {
         log(`[NewEmail] Skipping message ${msg.id} — already processed (thread: ${msg.threadId})`);
+        await markMessagesAsRead([msg.id]);
         continue;
       }
 
@@ -788,6 +796,7 @@ export async function checkForNewEmails(): Promise<{
         if (vehicleTonnage === null) {
           log(`[NewEmail] PO ${poNumber}: tonnage missing — ZSO-VISIBILITY deferred until branch replies on tonnage_inquiry`);
           triggered++;
+          await markMessagesAsRead([msg.id]);
           continue;
         }
 
@@ -802,6 +811,7 @@ export async function checkForNewEmails(): Promise<{
         if (queuedSOs.length === 0) {
           log(`[NewEmail] No queued SOs for PO ${poNumber} (already in progress?), skipping`);
           triggered++;
+          await markMessagesAsRead([msg.id]);
           continue;
         }
 
@@ -820,6 +830,11 @@ export async function checkForNewEmails(): Promise<{
         log(`[NewEmail] PO ${poNumber}: enqueued ZSO-VISIBILITY for ${queuedSOs.length} SO(s)`);
 
         triggered++;
+        // Clear UNREAD so the same NEW ORDER doesn't keep matching is:unread.
+        // The ProcessedEmail row created at the top of this iteration is the
+        // DB-side dedup; mark-read is the Gmail-side dedup. Best-effort —
+        // markMessagesAsRead swallows errors internally.
+        await markMessagesAsRead([msg.id]);
       } catch (error) {
         const cause = error instanceof Error && (error as any).cause ? ` cause: ${String((error as any).cause)}` : '';
         const errorMsg = `Error processing message ${msg.id}: ${

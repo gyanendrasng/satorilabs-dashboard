@@ -386,6 +386,32 @@ export async function getMessageBody(messageId: string): Promise<string> {
 }
 
 /**
+ * Remove the UNREAD label from one or more Gmail messages so they don't keep
+ * matching `is:unread` queries on subsequent cron ticks.
+ *
+ * Use `messages.batchModify` so multiple ids cost one API call. Failures
+ * never throw — marking-read is best-effort; the worst case is a
+ * harmlessly-retriggered processing attempt (which the ProcessedEmail
+ * dedup table catches on the DB side).
+ */
+export async function markMessagesAsRead(messageIds: string[]): Promise<void> {
+  if (messageIds.length === 0) return;
+  try {
+    await gmail.users.messages.batchModify({
+      userId: 'me',
+      requestBody: {
+        ids: messageIds,
+        removeLabelIds: ['UNREAD'],
+      },
+    });
+  } catch (err) {
+    console.warn(
+      `[Gmail] markMessagesAsRead failed for ${messageIds.length} message(s): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+/**
  * List recent messages matching a query (e.g. newer_than:1d, from:branch@example.com)
  */
 export async function listMessages(
