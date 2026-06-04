@@ -117,6 +117,16 @@ model PurchaseOrder {
   // we email the branch to ask and stay NULL until they reply. The bundler
   // requires this to compute bundles — when NULL, bundling is blocked.
   weightage    Decimal?
+  // Per-PO stakeholder thread anchors. All outbound emails to BRANCH for this
+  // PO reply into branchThreadId (set from the NEW ORDER thread on intake);
+  // all outbound emails to PLANT reply into plantThreadId (captured the first
+  // time we send to PLANT_EMAIL for this PO). The *AnchorMsgId is the RFC822
+  // Message-ID of the first outbound on that thread, used as In-Reply-To
+  // so Gmail keeps replies stitched.
+  branchThreadId    String?
+  branchAnchorMsgId String?
+  plantThreadId     String?
+  plantAnchorMsgId  String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

@@ -19,6 +19,7 @@ const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
+const PLANT_EMAIL = process.env.PLANT_EMAIL || '';
 
 /**
  * Check for email replies and process them
@@ -158,7 +159,12 @@ export async function checkForReplies(): Promise<{
       const plannerDisabled = (process.env.LLM_PLANNER_DISABLED ?? 'false').toLowerCase() === 'true';
       if (!plannerDisabled && email.salesOrderId) {
         log(`[EmailChecker] Planner → handleReplyV2 for emailType=${emailType ?? 'null'} SO ${soNumber}`);
-        const sender: 'branch' | 'plant' = emailType === 'plant_ls' ? 'plant' : 'branch';
+        // Sender = whoever the outbound was addressed to. Replaces the old
+        // emailType-based rule (`emailType === 'plant_ls' ? 'plant' : 'branch'`)
+        // so newly plant-bound emails (e.g. 2nd_release after this refactor)
+        // are correctly classified without needing per-type branching.
+        const sender: 'branch' | 'plant' =
+          PLANT_EMAIL && email.recipientEmail === PLANT_EMAIL ? 'plant' : 'branch';
         const { handleReplyV2 } = await import('./scenario-engine');
         const originalEmailHtml = await getMessageBody(email.gmailMessageId);
         const r = await handleReplyV2({
@@ -609,6 +615,9 @@ export async function checkForNewEmails(): Promise<{
             // overwrite a previously-stored value with null (a later cron
             // pass shouldn't undo a successful first extraction).
             ...(vehicleTonnage !== null ? { weightage: vehicleTonnage } : {}),
+            // Backfill the canonical branch thread on this PO from the
+            // NEW ORDER message if we haven't claimed one yet.
+            branchThreadId: msg.threadId,
           },
           create: {
             poNumber,
@@ -617,6 +626,11 @@ export async function checkForNewEmails(): Promise<{
             status: 'in-progress',
             stage: 1,
             weightage: vehicleTonnage,
+            // The branch thread for this PO is the NEW ORDER thread. The
+            // anchor RFC822 id is resolved lazily on the first outbound
+            // (see resolvePoThreadAnchor) — Gmail message-id lookups are
+            // cheap but not free, and many POs never send into the thread.
+            branchThreadId: msg.threadId,
           },
         });
 
@@ -723,6 +737,12 @@ export async function checkForNewEmails(): Promise<{
                 ? await sendPlainEmail(BRANCH_EMAIL, tonnageSubject, tonnageBody)
                 : null;
             if (sent) {
+              // Stamp the canonical branch anchor for this PO so downstream
+              // outbounds don't have to re-fetch the RFC822 id.
+              if (rfc822Id) {
+                const { capturePoThreadAnchor } = await import('./po-thread');
+                await capturePoThreadAnchor(purchaseOrder.id, 'branch', msg.threadId, rfc822Id);
+              }
               // ─── PROJECT CONVENTION: PO-scoped emails anchor to lead SO ───
               // tonnage_inquiry is logically a PO-level email — the truck
               // tonnage is stored on PurchaseOrder.weightage and applies to

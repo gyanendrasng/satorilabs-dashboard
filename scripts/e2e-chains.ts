@@ -786,20 +786,12 @@ async function executeAction(
         items,
         totalWeightKg: totalKg,
       };
-      const trigger = await prisma.email.findUnique({
-        where: { id: state.triggerEmailId },
-        select: { gmailThreadId: true, gmailMessageId: true },
-      });
       await env.sendDispatchConfirmationEmail({
         purchaseOrderId: poId,
         plans: [plan],
         twoVehicles: false,
         totalTonnes: totalKg / 1000,
         capacityTonnes: 45,
-        threadAnchor: {
-          gmailThreadId: trigger?.gmailThreadId ?? '',
-          gmailMessageId: trigger?.gmailMessageId ?? '',
-        },
         log: (m: string) => notes.push(m),
       });
       notes.push(`dispatch_confirmation sent (${items.length} item(s), ${(totalKg / 1000).toFixed(2)}t)`);

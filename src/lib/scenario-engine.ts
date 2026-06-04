@@ -140,6 +140,7 @@ import {
 } from './auto-gui-trigger';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
+const PLANT_EMAIL = process.env.PLANT_EMAIL || '';
 
 export function isScenarioEngineEnabled(): boolean {
   return (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true';
@@ -192,13 +193,12 @@ export function isSegmentedExecutionEnabled(): boolean {
 export async function sendSecondReleaseEmail(args: {
   salesOrderId: string;
   modifications: BranchReplyIntent['materials'];
-  threadAnchor: { gmailThreadId: string | null; gmailMessageId: string | null } | null;
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
-  const { salesOrderId, modifications, threadAnchor, log } = args;
+  const { salesOrderId, modifications, log } = args;
 
-  if (!BRANCH_EMAIL) {
-    log('[2ndRelease] BRANCH_EMAIL not configured — skipping');
+  if (!PLANT_EMAIL) {
+    log('[2ndRelease] PLANT_EMAIL not configured — skipping');
     return null;
   }
 
@@ -305,21 +305,32 @@ export async function sendSecondReleaseEmail(args: {
 
   const subject = `2nd Release Confirmation - SO ${so.soNumber}`;
 
+  // Anchor on the per-PO plant thread. First-ever plant outbound for this PO
+  // opens a fresh thread; the resulting thread+message-id are captured below
+  // so every subsequent plant email lands in the same conversation.
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const anchor = so.purchaseOrderId
+    ? await resolvePoThreadAnchor(so.purchaseOrderId, 'plant')
+    : null;
+
   let sent: { messageId: string; threadId: string };
   try {
-    if (threadAnchor?.gmailThreadId && threadAnchor.gmailMessageId) {
-      const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
-      if (rfc822Id) {
-        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
-      } else {
-        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
-      }
+    if (anchor) {
+      sent = await sendReplyEmail(PLANT_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      sent = await sendPlainEmail(PLANT_EMAIL, subject, body);
     }
   } catch (err) {
     log(`[2ndRelease] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
-    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    sent = await sendPlainEmail(PLANT_EMAIL, subject, body);
+  }
+
+  // Capture the plant anchor on first send (no-op if already set).
+  if (so.purchaseOrderId && !anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) {
+      await capturePoThreadAnchor(so.purchaseOrderId, 'plant', sent.threadId, rfc822);
+    }
   }
 
   // Open a new dispatch round on the PO. This is the single moment that bumps
@@ -343,7 +354,7 @@ export async function sendSecondReleaseEmail(args: {
       purchaseOrderId: so.purchaseOrderId,
       gmailMessageId: sent.messageId,
       gmailThreadId: sent.threadId,
-      recipientEmail: BRANCH_EMAIL,
+      recipientEmail: PLANT_EMAIL,
       subject,
       status: 'sent',
       emailType: '2nd_release',
@@ -362,7 +373,7 @@ export async function sendSecondReleaseEmail(args: {
       type: 'email_sent',
       payload: {
         emailType: '2nd_release',
-        recipient: BRANCH_EMAIL,
+        recipient: PLANT_EMAIL,
         subject,
         body_excerpt: body.slice(0, 200),
         gmailMessageId: sent.messageId,
@@ -389,10 +400,9 @@ export async function sendSecondReleaseEmail(args: {
  */
 export async function sendOrderStatusEmail(args: {
   salesOrderId: string;
-  threadAnchor: { gmailThreadId: string | null; gmailMessageId: string | null } | null;
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
-  const { salesOrderId, threadAnchor, log } = args;
+  const { salesOrderId, log } = args;
 
   if (!BRANCH_EMAIL) {
     log('[OrderStatus] BRANCH_EMAIL not configured — skipping');
@@ -424,21 +434,24 @@ export async function sendOrderStatusEmail(args: {
 
   const subject = `Order status — SO ${so.soNumber}`;
 
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const anchor = so.purchaseOrderId
+    ? await resolvePoThreadAnchor(so.purchaseOrderId, 'branch')
+    : null;
   let sent: { messageId: string; threadId: string };
   try {
-    if (threadAnchor?.gmailThreadId && threadAnchor.gmailMessageId) {
-      const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
-      if (rfc822Id) {
-        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
-      } else {
-        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
-      }
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
     } else {
       sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
     }
   } catch (err) {
     log(`[OrderStatus] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+  if (so.purchaseOrderId && !anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(so.purchaseOrderId, 'branch', sent.threadId, rfc822);
   }
 
   await prisma.email.create({
@@ -493,10 +506,9 @@ export async function sendOrderStatusEmail(args: {
 export async function sendPlantChangeNotificationEmail(args: {
   salesOrderId: string;
   modifications: BranchReplyIntent['materials'];
-  threadAnchor: { gmailThreadId: string | null; gmailMessageId: string | null } | null;
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
-  const { salesOrderId, modifications, threadAnchor, log } = args;
+  const { salesOrderId, modifications, log } = args;
 
   if (!BRANCH_EMAIL) {
     log('[PlantChangeNotify] BRANCH_EMAIL not configured — skipping');
@@ -535,21 +547,24 @@ export async function sendPlantChangeNotificationEmail(args: {
 
   const subject = `Plant-proposed change — SO ${so.soNumber}`;
 
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const anchor = so.purchaseOrderId
+    ? await resolvePoThreadAnchor(so.purchaseOrderId, 'branch')
+    : null;
   let sent: { messageId: string; threadId: string };
   try {
-    if (threadAnchor?.gmailThreadId && threadAnchor.gmailMessageId) {
-      const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
-      if (rfc822Id) {
-        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
-      } else {
-        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
-      }
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
     } else {
       sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
     }
   } catch (err) {
     log(`[PlantChangeNotify] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+  if (so.purchaseOrderId && !anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(so.purchaseOrderId, 'branch', sent.threadId, rfc822);
   }
 
   await prisma.email.create({
@@ -607,12 +622,10 @@ async function sendPlannerQuestionEmail(args: {
   triggerEmailId: string;
   question: string;
   options?: string[];
-  /** Anchor the message in the inbound's thread so the recipient sees context. */
-  threadAnchor: { gmailThreadId: string | null; gmailMessageId: string | null } | null;
   emailType: 'branch_clarify' | 'plant_clarify' | 'supervisor_question';
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
-  const { recipient, recipientRole, salesOrderId, triggerEmailId, question, options, threadAnchor, emailType, log } = args;
+  const { recipient, recipientRole, salesOrderId, triggerEmailId, question, options, emailType, log } = args;
 
   if (!recipient) {
     log(`[PlannerQ:${recipientRole}] no recipient address configured — skipping`);
@@ -648,27 +661,30 @@ async function sendPlannerQuestionEmail(args: {
       : `Clarification needed — SO ${so.soNumber}`;
   const subject = subjectPrefix;
 
-  // Supervisor mails go in a fresh thread (cleaner inbox for the supervisor);
-  // branch/plant clarifications reply in-thread to give context.
+  // Supervisor mails open a fresh thread (cleaner inbox for the supervisor);
+  // branch/plant clarifications anchor on the per-PO stakeholder thread so
+  // the question stays in the canonical conversation for that party.
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const stakeholder: 'branch' | 'plant' | null =
+    recipientRole === 'branch' ? 'branch' : recipientRole === 'plant' ? 'plant' : null;
+  const anchor =
+    stakeholder && so.purchaseOrderId
+      ? await resolvePoThreadAnchor(so.purchaseOrderId, stakeholder)
+      : null;
   let sent: { messageId: string; threadId: string };
   try {
-    if (
-      recipientRole !== 'supervisor' &&
-      threadAnchor?.gmailThreadId &&
-      threadAnchor.gmailMessageId
-    ) {
-      const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
-      if (rfc822Id) {
-        sent = await sendReplyEmail(recipient, subject, body, threadAnchor.gmailThreadId, rfc822Id);
-      } else {
-        sent = await sendPlainEmail(recipient, subject, body);
-      }
+    if (anchor) {
+      sent = await sendReplyEmail(recipient, subject, body, anchor.threadId, anchor.rfc822MessageId);
     } else {
       sent = await sendPlainEmail(recipient, subject, body);
     }
   } catch (err) {
     log(`[PlannerQ:${recipientRole}] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
     sent = await sendPlainEmail(recipient, subject, body);
+  }
+  if (stakeholder && so.purchaseOrderId && !anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(so.purchaseOrderId, stakeholder, sent.threadId, rfc822);
   }
 
   await prisma.email.create({
@@ -733,7 +749,9 @@ export async function handleSecondReleaseReply(
     emailId,
     replyHtml,
     originalEmailHtml: '',
-    sourceEmailType: 'branch',
+    // 2nd_release is plant-addressed since the email routing refactor —
+    // the reply on that thread comes from the plant.
+    sourceEmailType: 'plant',
   });
   return { success: r.success, logs: r.logs };
 }
@@ -1010,7 +1028,6 @@ async function handleAnytimeIntent(args: {
   if (scenarioKey === 'branch|anytime|status_update|-') {
     await sendOrderStatusEmail({
       salesOrderId: email.salesOrderId,
-      threadAnchor: { gmailThreadId: email.gmailThreadId, gmailMessageId: email.gmailMessageId },
       log,
     });
   } else if (scenarioKey === 'branch|anytime|other|-' || scenarioKey === 'plant|anytime|other|-') {
@@ -1300,20 +1317,33 @@ async function fireStep(
         return 'pause';
       }
 
-      // 'short' — email branch and abort. Branch's reply will re-enter the
-      // classifier and start a fresh scenario (typically modify|delete or
-      // modify|decrease) via the standard reply pipeline.
+      // 'short' — email the party that requested the increase and abort.
+      // Their reply re-enters via the standard reply pipeline.
       const triggerEmailId = (
         await prisma.scenarioProgress.findUnique({
           where: { id: progress.id },
           select: { triggerEmailId: true },
         })
       )?.triggerEmailId ?? '';
+      // Infer source from the inbound trigger: a reply that landed on a
+      // plant-bound email (recipientEmail==PLANT_EMAIL on the trigger) means
+      // the plant asked; otherwise branch.
+      let requestSource: 'branch' | 'plant' = 'branch';
+      if (triggerEmailId) {
+        const triggerEmailRow = await prisma.email.findUnique({
+          where: { id: triggerEmailId },
+          select: { recipientEmail: true },
+        });
+        if (PLANT_EMAIL && triggerEmailRow?.recipientEmail === PLANT_EMAIL) {
+          requestSource = 'plant';
+        }
+      }
       const { sendStockShortageInquiryEmail } = await import('./stock-shortage-email');
       await sendStockShortageInquiryEmail({
         salesOrderId: progress.salesOrderId,
         triggerEmailId,
         shortages: result.shortages,
+        requestSource,
         log,
       });
       await prisma.scenarioProgress.update({
@@ -1696,12 +1726,6 @@ async function fireStep(
         },
         select: { id: true },
       });
-      if (alreadySent) {
-        log(`[ENGINE] email_confirm_bundle_details — round ${currentRound} dispatch_confirmation already sent (${alreadySent.id}); segment-completing`);
-        if (isSegmentedExecutionEnabled()) return 'complete_segment';
-        await markAwaitingReply(progress.id);
-        return 'pause';
-      }
 
       // Recompute the per-material dispatch quantity from scratch on every
       // run: min(orderQuantity, availableStock). Reading a prior round's
@@ -1747,39 +1771,43 @@ async function fireStep(
       });
       const capacityTonnes = poForCap?.weightage ? Number(poForCap.weightage) : 0;
 
-      // Anchor in the scenario's trigger email so the dispatch_confirmation
-      // lands in the same Gmail thread (best-effort; falls back to a fresh
-      // thread if the trigger email is missing). The `progress` arg passed
-      // into fireStep is a subset of ScenarioProgress that doesn't include
-      // triggerEmailId — look it up directly.
-      const progressRow = await prisma.scenarioProgress.findUnique({
-        where: { id: progress.id },
-        select: { triggerEmailId: true },
-      });
-      const trigger = progressRow?.triggerEmailId
-        ? await prisma.email.findUnique({
-            where: { id: progressRow.triggerEmailId },
-            select: { gmailThreadId: true, gmailMessageId: true },
-          })
-        : null;
+      const plan = {
+        soNumber: so.soNumber,
+        salesOrderId: progress.salesOrderId,
+        items,
+        totalWeightKg: totalKg,
+      };
 
+      if (alreadySent) {
+        // A dispatch_confirmation already went out for this round — send a
+        // short diff reply on the same thread instead of duplicating the
+        // full form. dispatchRound only bumps on email_2nd_release, so a
+        // bumped round is the signal for a fresh full confirmation.
+        const { sendDispatchConfirmationUpdate } = await import('./auto-gui-trigger');
+        const result = await sendDispatchConfirmationUpdate({
+          purchaseOrderId: so.purchaseOrderId,
+          currentRound,
+          plans: [plan],
+          totalTonnes: totalKg / 1000,
+          log,
+        });
+        if (result.sent) {
+          log(`[ENGINE] email_confirm_bundle_details — round ${currentRound} diff update sent (replaced full dispatch_confirmation duplicate)`);
+        } else {
+          log(`[ENGINE] email_confirm_bundle_details — round ${currentRound} already has dispatch_confirmation ${alreadySent.id}; no diff (${result.reason ?? 'unknown'}); segment-completing`);
+        }
+        if (isSegmentedExecutionEnabled()) return 'complete_segment';
+        await markAwaitingReply(progress.id);
+        return 'pause';
+      }
+
+      // Per-PO branch thread anchoring is handled inside sendDispatchConfirmationEmail.
       await sendDispatchConfirmationEmail({
         purchaseOrderId: so.purchaseOrderId,
-        plans: [
-          {
-            soNumber: so.soNumber,
-            salesOrderId: progress.salesOrderId,
-            items,
-            totalWeightKg: totalKg,
-          },
-        ],
+        plans: [plan],
         twoVehicles: false,
         totalTonnes: totalKg / 1000,
         capacityTonnes,
-        threadAnchor: {
-          gmailThreadId: trigger?.gmailThreadId ?? '',
-          gmailMessageId: trigger?.gmailMessageId ?? '',
-        },
         log,
       });
 
@@ -2173,10 +2201,6 @@ async function fireStep(
               twoVehicles: false,
               totalTonnes,
               capacityTonnes: tonnes,
-              threadAnchor: {
-                gmailThreadId: lsDispatchReplied.gmailThreadId,
-                gmailMessageId: lsDispatchReplied.gmailMessageId,
-              },
               log,
             });
           }
@@ -2221,10 +2245,6 @@ async function fireStep(
       await sendSecondReleaseEmail({
         salesOrderId: progress.salesOrderId,
         modifications,
-        threadAnchor: {
-          gmailThreadId: trigger.gmailThreadId,
-          gmailMessageId: trigger.gmailMessageId,
-        },
         log,
       });
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
@@ -2258,10 +2278,6 @@ async function fireStep(
       await sendPlantChangeNotificationEmail({
         salesOrderId: progress.salesOrderId,
         modifications,
-        threadAnchor: {
-          gmailThreadId: trigger.gmailThreadId,
-          gmailMessageId: trigger.gmailMessageId,
-        },
         log,
       });
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
@@ -2270,19 +2286,10 @@ async function fireStep(
     }
 
     case 'email_order_status': {
-      // R9 — Seeking Order Update auto-reply. Single-step Anytime intent; the
-      // handleAnytimeIntent path normally runs first and short-circuits before
-      // executeScenario. This case exists for completeness if a step list ever
-      // includes order_status directly.
-      const triggerEmail = await prisma.email.findUnique({
-        where: { id: (await loadProgress(progress.id)).triggerEmailId ?? '' },
-        select: { gmailThreadId: true, gmailMessageId: true },
-      }).catch(() => null);
+      // R9 — Seeking Order Update auto-reply. Per-PO branch thread anchoring
+      // is handled inside sendOrderStatusEmail.
       await sendOrderStatusEmail({
         salesOrderId: progress.salesOrderId,
-        threadAnchor: triggerEmail
-          ? { gmailThreadId: triggerEmail.gmailThreadId, gmailMessageId: triggerEmail.gmailMessageId }
-          : null,
         log,
       });
       if (isSegmentedExecutionEnabled()) return 'complete_segment';
@@ -2305,10 +2312,9 @@ async function fireStep(
         return 'pause';
       }
 
-      // Anchor the outbound on whatever inbound triggered this plan, so the
-      // recipient sees the context above our question (branch/plant case).
-      // For supervisor we still pass the anchor but the sender opts to start
-      // a new thread.
+      // sendPlannerQuestionEmail anchors on the per-PO stakeholder thread
+      // internally — no external thread anchor needed. Look up the trigger
+      // only so we can pass its id for audit purposes.
       const trigger = await prisma.scenarioProgress.findUnique({
         where: { id: progress.id },
         select: { triggerEmailId: true },
@@ -2316,11 +2322,8 @@ async function fireStep(
       const triggerEmail = trigger?.triggerEmailId
         ? await prisma.email.findUnique({
             where: { id: trigger.triggerEmailId },
-            select: { id: true, gmailThreadId: true, gmailMessageId: true },
+            select: { id: true },
           })
-        : null;
-      const threadAnchor = triggerEmail
-        ? { gmailThreadId: triggerEmail.gmailThreadId, gmailMessageId: triggerEmail.gmailMessageId }
         : null;
 
       let recipient: string;
@@ -2347,7 +2350,6 @@ async function fireStep(
         triggerEmailId: triggerEmail?.id ?? '',
         question,
         options: _plannedStep?.options,
-        threadAnchor,
         emailType,
         log,
       });

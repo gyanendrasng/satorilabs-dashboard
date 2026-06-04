@@ -680,7 +680,6 @@ export async function handleVehicleSplitConfirmation(
         twoVehicles: true,
         totalTonnes,
         capacityTonnes,
-        threadAnchor: email,
         log,
       });
       await prisma.email.update({
@@ -772,7 +771,6 @@ export async function handleVehicleSplitConfirmation(
           twoVehicles: false,
           totalTonnes: newTotalTonnes,
           capacityTonnes,
-          threadAnchor: email,
           log,
         });
       } else {
@@ -1041,26 +1039,23 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     `Sales Order Dispatch Co-ordinator`,
   ].join('\n');
 
-  // Reply in the original NEW ORDER thread of any SO in this PO, when possible.
-  const allSoAnchors = po.bundles
-    .flatMap((b) => [...b.loadingSlips.map((ls) => ls.salesOrder), ...b.materials.map((m) => m.salesOrder)])
-    .filter((so) => so.originalThreadId && so.originalMessageId);
-  const anchor = allSoAnchors[0];
+  // Anchor on the per-PO branch thread.
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
   let sent: { messageId: string; threadId: string };
   try {
-    if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
-      const rfc822Id = await getMessageRfc822Id(anchor.originalMessageId);
-      if (rfc822Id) {
-        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.originalThreadId, rfc822Id);
-      } else {
-        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
-      }
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
     } else {
       sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
     }
   } catch (err) {
     log(`[VehicleDetails] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', sent.threadId, rfc822);
   }
 
   // Use lead SO for legacy `salesOrderId` linkage so reply-checker keeps logs sane.
@@ -1292,10 +1287,9 @@ export async function sendDispatchConfirmationEmail(args: {
   twoVehicles: boolean;
   totalTonnes: number;
   capacityTonnes: number;
-  threadAnchor: { gmailThreadId: string; gmailMessageId: string };
   log: (msg: string) => void;
 }): Promise<void> {
-  const { purchaseOrderId, plans, twoVehicles, totalTonnes, capacityTonnes, threadAnchor, log } = args;
+  const { purchaseOrderId, plans, twoVehicles, totalTonnes, capacityTonnes, log } = args;
 
   if (!BRANCH_EMAIL) {
     log(`[DispatchConfirm] BRANCH_EMAIL not configured`);
@@ -1357,18 +1351,24 @@ export async function sendDispatchConfirmationEmail(args: {
   });
   const subject = `Dispatch Confirmation - PO ${po.poNumber}`;
 
-  // 3) Send (reply in original NEW ORDER thread when possible).
+  // 3) Send (reply in the canonical per-PO branch thread).
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
   let sent: { messageId: string; threadId: string };
   try {
-    const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
-    if (rfc822Id) {
-      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
     } else {
       sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
     }
   } catch (err) {
     log(`[DispatchConfirm] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
     sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', sent.threadId, rfc822);
   }
 
   // 4) Track the Email row for reply detection. Stamp with the PO's current
@@ -1415,6 +1415,166 @@ export async function sendDispatchConfirmationEmail(args: {
   }
 
   log(`[DispatchConfirm] Confirmation email sent to ${BRANCH_EMAIL} for PO ${po.poNumber} (${plans.length} SO(s), ${totalTonnes.toFixed(2)} t)`);
+}
+
+/**
+ * Follow-up update to an existing dispatch_confirmation for the same round.
+ * When the round guard would have skipped a re-send but the plan has actually
+ * changed (e.g. quantity revision after the original confirmation went out),
+ * we send a short diff reply IN THE SAME thread instead of a fresh full form.
+ *
+ * Returns `{ skipped: true }` when there's no prior dispatch_confirmation for
+ * the round, when the prior has no usable plans snapshot, or when the new
+ * plan is identical to the prior (no diff to communicate).
+ */
+export async function sendDispatchConfirmationUpdate(args: {
+  purchaseOrderId: string;
+  currentRound: number;
+  plans: SoReleasePlan[];
+  totalTonnes: number;
+  log: (msg: string) => void;
+}): Promise<{ sent: boolean; skipped?: boolean; reason?: string }> {
+  const { purchaseOrderId, currentRound, plans, totalTonnes, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log(`[DispatchConfirm:update] BRANCH_EMAIL not configured`);
+    return { sent: false, skipped: true, reason: 'no_branch_email' };
+  }
+
+  const prior = await prisma.email.findFirst({
+    where: {
+      purchaseOrderId,
+      emailType: 'dispatch_confirmation',
+      status: 'sent',
+      dispatchRound: currentRound,
+    },
+    orderBy: { sentAt: 'desc' },
+    select: { id: true, gmailThreadId: true, gmailMessageId: true, relatedMaterials: true },
+  });
+  if (!prior) {
+    return { sent: false, skipped: true, reason: 'no_prior_for_round' };
+  }
+
+  // Pull the per-(soNumber, material, batch) quantity from the prior plan
+  // snapshot so we can compute the diff.
+  type PriorItem = { material_code: string; batch: string; quantity: number };
+  const priorByKey = new Map<string, number>();
+  try {
+    const parsed = prior.relatedMaterials ? JSON.parse(prior.relatedMaterials) : null;
+    const priorPlans: Array<{ soNumber: string; items: PriorItem[] }> = parsed?.plans ?? [];
+    for (const p of priorPlans) {
+      for (const it of p.items ?? []) {
+        priorByKey.set(`${p.soNumber}|${it.material_code}|${it.batch}`, it.quantity);
+      }
+    }
+  } catch {
+    log(`[DispatchConfirm:update] prior email ${prior.id} has unparseable relatedMaterials — skipping diff`);
+    return { sent: false, skipped: true, reason: 'prior_unparseable' };
+  }
+
+  type DiffRow = { soNumber: string; material: string; batch: string; was: number; now: number };
+  const diffs: DiffRow[] = [];
+  for (const plan of plans) {
+    for (const it of plan.items) {
+      const key = `${plan.soNumber}|${it.material_code}|${it.batch}`;
+      const was = priorByKey.get(key);
+      if (was === undefined) {
+        diffs.push({ soNumber: plan.soNumber, material: it.material_code, batch: it.batch, was: 0, now: it.quantity });
+        continue;
+      }
+      if (was !== it.quantity) {
+        diffs.push({ soNumber: plan.soNumber, material: it.material_code, batch: it.batch, was, now: it.quantity });
+      }
+      priorByKey.delete(key);
+    }
+  }
+  for (const [key, was] of priorByKey.entries()) {
+    const [soNumber, material, batch] = key.split('|');
+    diffs.push({ soNumber, material, batch, was, now: 0 });
+  }
+
+  if (diffs.length === 0) {
+    log(`[DispatchConfirm:update] no diff vs prior email ${prior.id} — skipping`);
+    return { sent: false, skipped: true, reason: 'no_diff' };
+  }
+
+  const lines = diffs.map(
+    (d) => `  - SO ${d.soNumber} / ${d.material} (Batch ${d.batch}): ${d.was} → ${d.now}`,
+  );
+  const body = [
+    `Hi,`,
+    ``,
+    `Update to the dispatch plan we shared earlier on this thread:`,
+    ``,
+    ...lines,
+    ``,
+    `Revised total: ${totalTonnes.toFixed(2)} t.`,
+    ``,
+    `Please confirm.`,
+    ``,
+    `Thanks.`,
+  ].join('\n');
+  const subject = `Re: Dispatch Plan Update`;
+
+  // Reply on the prior dispatch_confirmation's exact message so Gmail stitches
+  // it tightly. Fall back to the per-PO branch anchor if that lookup fails.
+  let sent: { messageId: string; threadId: string };
+  try {
+    const rfc822 = await getMessageRfc822Id(prior.gmailMessageId);
+    if (rfc822) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, prior.gmailThreadId, rfc822);
+    } else {
+      const { resolvePoThreadAnchor } = await import('./po-thread');
+      const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+      sent = anchor
+        ? await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId)
+        : await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[DispatchConfirm:update] send failed (${err instanceof Error ? err.message : err}); falling back to fresh email`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  await prisma.email.create({
+    data: {
+      purchaseOrderId,
+      salesOrderId: plans[0]?.salesOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'dispatch_confirmation_update',
+      workflowState: 'awaiting_dispatch_confirmation',
+      sentBody: body,
+      relatedMaterials: JSON.stringify({ version: 'dispatch-update-v1', plans, totalTonnes, diff: diffs }),
+      dispatchRound: currentRound,
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    for (const plan of plans) {
+      await emitEvent({
+        salesOrderId: plan.salesOrderId,
+        type: 'email_sent',
+        payload: {
+          emailType: 'dispatch_confirmation_update',
+          recipient: BRANCH_EMAIL,
+          subject,
+          body_excerpt: body.slice(0, 200),
+          gmailMessageId: sent.messageId,
+          dispatchRound: currentRound,
+          diff_count: diffs.length,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
+
+  log(`[DispatchConfirm:update] Sent diff update for PO ${purchaseOrderId} round ${currentRound} (${diffs.length} change(s)) replying to prior ${prior.id}`);
+  return { sent: true };
 }
 
 /**
@@ -1730,7 +1890,6 @@ export async function handleBranchReply(
             twoVehicles: false,
             totalTonnes,
             capacityTonnes,
-            threadAnchor: email,
             log,
           });
         }
@@ -1787,7 +1946,6 @@ export async function handleBranchReply(
           twoVehicles: false,
           totalTonnes,
           capacityTonnes,
-          threadAnchor: email,
           log,
         });
       }
@@ -2430,18 +2588,16 @@ export async function assembleAndSendCombinedEmail(
 
   log(`[CombinedEmail] Sending combined HTML email for PO ${purchaseOrder.poNumber} (${includedSOs.length} SOs${failureNote})`);
 
+  // Anchor on the per-PO branch thread.
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
   let messageId: string;
   let threadId: string;
   try {
     let sent: { messageId: string; threadId: string };
-    if (leadSO.originalThreadId && leadSO.originalMessageId) {
+    if (anchor) {
       try {
-        const rfc822Id = await getMessageRfc822Id(leadSO.originalMessageId);
-        if (rfc822Id) {
-          sent = await sendHtmlReplyEmail(BRANCH_EMAIL, subject, combinedBody, leadSO.originalThreadId, rfc822Id);
-        } else {
-          sent = await sendHtmlEmail(BRANCH_EMAIL, subject, combinedBody);
-        }
+        sent = await sendHtmlReplyEmail(BRANCH_EMAIL, subject, combinedBody, anchor.threadId, anchor.rfc822MessageId);
       } catch (replyErr) {
         log(`[CombinedEmail] Reply-in-thread failed (${replyErr instanceof Error ? replyErr.message : replyErr}); sending as new email`);
         sent = await sendHtmlEmail(BRANCH_EMAIL, subject, combinedBody);
@@ -2454,6 +2610,10 @@ export async function assembleAndSendCombinedEmail(
   } catch (sendErr) {
     log(`[CombinedEmail] Failed to send combined email for PO ${purchaseOrder.poNumber}: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
     return { success: false, logs };
+  }
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', threadId, rfc822);
   }
 
   // Create the FINAL Email row keyed to lead SO + PO. Stamp with the PO's

@@ -1,5 +1,6 @@
 import { prisma } from './prisma';
-import { sendEmail } from './gmail';
+import { sendEmail, sendReplyEmailWithAttachment, getMessageRfc822Id } from './gmail';
+import { resolvePoThreadAnchor, capturePoThreadAnchor } from './po-thread';
 
 interface VehicleDetails {
   vehicleNumber?: string | null;
@@ -28,6 +29,7 @@ export async function sendLSEmail(
     select: {
       loadingSlipId: true,
       loadingSlip: { select: { plantEmail: true } },
+      salesOrder: { select: { purchaseOrderId: true } },
     },
   });
   const envPlantEmail = process.env.PLANT_EMAIL || '';
@@ -71,11 +73,22 @@ export async function sendLSEmail(
       : 'application/pdf';
 
   try {
-    const { messageId, threadId } = await sendEmail(plantEmail, subject, body, {
-      filename,
-      content: fileBuffer,
-      mimeType,
-    });
+    // Anchor on the per-PO plant thread so every plant outbound for this PO
+    // (LS forwards, modified LS forwards, 2nd_release, etc.) stays in one
+    // conversation. First plant outbound for the PO captures the thread.
+    const poId = lsiRow?.salesOrder?.purchaseOrderId ?? null;
+    const anchor = poId ? await resolvePoThreadAnchor(poId, 'plant') : null;
+
+    const attachment = { filename, content: fileBuffer, mimeType };
+    const sent = anchor
+      ? await sendReplyEmailWithAttachment(plantEmail, subject, body, anchor.threadId, anchor.rfc822MessageId, attachment)
+      : await sendEmail(plantEmail, subject, body, attachment);
+    const { messageId, threadId } = sent;
+
+    if (poId && !anchor) {
+      const rfc822 = await getMessageRfc822Id(messageId);
+      if (rfc822) await capturePoThreadAnchor(poId, 'plant', threadId, rfc822);
+    }
 
     console.log(`[Email] Successfully sent LS ${lsNumber} for SO ${soNumber} - messageId: ${messageId}, threadId: ${threadId}`);
 
