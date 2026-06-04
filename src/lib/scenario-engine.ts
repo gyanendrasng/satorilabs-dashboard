@@ -27,6 +27,7 @@ import {
   type StepKind,
 } from './dispatch-scenarios';
 import type { PlannedStep } from './llm-planner';
+import type { MaterialModification } from './material-modification-extractor';
 
 // -----------------------------------------------------------------------------
 // Planner-mode step list: every active ScenarioProgress in the new code path
@@ -1254,6 +1255,77 @@ export async function executeScenario(args: {
 
 type FireResult = 'pause' | 'advance_now' | 'complete_segment';
 
+/**
+ * DB-state fallback for the per-material modification extractor.
+ *
+ * Used by zload2 / zloading_close when the LLM extractor returns no
+ * modifications on the trigger reply — e.g. the trigger is a bare "yes"
+ * on a round-2 dispatch_confirmation, AFTER va02 + zso_visibility have
+ * already moved the SO into its new state. In that path the canonical
+ * source of truth is the DB:
+ *
+ *   - Material.orderQuantity per material = the NEW target (written by the
+ *     most recent zso_visibility callback after va02).
+ *   - sum(LoadingSlipItem.orderQuantity) per material = what's currently
+ *     loaded onto the LSs in SAP (unchanged since the original ZLOAD1).
+ *
+ * Wherever the two disagree AND an LSI line exists, that's an unapplied
+ * modification we still need to push to SAP. Returns the same shape the
+ * LLM extractor produces so callers can swap it in transparently.
+ *
+ * Stockouts (Material.orderQuantity > 0, no LSI created because there was
+ * nothing to load) are excluded — they're not a zload2 case, they're a
+ * fresh-zload1 / never-ordered case.
+ */
+async function computeModificationsFromDbDelta(salesOrderId: string): Promise<{
+  increases: MaterialModification[];
+  decreases: MaterialModification[];
+  deletes: MaterialModification[];
+}> {
+  const [materialRows, lsiRows] = await Promise.all([
+    prisma.material.findMany({
+      where: { salesOrderId },
+      select: { material: true, orderQuantity: true },
+    }),
+    prisma.loadingSlipItem.findMany({
+      where: { salesOrderId },
+      select: { material: true, orderQuantity: true },
+    }),
+  ]);
+
+  const materialQty = new Map<string, number>();
+  for (const r of materialRows) {
+    materialQty.set(r.material, (materialQty.get(r.material) ?? 0) + (r.orderQuantity ?? 0));
+  }
+  const lsiQty = new Map<string, number>();
+  for (const r of lsiRows) {
+    lsiQty.set(r.material, (lsiQty.get(r.material) ?? 0) + (r.orderQuantity ?? 0));
+  }
+
+  const increases: MaterialModification[] = [];
+  const decreases: MaterialModification[] = [];
+  const deletes: MaterialModification[] = [];
+  const allCodes = new Set<string>([...materialQty.keys(), ...lsiQty.keys()]);
+
+  for (const code of allCodes) {
+    const matQty = materialQty.get(code) ?? 0;
+    const lsiSum = lsiQty.get(code) ?? 0;
+    // No LSI for this material → outside zload2/zloading_close territory.
+    if (lsiSum <= 0) continue;
+    const delta = matQty - lsiSum;
+    if (delta === 0) continue;
+    if (matQty <= 0) {
+      deletes.push({ material_code: code, operation: 'delete', quantity: undefined });
+    } else if (delta > 0) {
+      increases.push({ material_code: code, operation: 'increase', quantity: matQty });
+    } else {
+      decreases.push({ material_code: code, operation: 'decrease', quantity: matQty });
+    }
+  }
+
+  return { increases, decreases, deletes };
+}
+
 async function fireStep(
   step: Step,
   progress: { id: string; salesOrderId: string; classifierOutput: string },
@@ -1443,11 +1515,21 @@ async function fireStep(
         salesOrderId: progress.salesOrderId,
         replyHtml: trigger.replyHtml,
       });
-      const requested = [...mods.increases, ...mods.decreases]
+      let requested = [...mods.increases, ...mods.decreases]
         .filter((m) => m.quantity !== undefined && m.quantity > 0);
       if (requested.length === 0) {
-        log('[ENGINE] zload2 — extractor found no inc/dec materials in reply; skipping');
-        return 'advance_now';
+        // DB-delta fallback. Trigger reply ("yes" on a round-2
+        // dispatch_confirmation, post-VA02) carries no material text but
+        // the unapplied modification is sitting in Material vs LSI.
+        log('[ENGINE] zload2 — extractor found no inc/dec materials in reply; checking DB-delta fallback');
+        const delta = await computeModificationsFromDbDelta(progress.salesOrderId);
+        const fromDelta = [...delta.increases, ...delta.decreases];
+        if (fromDelta.length === 0) {
+          log('[ENGINE] zload2 — DB delta shows no inc/dec either; skipping');
+          return 'advance_now';
+        }
+        log(`[ENGINE] zload2 — using DB-delta fallback: ${fromDelta.map((m) => `${m.material_code}→${m.quantity} (${m.operation})`).join(', ')}`);
+        requested = fromDelta;
       }
 
       // Resolve each requested material → its (lsNumber, batch). Source of
@@ -1560,10 +1642,19 @@ async function fireStep(
         salesOrderId: progress.salesOrderId,
         replyHtml: trigger.replyHtml,
       });
-      const codes = mods.deletes.map((m) => m.material_code);
+      let codes = mods.deletes.map((m) => m.material_code);
       if (codes.length === 0) {
-        log('[ENGINE] zloading_close — extractor found no delete materials; skipping');
-        return 'advance_now';
+        // DB-delta fallback. After va02-with-delete + re-visibility,
+        // a material's Material row drops to qty 0 (or disappears) while
+        // its LSI row still exists — that's the delete we need to push.
+        log('[ENGINE] zloading_close — extractor found no delete materials; checking DB-delta fallback');
+        const delta = await computeModificationsFromDbDelta(progress.salesOrderId);
+        if (delta.deletes.length === 0) {
+          log('[ENGINE] zloading_close — DB delta shows no deletes either; skipping');
+          return 'advance_now';
+        }
+        log(`[ENGINE] zloading_close — using DB-delta fallback: deleting ${delta.deletes.map((m) => m.material_code).join(', ')}`);
+        codes = delta.deletes.map((m) => m.material_code);
       }
 
       // Group delete codes by LS. A material can sit on multiple LSs (or
