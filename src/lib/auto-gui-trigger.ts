@@ -835,9 +835,10 @@ export async function sendVehicleDetailsForBundle(
     return { sent: false, logs };
   }
 
-  // Idempotency
+  // Idempotency — match both `sent` and `replied` so a branch reply on
+  // the vehicle_details email doesn't reset us into "no email yet, send one".
   const existing = await prisma.email.findFirst({
-    where: { bundleId, emailType: 'vehicle_details', status: 'sent' },
+    where: { bundleId, emailType: 'vehicle_details', status: { in: ['sent', 'replied'] } },
     select: { id: true },
   });
   if (existing) {
@@ -961,9 +962,11 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     return { sent: false, logs };
   }
 
-  // Idempotency — one combined email per PO.
+  // Idempotency — one combined email per PO. Match both `sent` and `replied`
+  // so the branch's vehicle-details reply doesn't trip the guard into "no
+  // email yet, send another."
   const existing = await prisma.email.findFirst({
-    where: { purchaseOrderId, emailType: 'vehicle_details', status: 'sent' },
+    where: { purchaseOrderId, emailType: 'vehicle_details', status: { in: ['sent', 'replied'] } },
     select: { id: true },
   });
   if (existing) {
@@ -1441,11 +1444,14 @@ export async function sendDispatchConfirmationUpdate(args: {
     return { sent: false, skipped: true, reason: 'no_branch_email' };
   }
 
+  // The prior dispatch_confirmation is normally `replied` by the time we
+  // reach the diff path (the reply is what triggered the re-plan), so we
+  // must match both `sent` and `replied`.
   const prior = await prisma.email.findFirst({
     where: {
       purchaseOrderId,
       emailType: 'dispatch_confirmation',
-      status: 'sent',
+      status: { in: ['sent', 'replied'] },
       dispatchRound: currentRound,
     },
     orderBy: { sentAt: 'desc' },
@@ -2483,6 +2489,10 @@ export async function assembleAndSendCombinedEmail(
   // bumps `PurchaseOrder.dispatchRound`; the next visibility callback should
   // send a FRESH ls_dispatch tagged with the new round. We only short-circuit
   // when the current round's ls_dispatch is already out.
+  //
+  // Match BOTH `sent` and `replied` — once branch replies on the ls_dispatch
+  // the row flips to `replied`, and a `sent`-only filter would miss it and
+  // let a duplicate Dispatch Approval Request go out on the next sweep.
   const poRound = await prisma.purchaseOrder.findUnique({
     where: { id: purchaseOrderId },
     select: { dispatchRound: true },
@@ -2493,7 +2503,7 @@ export async function assembleAndSendCombinedEmail(
     where: {
       purchaseOrderId,
       emailType: 'ls_dispatch',
-      status: 'sent',
+      status: { in: ['sent', 'replied'] },
       dispatchRound: currentRound,
     },
   });

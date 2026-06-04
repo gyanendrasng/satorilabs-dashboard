@@ -1015,7 +1015,13 @@ export async function checkStaleVisibility(): Promise<{
     await pumpQueue();
   }
 
-  // Step 3: sweep POs whose every SO is in {received, failed} but no sent ls_dispatch yet
+  // Step 3: sweep POs whose every SO is in {received, failed} but no
+  // ls_dispatch has been sent yet for the current round.
+  //
+  // The filter must match BOTH `sent` and `replied` rows — once the branch
+  // replies on the ls_dispatch the row flips to `replied`, and a `sent`-only
+  // filter would falsely report "no ls_dispatch yet" and re-fire one. The
+  // round guard inside assembleAndSendCombinedEmail does the same widen.
   const candidatePOs = await prisma.purchaseOrder.findMany({
     where: {
       salesOrders: {
@@ -1025,7 +1031,7 @@ export async function checkStaleVisibility(): Promise<{
     },
     include: {
       emails: {
-        where: { emailType: 'ls_dispatch', status: 'sent' },
+        where: { emailType: 'ls_dispatch', status: { in: ['sent', 'replied'] } },
         take: 1,
       },
     },

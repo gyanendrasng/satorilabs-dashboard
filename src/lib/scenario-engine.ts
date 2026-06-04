@@ -1667,12 +1667,15 @@ async function fireStep(
           })
         : null;
       const currentRound = poRow?.dispatchRound ?? 1;
+      // Match both `sent` and `replied` — once branch replies, the row
+      // flips to `replied`, and a `sent`-only filter would miss the row
+      // we actually need to inspect for replyHtml/repliedAt.
       const lsDispatch = so?.purchaseOrderId
         ? await prisma.email.findFirst({
             where: {
               purchaseOrderId: so.purchaseOrderId,
               emailType: 'ls_dispatch',
-              status: 'sent',
+              status: { in: ['sent', 'replied'] },
               dispatchRound: currentRound,
             },
             orderBy: { sentAt: 'desc' },
@@ -1717,11 +1720,15 @@ async function fireStep(
         select: { dispatchRound: true },
       });
       const currentRound = poRow?.dispatchRound ?? 1;
+      // Match both `sent` and `replied` — once branch replies on the
+      // dispatch_confirmation the row flips to `replied`, and a `sent`-only
+      // filter would let a duplicate Dispatch Confirmation go out instead
+      // of routing to the diff-update path.
       const alreadySent = await prisma.email.findFirst({
         where: {
           purchaseOrderId: so.purchaseOrderId,
           emailType: 'dispatch_confirmation',
-          status: 'sent',
+          status: { in: ['sent', 'replied'] },
           dispatchRound: currentRound,
         },
         select: { id: true },
