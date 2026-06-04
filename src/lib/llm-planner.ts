@@ -96,7 +96,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string }> = [
   { kind: 'zload1', description: 'Create loading slips (LSs). Use ONLY when no LSs exist yet for this SO (i.e. SO.status != ls_created).' },
   { kind: 'zload2', description: 'Revise existing loading slip quantities. Use when LSs already exist and qty needs updating.' },
   { kind: 'zloading_close', description: 'Delete line items from an existing LS (ZLOAD_Delete). Use for material deletions after LS creation.' },
-  { kind: 'email_2nd_release', description: 'Ask branch to confirm the revised plan after a va02 modification. Send AFTER va02, BEFORE re-running zso_visibility.' },
+  { kind: 'email_2nd_release', description: 'Ask the PLANT (not branch) to perform the second release after a va02 modification. The plant runs the actual release in SAP. Send AFTER va02, BEFORE re-running zso_visibility. The plant\'s reply lands as sender=plant and triggers rule 8 → zso_visibility.' },
   { kind: 'email_confirm_product_details', description: 'The ls_dispatch email — confirm product/batch details with branch. Sent automatically by the zso_visibility callback; do not emit explicitly unless you specifically want to re-send.' },
   { kind: 'email_confirm_bundle_details', description: 'The dispatch_confirmation email — confirm bundle/truck plan with branch. Send after ls_dispatch was replied to with a confirmation.' },
   { kind: 'email_to_branch_for_vehicle', description: 'Ask branch for vehicle details (truck no, driver, LR). Send after ZLOAD1 creates loading slips.' },
@@ -328,6 +328,12 @@ trigger email type, to decide whose intent this is.
   - SENDER=plant + reply asks to modify quantities/lines → PLANT-side
     proposal. Emit email_to_branch_notifying_plant_change first (branch
     must approve before we touch SAP).
+  - SENDER=plant + reply is a confirmation/acknowledgment on a 2nd_release
+    email ("yes", "done", "released", "ok"). This is NOT a modification —
+    it's the plant confirming they performed the requested second release
+    in SAP. Apply rule 8 (emit zso_visibility), NOT zload2 /
+    email_modified_ls_to_plant. The presence of an existing LSI does not
+    change this: rule 8 wins because the trigger email is 2nd_release.
 
   6. INBOUND: branch MODIFY-INCREASE on ls_dispatch (pre-LS, no LSs yet).
      EMIT: stock_precheck → va02 → email_2nd_release. STOP.
@@ -338,11 +344,19 @@ trigger email type, to decide whose intent this is.
   7. INBOUND: branch MODIFY-DECREASE or MODIFY-DELETE on ls_dispatch (pre-LS).
      EMIT: email_confirm_bundle_details. STOP.
 
-  8. INBOUND: branch "yes do 2nd release" on a 2nd_release email.
-     (Audit trail shows va02 ✓ + email_2nd_release already sent.)
+  8. INBOUND: PLANT confirms the 2nd release ("yes", "done", "released", etc.)
+     on a 2nd_release email. (SENDER=plant. Audit trail shows va02 ✓ +
+     email_2nd_release already sent.) NOTE: the 2nd_release email is sent
+     to the PLANT — they perform the second release — so the reply comes
+     from sender=plant, NOT branch. Do not skip this rule because the
+     sender is plant; it is the only correct path for a 2nd_release reply.
      EMIT: zso_visibility. STOP.
      The /visibility-data callback auto-sends round-2 ls_dispatch.
      Do NOT chain to email_confirm_bundle_details here.
+     Do NOT emit zload2 / email_modified_ls_to_plant — the plant
+     confirmation is a green-light for re-visibility, not a request to
+     modify loading slips (rule 11 covers branch-requested LS modifications
+     on a plant_ls thread, which is a different scenario).
 
   9. INBOUND: branch confirmation on a round-2 ls_dispatch.
      (Audit trail shows TWO ls_dispatch emails AND one 2nd_release ✓.)

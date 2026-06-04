@@ -889,7 +889,7 @@ export async function handleReplyV2(args: {
 
   log(
     `[ENGINE] SO ${email.salesOrder.soNumber}: planner produced ${plan.steps.length} step(s) ` +
-      `(stopAfter=${plan.stopAfterIndex}, escalate=${plan.escalate}); rationale="${plan.rationale.slice(0, 200)}"`,
+      `(stopAfter=${plan.stopAfterIndex}, escalate=${plan.escalate}); rationale="${plan.rationale}"`,
   );
 
   await emitEvent({
