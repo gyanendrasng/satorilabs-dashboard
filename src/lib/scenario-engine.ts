@@ -1703,19 +1703,17 @@ async function fireStep(
         return 'pause';
       }
 
-      // Pull Material rows for the SO; pick the per-material quantity to
-      // dispatch from `dispatchQuantity` if the legacy planner set it,
-      // otherwise fall back to min(orderQuantity, availableStock) — the
-      // "release what's available" plan that matches release_all/release_part.
+      // Recompute the per-material dispatch quantity from scratch on every
+      // run: min(orderQuantity, availableStock). Reading a prior round's
+      // `dispatchQuantity` here was the source of the cross-round staleness
+      // bug — after branch revised orderQuantity 250 → 257, the guard kept
+      // returning 250 because that's what the previous round committed.
       const materials = await prisma.material.findMany({
         where: { salesOrderId: progress.salesOrderId },
       });
       const items = materials
         .map((m) => {
-          const qty =
-            m.dispatchQuantity && m.dispatchQuantity > 0
-              ? m.dispatchQuantity
-              : Math.min(m.orderQuantity ?? 0, m.availableStock ?? 0);
+          const qty = Math.min(m.orderQuantity ?? 0, m.availableStock ?? 0);
           return {
             material_code: m.material,
             batch: m.batch ?? '',
@@ -1732,15 +1730,12 @@ async function fireStep(
         return 'pause';
       }
 
-      // Persist dispatchQuantity onto Material rows so downstream bundling
+      // Persist the freshly computed dispatchQuantity so downstream bundling
       // (`computeBundlesForPo` inside sendDispatchConfirmationEmail) and
       // `fanOutZload1ForPo` read from a stable source.
       for (const m of materials) {
-        const qty =
-          m.dispatchQuantity && m.dispatchQuantity > 0
-            ? m.dispatchQuantity
-            : Math.min(m.orderQuantity ?? 0, m.availableStock ?? 0);
-        if (qty > 0 && m.dispatchQuantity !== qty) {
+        const qty = Math.min(m.orderQuantity ?? 0, m.availableStock ?? 0);
+        if (m.dispatchQuantity !== qty) {
           await prisma.material.update({ where: { id: m.id }, data: { dispatchQuantity: qty } });
         }
       }
