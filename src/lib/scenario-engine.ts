@@ -1281,6 +1281,10 @@ async function computeModificationsFromDbDelta(salesOrderId: string): Promise<{
   increases: MaterialModification[];
   decreases: MaterialModification[];
   deletes: MaterialModification[];
+  // material code → quantity on the LS BEFORE the unapplied modification.
+  // Only populated for materials that ended up in increases/decreases/deletes,
+  // so the caller can render "was N" alongside the new quantity in logs.
+  wasQtyByMaterial: Map<string, number>;
 }> {
   const [materialRows, lsiRows] = await Promise.all([
     prisma.material.findMany({
@@ -1305,6 +1309,7 @@ async function computeModificationsFromDbDelta(salesOrderId: string): Promise<{
   const increases: MaterialModification[] = [];
   const decreases: MaterialModification[] = [];
   const deletes: MaterialModification[] = [];
+  const wasQtyByMaterial = new Map<string, number>();
   const allCodes = new Set<string>([...materialQty.keys(), ...lsiQty.keys()]);
 
   for (const code of allCodes) {
@@ -1314,6 +1319,7 @@ async function computeModificationsFromDbDelta(salesOrderId: string): Promise<{
     if (lsiSum <= 0) continue;
     const delta = matQty - lsiSum;
     if (delta === 0) continue;
+    wasQtyByMaterial.set(code, lsiSum);
     if (matQty <= 0) {
       deletes.push({ material_code: code, operation: 'delete', quantity: undefined });
     } else if (delta > 0) {
@@ -1323,7 +1329,7 @@ async function computeModificationsFromDbDelta(salesOrderId: string): Promise<{
     }
   }
 
-  return { increases, decreases, deletes };
+  return { increases, decreases, deletes, wasQtyByMaterial };
 }
 
 async function fireStep(
@@ -1528,7 +1534,7 @@ async function fireStep(
           log('[ENGINE] zload2 — DB delta shows no inc/dec either; skipping');
           return 'advance_now';
         }
-        log(`[ENGINE] zload2 — using DB-delta fallback: ${fromDelta.map((m) => `${m.material_code}→${m.quantity} (${m.operation})`).join(', ')}`);
+        log(`[ENGINE] zload2 — using DB-delta fallback: ${fromDelta.map((m) => `${m.material_code} ${m.operation} ${delta.wasQtyByMaterial.get(m.material_code) ?? '?'}→${m.quantity}`).join(', ')}`);
         requested = fromDelta;
       }
 
@@ -1653,7 +1659,7 @@ async function fireStep(
           log('[ENGINE] zloading_close — DB delta shows no deletes either; skipping');
           return 'advance_now';
         }
-        log(`[ENGINE] zloading_close — using DB-delta fallback: deleting ${delta.deletes.map((m) => m.material_code).join(', ')}`);
+        log(`[ENGINE] zloading_close — using DB-delta fallback: deleting ${delta.deletes.map((m) => `${m.material_code} (was ${delta.wasQtyByMaterial.get(m.material_code) ?? '?'})`).join(', ')}`);
         codes = delta.deletes.map((m) => m.material_code);
       }
 
