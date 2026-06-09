@@ -88,6 +88,17 @@ export interface Customer {
   name: string;
 }
 
+export interface Bundle {
+  id: string;
+  bundleNumber: number;
+  vehicleNumber: string | null;
+  driverMobile: string | null;
+  containerNumber: string | null;
+  transportId: string | null;
+  sealNumber: string | null;
+  status: string;
+}
+
 export interface PurchaseOrder {
   id: string;
   poNumber: string;
@@ -100,6 +111,7 @@ export interface PurchaseOrder {
   stage: number;
   createdAt: string;
   updatedAt: string;
+  bundles: Bundle[];
   salesOrders: SalesOrder[];
 }
 

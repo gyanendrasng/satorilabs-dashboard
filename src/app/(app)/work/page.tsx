@@ -32,7 +32,8 @@ import {
   ArrowDown,
   ListChecks,
 } from 'lucide-react';
-import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, groupItemsByLsNumber } from '@/components/orders/types';
+import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, Bundle, groupItemsByLsNumber } from '@/components/orders/types';
+import { BundleVehicleEditor } from '@/components/orders/BundleVehicleEditor';
 
 interface ChatMessage {
   id: string;
@@ -943,6 +944,20 @@ export default function WorkPage() {
                     {/* SO Level */}
                     {expandedPOs.has(po.id) && (
                       <div className="bg-slate-800/50 p-4 space-y-3">
+                        {po.bundles && po.bundles.length > 0 && (
+                          <div className="space-y-2">
+                            <p className="text-xs uppercase tracking-wide text-slate-400">
+                              Vehicle Details ({po.bundles.length} {po.bundles.length === 1 ? 'truck' : 'trucks'})
+                            </p>
+                            {po.bundles.map((b: Bundle) => (
+                              <BundleVehicleEditor
+                                key={b.id}
+                                bundle={b}
+                                onSaved={fetchOrders}
+                              />
+                            ))}
+                          </div>
+                        )}
                         {/* Add SO Button */}
                         <div className="flex justify-end mb-2">
                           <button
