@@ -52,3 +52,6 @@ next-env.d.ts
 
 # local PDF dumps from missing-LS debug runs
 /missing_pdfs
+
+# local planner-prompt dumps (PLANNER_DUMP_PROMPTS=true)
+/test_artifacts/planner-prompts

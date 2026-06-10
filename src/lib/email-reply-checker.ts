@@ -1,13 +1,6 @@
 import { prisma } from './prisma';
 import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject, markMessagesAsRead } from './gmail';
 import {
-  checkAndSendBatchToAman,
-  handleBranchReply,
-  handleProductionReply,
-  handleProductionConfirmation,
-  handleVehicleDetailsReply,
-  handleVehicleSplitConfirmation,
-  handleDispatchConfirmation,
   triggerZsoVisibility,
   assembleAndSendCombinedEmail,
 } from './auto-gui-trigger';
@@ -128,41 +121,48 @@ export async function checkForReplies(): Promise<{
         continue;
       }
 
-      // Get reply HTML body for workflow classification
+      // Get reply HTML body for the planner.
       const replyBodyHtml = await getMessageBody(latestReply.id);
-
-      // Store replyHtml + repliedAt on the email record. Both fields are
-      // required by `renderEmailThreadForSO` to include the reply in the
-      // rendered thread the classifier sees — without repliedAt the inbound
-      // entry is silently dropped, and the LLM ends up classifying the
-      // outbound dispatch email instead.
-      await prisma.email.update({
-        where: { id: email.id },
-        data: { replyHtml: replyBodyHtml, repliedAt: new Date() },
-      });
-
-      // Clear UNREAD on the branch/plant reply so the same message doesn't
-      // keep matching `is:unread` on subsequent cron ticks. Done right after
-      // we persist replyHtml — if a downstream router throws below, we still
-      // have the reply captured in our DB and don't want to reprocess it.
-      await markMessagesAsRead([latestReply.id]);
-
-      // Route based on emailType
       const emailType = (email as any).emailType as string | null;
 
-      // ─── LLM planner (default path) ─────────────────────────────────────
-      // Route ALL SO-tied replies through handleReplyV2, which now uses the
-      // LLM planner (src/lib/llm-planner.ts). The planner reads the audit
-      // trail + email thread and emits a step list to execute up to the next
-      // outbound email. Per-type branches below remain only as a defensive
-      // fallback if LLM_PLANNER_DISABLED=true is set.
-      const plannerDisabled = (process.env.LLM_PLANNER_DISABLED ?? 'false').toLowerCase() === 'true';
-      if (!plannerDisabled && email.salesOrderId) {
+      // ─── PDF attachment pre-pass ───────────────────────────────────────
+      // Plant-side invoice replies carry the LS invoice as a PDF. Upload it
+      // to R2 and stamp `replyPdfUrl` on the Email row BEFORE handing off to
+      // the planner — the planner's `process_plant_invoice` step reads that
+      // column to find the bundle's PDF.
+      const attachments = await extractPdfAttachments(latestReply.id);
+      let replyPdfUrl: string | undefined;
+      if (attachments.length > 0) {
+        const invoicePdf = attachments[0];
+        const s3Key = `reply-pdfs/${soNumber}/${lsNumber}.pdf`;
+        await uploadToS3(s3Key, invoicePdf.content, 'application/pdf');
+        log(`[EmailChecker] Uploaded PDF to R2: ${s3Key} (${invoicePdf.content.length} bytes)`);
+        replyPdfUrl = s3Key;
+      }
+
+      // Persist reply + PDF in a single write so the planner sees consistent
+      // state. `repliedAt` flips the email from `sent` → `replied`.
+      await prisma.email.update({
+        where: { id: email.id },
+        data: {
+          replyHtml: replyBodyHtml,
+          repliedAt: new Date(),
+          status: 'replied',
+          ...(replyPdfUrl ? { replyPdfUrl } : {}),
+        },
+      });
+
+      // Clear UNREAD on the inbound so the same message doesn't keep matching
+      // `is:unread` on subsequent cron ticks.
+      await markMessagesAsRead([latestReply.id]);
+
+      // ─── Planner ────────────────────────────────────────────────────────
+      // Every SO-tied reply goes through `handleReplyV2` → LLM planner. The
+      // planner reads the audit trail + thread and emits a step list. Sender
+      // is inferred from the outbound recipient (plant-bound outbounds reply
+      // from the plant; everything else is the branch).
+      if (email.salesOrderId) {
         log(`[EmailChecker] Planner → handleReplyV2 for emailType=${emailType ?? 'null'} SO ${soNumber}`);
-        // Sender = whoever the outbound was addressed to. Replaces the old
-        // emailType-based rule (`emailType === 'plant_ls' ? 'plant' : 'branch'`)
-        // so newly plant-bound emails (e.g. 2nd_release after this refactor)
-        // are correctly classified without needing per-type branching.
         const sender: 'branch' | 'plant' =
           PLANT_EMAIL && email.recipientEmail === PLANT_EMAIL ? 'plant' : 'branch';
         const { handleReplyV2 } = await import('./scenario-engine');
@@ -175,178 +175,12 @@ export async function checkForReplies(): Promise<{
         });
         logs.push(...r.logs);
         processed++;
-        continue;
-      }
-
-      if (emailType === 'vehicle_split_inquiry') {
-        log(`[EmailChecker] Routing to handleVehicleSplitConfirmation for PO email ${email.id}`);
-        const splitResult = await handleVehicleSplitConfirmation(email.id, replyBodyHtml);
-        logs.push(...splitResult.logs);
+      } else {
+        // No SO link → can only be the PO-level tonnage_inquiry / vehicle
+        // split inquiry threads. The planner still handles these once the PO
+        // is resolved; for now we just record the reply.
+        log(`[EmailChecker] Reply on PO-level email ${email.id} (no salesOrderId) — replyHtml stored, planner skip`);
         processed++;
-        continue;
-      }
-
-      if (emailType === 'dispatch_confirmation') {
-        log(`[EmailChecker] Routing to handleDispatchConfirmation for PO email ${email.id}`);
-        const dcResult = await handleDispatchConfirmation(email.id, replyBodyHtml);
-        logs.push(...dcResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'production_inquiry') {
-        // Production team replied to our inquiry — extract days
-        log(`[EmailChecker] Routing to handleProductionReply for SO ${soNumber}`);
-        const prodResult = await handleProductionReply(email.id, replyBodyHtml);
-        logs.push(...prodResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'production_reminder') {
-        // Production team replied to our reminder — classify confirmation
-        log(`[EmailChecker] Routing to handleProductionConfirmation for SO ${soNumber}`);
-        const confResult = await handleProductionConfirmation(email.id, replyBodyHtml);
-        logs.push(...confResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'vehicle_details') {
-        // Branch replied with vehicle details
-        log(`[EmailChecker] Routing to handleVehicleDetailsReply for SO ${soNumber}`);
-        const vdResult = await handleVehicleDetailsReply(email.id, replyBodyHtml || '', email.salesOrderId!);
-        logs.push(...vdResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === '2nd_release') {
-        // Branch replied to a 2nd-release confirmation email — scenario engine advances on 'yes'
-        log(`[EmailChecker] Routing to handleSecondReleaseReply for SO ${soNumber}`);
-        const { handleSecondReleaseReply } = await import('./scenario-engine');
-        const srResult = await handleSecondReleaseReply(email.id, replyBodyHtml || '');
-        logs.push(...srResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'plant_ls') {
-        // Plant replied to LS email — only care about PDF attachment (invoice)
-        log(`[EmailChecker] Plant reply for SO ${soNumber} / LS ${lsNumber}`);
-        // Fall through to PDF extraction below (skip handleBranchReply)
-      } else if (replyBodyHtml) {
-        // Default: null or 'ls_dispatch' — this is a branch reply
-        log(`[EmailChecker] Routing to handleBranchReply for SO ${soNumber} / LS ${lsNumber}`);
-        // Fetch the original sent email body from Gmail
-        const originalEmailHtml = await getMessageBody(email.gmailMessageId);
-        const branchResult = await handleBranchReply(
-          email.id,
-          replyBodyHtml,
-          originalEmailHtml,
-          email.salesOrderId!
-        );
-        logs.push(...branchResult.logs);
-
-        // Branch replies are fully owned by handleBranchReply (ZLOAD1 result
-        // arrives via the zload1-data callback). Do NOT fall through to the
-        // legacy ZLOAD3-B1 PDF/BatchSender flow.
-        processed++;
-        continue;
-      }
-
-      // Also continue with existing PDF flow (legacy ZLOAD3-B path)
-      // Extract PDF attachments from the reply
-      const attachments = await extractPdfAttachments(latestReply.id);
-
-      if (attachments.length === 0) {
-        log(`[EmailChecker] Reply has no PDF attachment for SO ${soNumber} / LS ${lsNumber}`);
-        // Reply received but no PDF attachment
-        await prisma.email.update({
-          where: { id: email.id },
-          data: {
-            status: 'replied',
-            repliedAt: new Date(),
-          },
-        });
-
-        // Plant-modification fork: a plant_ls reply with text but no invoice
-        // PDF means the plant is asking for an LS modification (qty change /
-        // shortage / line removal). Route to the scenario engine when the
-        // flag is on. If the engine matches a scenario, skip the legacy
-        // BatchSender call below.
-        if (
-          emailType === 'plant_ls' &&
-          replyBodyHtml &&
-          email.salesOrderId &&
-          (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
-        ) {
-          const { handleReplyV2 } = await import('./scenario-engine');
-          const originalEmailHtml = await getMessageBody(email.gmailMessageId);
-          const r = await handleReplyV2({
-            emailId: email.id,
-            replyHtml: replyBodyHtml,
-            originalEmailHtml,
-            sourceEmailType: 'plant',
-          });
-          logs.push(...r.logs);
-          if (r.matched) {
-            processed++;
-            continue;
-          }
-          // Fall through to legacy BatchSender if the engine didn't match.
-        }
-
-        // Check if all emails for this (Bundle, SO) pair now have replies.
-        // bundleId comes from the LSI the email is tied to; null = legacy
-        // (whole-SO) behavior.
-        if (email.salesOrderId) {
-          // Prefer the email's direct LS link (new path); fall back to the
-          // LSI → LoadingSlip chain for legacy emails. Either way resolves
-          // to the bundle that ZLOAD3-B1 should batch over.
-          const lsiBundleId =
-            email.loadingSlip?.bundleId ??
-            email.loadingSlipItem?.loadingSlip?.bundleId ??
-            null;
-          const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
-          logs.push(...batchResult.logs);
-        }
-        continue;
-      }
-
-      // Get the first PDF attachment (invoice)
-      const invoicePdf = attachments[0];
-
-      log(`[EmailChecker] Found PDF attachment (${invoicePdf.filename}, ${invoicePdf.content.length} bytes) for SO ${soNumber} / LS ${lsNumber}`);
-
-      // Store reply PDF to R2 instead of parsing immediately
-      const s3Key = `reply-pdfs/${soNumber}/${lsNumber}.pdf`;
-      await uploadToS3(s3Key, invoicePdf.content, 'application/pdf');
-
-      log(`[EmailChecker] Uploaded PDF to R2: ${s3Key}`);
-
-      // Update Email status to 'replied' with the PDF URL
-      await prisma.email.update({
-        where: { id: email.id },
-        data: {
-          status: 'replied',
-          repliedAt: new Date(),
-          replyPdfUrl: s3Key,
-        },
-      });
-
-      log(`[EmailChecker] Marked email as 'replied' for SO ${soNumber} / LS ${lsNumber}`);
-
-      processed++;
-
-      // Check if all emails for this (Bundle, SO) pair now have replies.
-      if (email.salesOrderId) {
-        const lsiBundleId =
-          email.loadingSlip?.bundleId ??
-          email.loadingSlipItem?.loadingSlip?.bundleId ??
-          null;
-        const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
-        logs.push(...batchResult.logs);
       }
     } catch (error) {
       const errorMsg = `Error processing email ${email.id} (SO ${soNumber} / LS ${lsNumber}): ${

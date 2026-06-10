@@ -119,19 +119,155 @@ export function packMaterialsIntoBundles(
 }
 
 /**
+ * A bundle expressed as the set of materials it holds. Used to compare the
+ * proposed bundling against what's already in the DB so we only do the
+ * destructive wipe when composition actually changed. Keys are
+ * `${material}|${batch}`; values are the per-line `dispatchQuantity`.
+ *
+ * Two bundles are "the same" when their material-key maps are equal.
+ * Bundle numbers are NOT part of the identity — the bin-packer is free to
+ * renumber (1,2,3...) without that counting as a change.
+ */
+type BundleComposition = Map<string, number>;
+
+interface BundleSnapshot {
+  /** Source of truth for "which SAP LS holds this bundle." Null when the
+   *  bundle exists only in our DB and hasn't been pushed to SAP yet. */
+  lsNumber: string | null;
+  composition: BundleComposition;
+}
+
+/**
+ * Read the current state of bundles for a PO: each Bundle plus the LS that
+ * was created from it (via `LoadingSlip.bundleId`) and the materials it
+ * carries (via `Material.bundleId`). Returns the per-bundle snapshot used
+ * by `diffBundleComposition`.
+ */
+async function readCurrentBundles(purchaseOrderId: string): Promise<BundleSnapshot[]> {
+  const bundles = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    include: {
+      loadingSlips: { select: { lsNumber: true } },
+      materials: { select: { material: true, batch: true, dispatchQuantity: true } },
+    },
+    orderBy: { bundleNumber: 'asc' },
+  });
+  return bundles.map((b) => {
+    const composition: BundleComposition = new Map();
+    for (const m of b.materials) {
+      const key = `${m.material}|${m.batch ?? ''}`;
+      composition.set(key, (composition.get(key) ?? 0) + (m.dispatchQuantity ?? 0));
+    }
+    // A bundle can in principle hold multiple LSs (one per SO under the PO).
+    // For diff purposes we tag the snapshot with the first LS as a label —
+    // the cleanup logic enumerates ALL LSs of an eliminated bundle below.
+    const lsNumber = b.loadingSlips[0]?.lsNumber ?? null;
+    return { lsNumber, composition };
+  });
+}
+
+/** Convert proposed bins (from `packMaterialsIntoBundles`) into snapshots
+ *  for diffing. Needs the per-Material id → (material, batch, qty) map. */
+function snapshotProposedBundles(
+  bins: BundlerBin[],
+  matIndex: Map<string, { material: string; batch: string; dispatchQuantity: number }>,
+): BundleSnapshot[] {
+  return bins.map((bin) => {
+    const composition: BundleComposition = new Map();
+    for (const id of bin.itemIds) {
+      const m = matIndex.get(id);
+      if (!m) continue;
+      const key = `${m.material}|${m.batch ?? ''}`;
+      composition.set(key, (composition.get(key) ?? 0) + m.dispatchQuantity);
+    }
+    return { lsNumber: null, composition };
+  });
+}
+
+function compositionsEqual(a: BundleComposition, b: BundleComposition): boolean {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) {
+    if (b.get(k) !== v) return false;
+  }
+  return true;
+}
+
+/**
+ * Compare proposed vs current bundle snapshots. Returns:
+ *   - `unchanged: true` when every current bundle has a 1:1 composition match
+ *     in the proposed set (regardless of bundle number).
+ *   - Otherwise, the list of LS numbers whose source bundle no longer matches
+ *     any proposed bundle — these must be closed in SAP before the wipe.
+ *
+ * The diff is composition-only: a material moving from Bundle 1 to Bundle 2
+ * (even with no qty change) counts as a change, because the SAP LS that
+ * held it under the old plan no longer accurately reflects the new plan.
+ */
+function diffBundleComposition(
+  proposed: BundleSnapshot[],
+  current: BundleSnapshot[],
+): { unchanged: true } | { unchanged: false; lssToClose: string[] } {
+  // Match each current bundle against a proposed bundle by composition.
+  const matchedProposed = new Set<number>();
+  const lssToClose: string[] = [];
+
+  for (const curr of current) {
+    let matchIdx = -1;
+    for (let i = 0; i < proposed.length; i++) {
+      if (matchedProposed.has(i)) continue;
+      if (compositionsEqual(curr.composition, proposed[i].composition)) {
+        matchIdx = i;
+        break;
+      }
+    }
+    if (matchIdx === -1) {
+      // No proposed bundle matches this current one — its LS (if any) must
+      // be closed in SAP.
+      if (curr.lsNumber) lssToClose.push(curr.lsNumber);
+    } else {
+      matchedProposed.add(matchIdx);
+    }
+  }
+
+  // Composition is unchanged when every current bundle paired with a unique
+  // proposed bundle AND no extra proposed bundles remained. The second half
+  // matters only when the proposed plan has MORE bundles than current — that
+  // means new material got added (or existing material grew past capacity),
+  // which is itself a composition change.
+  const allProposedMatched = matchedProposed.size === proposed.length;
+  const allCurrentMatched = lssToClose.length === 0;
+  if (allCurrentMatched && allProposedMatched && proposed.length === current.length) {
+    return { unchanged: true };
+  }
+  // Also include LSs from bundles that had no LS attached (e.g. a Bundle
+  // row that ZLOAD1 hadn't yet materialised into an LS) — those don't need
+  // closing in SAP, but their DB Bundle row will still be wiped below.
+  return { unchanged: false, lssToClose };
+}
+
+/**
  * Compute capacity-based bundles for a PurchaseOrder from its Material rows
- * (the branch-confirmed dispatch plan). Run AFTER the branch confirms the
- * dispatch — before ZLOAD1 fires — so the truck count is locked in before
- * any LS is created.
+ * (the branch-confirmed dispatch plan).
+ *
+ * Two distinct cases:
+ *
+ *   1. **First call** (pre-ZLOAD1, no LSs exist yet) — the diff trivially
+ *      reports "changed, nothing to close in SAP," falls through to the
+ *      compute+commit phase. Same code path; the wipe is a no-op because
+ *      there's nothing to wipe.
+ *
+ *   2. **Re-bundle after a modification** — materials have changed (qty,
+ *      composition). We:
+ *        a. Compute the proposed bundles in memory (dry run).
+ *        b. Diff against the existing Bundle/LoadingSlip state.
+ *        c. If composition is unchanged → no-op (common case for
+ *           "release as-is" replies after a clarification).
+ *        d. If composition changed → enqueue ZLOADING_CLOSE for every
+ *           affected SAP-issued LS, await completion, then wipe + recreate.
  *
  * Per-Material weight = (dispatchQuantity / orderQuantity) * orderWeightKg.
- * Capacity = Customer.weightage * 1000 kg (defaults to 35000 if missing or
- * non-positive). Bin packing delegated to `packMaterialsIntoBundles` —
- * material-grouping is enforced there.
- *
- * Idempotent — wipes existing Bundle rows and Material.bundleId for the PO
- * before recomputing. LSIs created later by /zload1-data inherit bundleId
- * from the matching Material.
+ * Capacity = `PO.weightage * 1000` kg. Bin packing delegated to
+ * `packMaterialsIntoBundles` — material-grouping is enforced there.
  */
 export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
   bundleCount: number;
@@ -152,13 +288,122 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
   }
   const capacityKg = rawWeightage * 1000;
 
-  // Idempotency: detach existing bundle linkages. With the LoadingSlip
-  // refactor, LSIs reach a bundle through their parent LS — so we:
-  //   1. Detach LSIs from LSs (set loadingSlipId=NULL).
-  //   2. Delete LSs for this PO (FK cascade on Bundle takes them out too,
-  //      but explicit removal here keeps the sequence obvious).
-  //   3. Detach Materials from bundles.
-  //   4. Delete Bundles.
+  // ── Phase 1: read materials and compute proposed bundles in memory ──────
+  const materials = await prisma.material.findMany({
+    where: {
+      salesOrder: { purchaseOrderId },
+      dispatchQuantity: { gt: 0 },
+    },
+  });
+
+  if (materials.length === 0) {
+    // Nothing to bundle. Treat as "wipe-and-leave-empty" — but only if
+    // there's something to wipe; otherwise it's a true no-op.
+    const existing = await prisma.bundle.count({ where: { purchaseOrderId } });
+    if (existing === 0) {
+      return { bundleCount: 0, totalKg: 0, capacityKg };
+    }
+    // Existing bundles but no materials → wipe (no SAP cleanup needed for
+    // the unusual case where every line went to zero; close any LSs found).
+    return wipeAndCommit(purchaseOrderId, [], 0, capacityKg);
+  }
+
+  const matIndex = new Map<string, { material: string; batch: string; dispatchQuantity: number }>();
+  const weighted: BundlerInput[] = materials.map((m) => {
+    const dispatchQty = m.dispatchQuantity!;
+    const orderedQty = m.orderQuantity || 0;
+    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    const weightKg = orderedQty > 0 ? (dispatchQty / orderedQty) * fullWeight : 0;
+    matIndex.set(m.id, { material: m.material, batch: m.batch ?? '', dispatchQuantity: dispatchQty });
+    return { id: m.id, material: m.material, weightKg };
+  });
+
+  const totalKg = weighted.reduce((s, w) => s + w.weightKg, 0);
+  const proposedBins = packMaterialsIntoBundles(weighted, capacityKg, (msg) => console.warn(msg));
+
+  // ── Phase 2: diff proposed against current ──────────────────────────────
+  const proposedSnapshots = snapshotProposedBundles(proposedBins, matIndex);
+  const currentSnapshots = await readCurrentBundles(purchaseOrderId);
+  const diff = diffBundleComposition(proposedSnapshots, currentSnapshots);
+
+  if (diff.unchanged) {
+    // Common case after the planner re-emits `email_confirm_bundle_details`
+    // for a no-op confirmation. Bundles + LSs stay exactly as they are; we
+    // just return the freshly computed totals (identical to current since
+    // composition matches).
+    console.log(
+      `[Bundler] PO ${po.poNumber}: re-bundle no-op (${currentSnapshots.length} bundle(s) unchanged) — skipping wipe`,
+    );
+    return {
+      bundleCount: currentSnapshots.length,
+      totalKg,
+      capacityKg,
+    };
+  }
+
+  // ── Phase 3: SAP-aware cleanup of LSs that no longer match the plan ─────
+  if (diff.lssToClose.length > 0) {
+    console.log(
+      `[Bundler] PO ${po.poNumber}: composition changed — closing ${diff.lssToClose.length} LS(s) in SAP before re-bundling: ${diff.lssToClose.join(', ')}`,
+    );
+
+    const { triggerZloadingClose } = await import('./auto-gui-trigger');
+    const { awaitWorkCompletion } = await import('./work-queue');
+
+    // For each LS to close, build the materials list from its LSI rows and
+    // emit ZLOADING_CLOSE. We collect the resulting WorkQueue ids so we can
+    // block on completion before wiping.
+    const workIdsToAwait: string[] = [];
+    for (const lsNumber of diff.lssToClose) {
+      const lsiRows = await prisma.loadingSlipItem.findMany({
+        where: { lsNumber },
+        select: { material: true },
+      });
+      const materialCodes = Array.from(new Set(lsiRows.map((r) => r.material)));
+      if (materialCodes.length === 0) {
+        console.warn(`[Bundler] LS ${lsNumber} has no LSI rows — skipping ZLOADING_CLOSE`);
+        continue;
+      }
+      // triggerZloadingClose enqueues + pumps internally. It dedupes on
+      // (lsNumber, materials) so re-calling within the same flow is safe.
+      await triggerZloadingClose(lsNumber, materialCodes);
+      // Pick up the work id we just enqueued for the wait. The trigger
+      // doesn't return it, so we re-query the most recent matching row.
+      const justQueued = await prisma.workQueue.findFirst({
+        where: {
+          step: 'zloading_close',
+          payload: { contains: `"ls_number":"${lsNumber}"` },
+          state: { in: ['queued', 'firing'] },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      });
+      if (justQueued) workIdsToAwait.push(justQueued.id);
+    }
+
+    if (workIdsToAwait.length > 0) {
+      console.log(
+        `[Bundler] PO ${po.poNumber}: awaiting ${workIdsToAwait.length} ZLOADING_CLOSE work row(s)…`,
+      );
+      await awaitWorkCompletion(workIdsToAwait, { timeoutMs: 120_000 });
+      console.log(`[Bundler] PO ${po.poNumber}: all ZLOADING_CLOSE work rows terminal`);
+    }
+  }
+
+  // ── Phase 4: wipe and commit the new bundles ────────────────────────────
+  return wipeAndCommit(purchaseOrderId, proposedBins, totalKg, capacityKg);
+}
+
+/**
+ * Apply the destructive wipe + recreate. Split out so the empty-materials
+ * fallback path can re-use it without duplicating the deletes.
+ */
+async function wipeAndCommit(
+  purchaseOrderId: string,
+  proposedBins: BundlerBin[],
+  totalKg: number,
+  capacityKg: number,
+): Promise<{ bundleCount: number; totalKg: number; capacityKg: number }> {
   await prisma.material.updateMany({
     where: { salesOrder: { purchaseOrderId }, bundleId: { not: null } },
     data: { bundleId: null },
@@ -172,30 +417,7 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
   });
   await prisma.bundle.deleteMany({ where: { purchaseOrderId } });
 
-  const materials = await prisma.material.findMany({
-    where: {
-      salesOrder: { purchaseOrderId },
-      dispatchQuantity: { gt: 0 },
-    },
-  });
-
-  if (materials.length === 0) {
-    return { bundleCount: 0, totalKg: 0, capacityKg };
-  }
-
-  const weighted: BundlerInput[] = materials.map((m) => {
-    const dispatchQty = m.dispatchQuantity!;
-    const orderedQty = m.orderQuantity || 0;
-    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
-    const weightKg = orderedQty > 0 ? (dispatchQty / orderedQty) * fullWeight : 0;
-    return { id: m.id, material: m.material, weightKg };
-  });
-
-  const totalKg = weighted.reduce((s, w) => s + w.weightKg, 0);
-
-  const bins = packMaterialsIntoBundles(weighted, capacityKg, (msg) => console.warn(msg));
-
-  for (const bin of bins) {
+  for (const bin of proposedBins) {
     const bundle = await prisma.bundle.create({
       data: {
         purchaseOrderId,
@@ -209,7 +431,7 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
     });
   }
 
-  return { bundleCount: bins.length, totalKg, capacityKg };
+  return { bundleCount: proposedBins.length, totalKg, capacityKg };
 }
 
 /**

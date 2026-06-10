@@ -1,5 +1,5 @@
 /**
- * LLM planner — replaces the sheet-driven scenario classifier.
+ * LLM planner — the single decision-maker for every inbound email.
  *
  * On every inbound email, planNextSteps() reads:
  *   - the manager prompt (ManagerV2.1.txt at repo root)
@@ -7,14 +7,13 @@
  *   - the SO's email thread (renderEmailThreadForSO)
  *   - the SO's current DB state (status, materials, plant_ls sent?, invoice?)
  *
- * …and asks an LLM to emit an ordered list of step kinds (drawn from the
- * existing StepKind vocabulary) up to and including the next outbound
- * email. The scenario engine then walks those steps via its existing
- * fireStep handlers; when the stop step completes, the scenario parks
- * awaiting reply. Next inbound triggers a fresh plan call.
+ * …and asks an LLM to emit an ordered list of steps (each {kind, args}) up
+ * to and including the next outbound email. The scenario engine then walks
+ * those steps via its fireStep handlers; when the stop step completes, the
+ * scenario parks awaiting reply. Next inbound triggers a fresh plan call.
  *
- * No sheet. No hardcoded scenario keys. The LLM picks steps from a fixed
- * vocabulary and the engine fires the corresponding handlers.
+ * The LLM picks steps from a fixed vocabulary and fills in args directly
+ * from the email thread — no downstream LLM extractor re-reads the body.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,6 +27,62 @@ import { deriveStage, type StepKind } from './dispatch-scenarios';
 // -----------------------------------------------------------------------------
 // Public types
 // -----------------------------------------------------------------------------
+
+/**
+ * Per-step args emitted by the planner. The planner reads the email thread +
+ * audit trail and fills these in directly — no second LLM extractor runs.
+ * Executor coerces JS types into the typed Prisma columns at the boundary
+ * (e.g. qty: number → Material.orderQuantity: Int via Math.round).
+ *
+ * Args are OPTIONAL at the schema level: if the planner omits args on a step
+ * that needs them, the coercion helper at the handler boundary throws and the
+ * scenario fails — the planner re-plans on next tick. Permissive at the
+ * schema layer keeps rollout incremental.
+ */
+export type MaterialOp = 'inc' | 'dec' | 'del';
+
+export interface MaterialModification {
+  code: string;
+  op: MaterialOp;
+  /** Required for inc / dec. Absent for del. */
+  qty?: number;
+}
+
+export interface LsRevision {
+  /** When the planner can identify the LS from the thread; otherwise executor resolves via (soNumber, material, batch). */
+  lsNumber?: string;
+  material: string;
+  /** Optional. Executor falls back to existing LSI.batch if omitted. */
+  batch?: string;
+  qty: number;
+}
+
+export interface LsDeletion {
+  lsNumber?: string;
+  material: string;
+  batch?: string;
+}
+
+export interface VehicleSet {
+  /** When the branch reply specifies a bundle/truck index; executor resolves the Bundle row. */
+  bundleNumber?: number;
+  vehicleNumber: string;
+  driverMobile: string;
+  containerNumber: string;
+}
+
+export interface TonnageReading {
+  value: number;
+  unit: 't' | 'kg';
+}
+
+export type PlannedStepArgs =
+  | { materials: MaterialModification[] }
+  | { revisions: LsRevision[] }
+  | { deletes: LsDeletion[] }
+  | { vehicles: VehicleSet[] }
+  | { tonnage: TonnageReading }
+  | Record<string, never>;
 
 export interface PlannedStep {
   kind: StepKind;
@@ -46,6 +101,14 @@ export interface PlannedStep {
    * stuck between. Rendered as a bulleted list in the supervisor email.
    */
   options?: string[];
+  /**
+   * Per-kind data the executor needs (materials, vehicles, tonnage, …).
+   * The planner reads the email thread + audit and fills this in; no
+   * downstream LLM extracts data again. Shape varies by `kind` — see
+   * `PlannedStepArgs`. Loose `Record<string, unknown>` at this layer
+   * because zod validates shape; coercion happens in the handler.
+   */
+  args?: Record<string, unknown>;
 }
 
 export interface PlanResult {
@@ -88,35 +151,135 @@ function loadManagerPrompt(): string {
 // Step-kind vocabulary block (rendered into every user prompt)
 // -----------------------------------------------------------------------------
 
-const STEP_KINDS: Array<{ kind: StepKind; description: string }> = [
-  { kind: 'stock_precheck', description: 'Free-stock pre-check (replaces Zmatana). Use BEFORE va02 on any increase.' },
-  { kind: 'va02', description: 'Modify SO line items in SAP. Use ONLY when increasing a material quantity. Decreases and deletes do not need va02.' },
-  { kind: 'zso_visibility', description: 'Re-run ZSO_Visibility + Zmatana. Always run after va02 to refresh material availability.' },
-  { kind: 'mb51', description: 'Park on daily FCFS reactivator. Use only when waiting for new stock to arrive.' },
-  { kind: 'zload1', description: 'Create loading slips (LSs). Use ONLY when no LSs exist yet for this SO (i.e. SO.status != ls_created).' },
-  { kind: 'zload2', description: 'Revise existing loading slip quantities. Use when LSs already exist and qty needs updating.' },
-  { kind: 'zloading_close', description: 'Delete line items from an existing LS (ZLOAD_Delete). Use for material deletions after LS creation.' },
-  { kind: 'email_2nd_release', description: 'Ask the PLANT (not branch) to perform the second release after a va02 modification. The plant runs the actual release in SAP. Send AFTER va02, BEFORE re-running zso_visibility. The plant\'s reply lands as sender=plant and triggers rule 8 → zso_visibility.' },
-  { kind: 'email_confirm_product_details', description: 'The ls_dispatch email — confirm product/batch details with branch. Sent automatically by the zso_visibility callback; do not emit explicitly unless you specifically want to re-send.' },
-  { kind: 'email_confirm_bundle_details', description: 'The dispatch_confirmation email — confirm bundle/truck plan with branch. Send after ls_dispatch was replied to with a confirmation.' },
-  { kind: 'email_to_branch_for_vehicle', description: 'Ask branch for vehicle details (truck no, driver, LR). Send after ZLOAD1 creates loading slips.' },
-  { kind: 'email_to_plant', description: 'Forward the LS PDF to the plant (plant_ls email). Use ONLY after branch provides vehicle details (truck/driver/LR). Sends EVERY LS for the affected bundles. Do NOT use after zload2/zloading_close — use email_modified_ls_to_plant for that.' },
-  { kind: 'email_modified_ls_to_plant', description: 'Forward the regenerated LS PDFs to the plant after a zload2 / zloading_close modification. Sends ONLY the LSs that were just touched by the preceding zload2/zloading_close steps in THIS plan — never every LS. Use this whenever the plan contains zload2 or zloading_close AND we need to notify the plant of the change.' },
-  { kind: 'email_to_branch_notifying_plant_change', description: 'Notify branch that the plant has proposed a modification. Send when a plant reply asks for a quantity change.' },
-  { kind: 'email_order_status', description: 'Auto-reply with the current SO status. Use when branch asks "where is my order?" (Seeking Order Update).' },
-  { kind: 'process_plant_invoice', description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use when the latest plant reply has a PDF attachment.' },
-  { kind: 'process_tonnage_reply', description: 'Branch replied to a tonnage_inquiry email with the vehicle/truck tonnage. Use ONLY when the latest inbound is a reply on a tonnage_inquiry thread and contains a number that looks like a truck capacity (e.g. "35 t", "35000 kg"). The executor parses the reply, writes po.weightage (PO-level — affects every SO under the PO), and the next inbound resumes normal dispatch. Note: tonnage_inquiry is a PO-scoped email anchored on the lead SO of the PO (project convention); the same PO.weightage benefits every SO.' },
-  { kind: 'email_clarify_branch', description: 'Reply in-thread to BRANCH asking a focused clarifying question. Use when the branch reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses; the branch reply will trigger a fresh plan.' },
-  { kind: 'email_clarify_plant', description: 'Reply in-thread to PLANT asking a focused clarifying question. Use when the plant reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses.' },
-  { kind: 'email_supervisor_question', description: 'Email the SUPERVISOR for guidance when you do not know which step to take. Use ONLY when the audit trail / email thread leave you genuinely unable to choose between options. Provide the exact question text as `question` and the alternatives you are weighing as `options` (each a short phrase). The executor sends the email and pauses; the supervisor reply will be classified by the next plan.' },
-  { kind: 'await_plant_invoice', description: 'Sentinel — pause execution until the plant emails an invoice. The next plant reply will resume.' },
-  { kind: 'await_vt01n', description: 'Sentinel — pause until the operator (or pipeline) fires VT01N for the shipment.' },
+/**
+ * Each step kind's `args` shape. The planner reads the email thread and fills
+ * args in directly — the executor does NOT call a second LLM to extract them.
+ *
+ * `argsSchema` is rendered into the prompt verbatim so the planner sees the
+ * shape it must emit. `null` = step needs no args.
+ */
+const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: string | null }> = [
+  {
+    kind: 'stock_precheck',
+    description: 'Free-stock pre-check (replaces Zmatana). Use BEFORE va02 on any increase.',
+    argsSchema: '{ materials: [{ code: "<material code>", op: "inc"|"dec"|"del", qty?: <number, omit for del> }, ...] }',
+  },
+  {
+    kind: 'va02',
+    description: 'Modify SO line items in SAP. Use ONLY when increasing a material quantity. Decreases and deletes do not need va02.',
+    argsSchema: '{ materials: [{ code: "<material code>", op: "inc", qty: <new total quantity, integer> }, ...] }',
+  },
+  {
+    kind: 'zso_visibility',
+    description: 'Re-run ZSO_Visibility + Zmatana. Always run after va02 to refresh material availability.',
+    argsSchema: null,
+  },
+  {
+    kind: 'mb51',
+    description: 'Park on daily FCFS reactivator. Use only when waiting for new stock to arrive.',
+    argsSchema: null,
+  },
+  {
+    kind: 'zload1',
+    description: 'Create loading slips (LSs). Use ONLY when no LSs exist yet for this SO (i.e. SO.status != ls_created).',
+    argsSchema: null,
+  },
+  {
+    kind: 'zload2',
+    description: 'Revise existing loading slip quantities. Use when LSs already exist and qty needs updating.',
+    argsSchema: '{ revisions: [{ lsNumber?: "<LS no if known from thread>", material: "<code>", batch?: "<batch if stated>", qty: <new qty, integer> }, ...] }',
+  },
+  {
+    kind: 'zloading_close',
+    description: 'Delete line items from an existing LS (ZLOAD_Delete). Use for material deletions after LS creation.',
+    argsSchema: '{ deletes: [{ lsNumber?: "<LS no if known>", material: "<code>", batch?: "<batch>" }, ...] }',
+  },
+  {
+    kind: 'email_2nd_release',
+    description: 'Ask the PLANT (not branch) to perform the second release after a va02 modification. The plant runs the actual release in SAP. Send AFTER va02, BEFORE re-running zso_visibility. The plant\'s reply lands as sender=plant and triggers rule 8 → zso_visibility.',
+    argsSchema: '{ materials: [{ code, op: "inc"|"dec"|"del", qty?: <integer> }, ...] }  // for the email body summary',
+  },
+  {
+    kind: 'email_confirm_product_details',
+    description: 'The ls_dispatch email — confirm product/batch details with branch. Sent automatically by the zso_visibility callback; do not emit explicitly unless you specifically want to re-send.',
+    argsSchema: null,
+  },
+  {
+    kind: 'email_confirm_bundle_details',
+    description: 'The dispatch_confirmation email — confirm bundle/truck plan with branch. Send after ls_dispatch was replied to with a confirmation.',
+    argsSchema: null,
+  },
+  {
+    kind: 'email_to_branch_for_vehicle',
+    description: 'Ask branch for vehicle details (truck no, driver, LR). Send after ZLOAD1 creates loading slips.',
+    argsSchema: null,
+  },
+  {
+    kind: 'email_to_plant',
+    description: 'Forward the LS PDF to the plant (plant_ls email). Use ONLY after branch provides vehicle details (truck/driver/LR). Sends EVERY LS for the affected bundles. Do NOT use after zload2/zloading_close — use email_modified_ls_to_plant for that.',
+    argsSchema: '{ vehicles: [{ bundleNumber?: <int, omit for single-truck>, vehicleNumber: "<reg no>", driverMobile: "<10-digit>", containerNumber: "<container or empty>" }, ...] }',
+  },
+  {
+    kind: 'email_modified_ls_to_plant',
+    description: 'Forward the regenerated LS PDFs to the plant after a zload2 / zloading_close modification. Sends ONLY the LSs that were just touched by the preceding zload2/zloading_close steps in THIS plan — never every LS. Use this whenever the plan contains zload2 or zloading_close AND we need to notify the plant of the change.',
+    argsSchema: null,
+  },
+  {
+    kind: 'email_to_branch_notifying_plant_change',
+    description: 'Notify branch that the plant has proposed a modification. Send when a plant reply asks for a quantity change.',
+    argsSchema: '{ materials: [{ code, op: "inc"|"dec"|"del", qty?: <integer> }, ...] }  // for the email body summary',
+  },
+  {
+    kind: 'email_order_status',
+    description: 'Auto-reply with the current SO status. Use when branch asks "where is my order?" (Seeking Order Update).',
+    argsSchema: null,
+  },
+  {
+    kind: 'process_plant_invoice',
+    description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use when the latest plant reply has a PDF attachment.',
+    argsSchema: null,
+  },
+  {
+    kind: 'process_tonnage_reply',
+    description: 'Branch replied to a tonnage_inquiry email with the vehicle/truck tonnage. Use ONLY when the latest inbound is a reply on a tonnage_inquiry thread and contains a number that looks like a truck capacity (e.g. "35 t", "35000 kg"). The executor writes po.weightage (PO-level — affects every SO under the PO), and the next inbound resumes normal dispatch. Note: tonnage_inquiry is a PO-scoped email anchored on the lead SO of the PO (project convention); the same PO.weightage benefits every SO.',
+    argsSchema: '{ tonnage: { value: <number as stated>, unit: "t"|"kg" } }  // executor converts kg→t before writing',
+  },
+  {
+    kind: 'email_clarify_branch',
+    description: 'Reply in-thread to BRANCH asking a focused clarifying question. Use when the branch reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses; the branch reply will trigger a fresh plan.',
+    argsSchema: null,
+  },
+  {
+    kind: 'email_clarify_plant',
+    description: 'Reply in-thread to PLANT asking a focused clarifying question. Use when the plant reply is ambiguous, incomplete, or only partially answers what we asked. Provide the exact question text on this step as `question`. The executor sends the email verbatim and pauses.',
+    argsSchema: null,
+  },
+  {
+    kind: 'email_supervisor_question',
+    description: 'Email the SUPERVISOR for guidance when you do not know which step to take. Use ONLY when the audit trail / email thread leave you genuinely unable to choose between options. Provide the exact question text as `question` and the alternatives you are weighing as `options` (each a short phrase). The executor sends the email and pauses; the supervisor reply will be classified by the next plan.',
+    argsSchema: null,
+  },
+  {
+    kind: 'await_plant_invoice',
+    description: 'Sentinel — pause execution until the plant emails an invoice. The next plant reply will resume.',
+    argsSchema: null,
+  },
+  {
+    kind: 'await_vt01n',
+    description: 'Sentinel — pause until the operator (or pipeline) fires VT01N for the shipment.',
+    argsSchema: null,
+  },
 ];
 
 function renderStepVocabulary(): string {
   const lines = ['AVAILABLE STEP KINDS (you MUST pick `kind` values from this list):'];
   for (const s of STEP_KINDS) {
-    lines.push(`- ${s.kind}: ${s.description}`);
+    if (s.argsSchema) {
+      lines.push(`- ${s.kind}: ${s.description}`);
+      lines.push(`    args: ${s.argsSchema}`);
+    } else {
+      lines.push(`- ${s.kind}: ${s.description}  (no args)`);
+    }
   }
   return lines.join('\n');
 }
@@ -241,11 +404,15 @@ function renderSoState(s: SoStateSnapshot): string {
 
 const VALID_STEP_KINDS = STEP_KINDS.map((s) => s.kind) as [StepKind, ...StepKind[]];
 
+// Args schema is shape-only — we trust the planner to emit the right fields
+// per the step kind. Executor coerces and routes coercion failures through
+// the `scenario_failed` path, which re-triggers the planner on next tick.
 const PlannedStepSchema = z.object({
   kind: z.enum(VALID_STEP_KINDS),
   rationale: z.string().optional(),
   question: z.string().optional(),
   options: z.array(z.string()).optional(),
+  args: z.record(z.string(), z.unknown()).optional(),
 });
 
 const PlanResultSchema = z.object({
@@ -266,12 +433,19 @@ OUTPUT FORMAT — RETURN STRICT JSON. NO MARKDOWN. NO PROSE OUTSIDE THE JSON.
 {
   "rationale": "Short explanation of what the latest email is asking for and why these steps follow.",
   "steps": [
-    { "kind": "<step_kind from vocab above>", "rationale": "why this step" }
+    { "kind": "<step_kind from vocab above>", "rationale": "why this step", "args": { /* per the step's argsSchema, omit if the step has no args */ } }
   ],
   "stop_after_index": <integer — the LAST index in steps that fires before we pause; usually points at the last outbound email step>,
   "escalate": false,
   "escalation_question": null
 }
+
+Examples of step objects with args (shape per AVAILABLE STEP KINDS argsSchema):
+  { "kind": "va02", "rationale": "branch asked to bump M-A to 257", "args": { "materials": [{ "code": "M-A", "op": "inc", "qty": 257 }] } }
+  { "kind": "zload2", "rationale": "decrease M-B to 80 on LS 12345", "args": { "revisions": [{ "lsNumber": "12345", "material": "M-B", "qty": 80 }] } }
+  { "kind": "email_to_plant", "rationale": "branch shared truck details", "args": { "vehicles": [{ "vehicleNumber": "MH12AB1234", "driverMobile": "9999999999", "containerNumber": "" }] } }
+  { "kind": "process_tonnage_reply", "rationale": "branch shared 35 t", "args": { "tonnage": { "value": 35, "unit": "t" } } }
+  { "kind": "zso_visibility", "rationale": "plant confirmed 2nd release" }  // no args
 
 For the three question-asking step kinds — email_clarify_branch, email_clarify_plant, email_supervisor_question — the step object MUST also include:
 { "kind": "email_clarify_branch", "rationale": "...", "question": "<exact text to send>" }
@@ -288,9 +462,11 @@ RULES:
      - You MAY still emit non-bundle, non-truck steps that don't depend on tonnage (e.g. process_plant_invoice on a separate flow, email_order_status for a status question).
 1. Plan up to and including the NEXT outbound email. STOP at that email. The next inbound email will trigger a fresh plan call.
 2. Pick step kinds ONLY from the AVAILABLE STEP KINDS list. Out-of-vocab values are rejected.
-3. You emit step KINDS ONLY. Do NOT emit data values (quantities, materials, vehicle numbers, etc.). Each step's executor reads what it needs from the email thread / DB on its own. Your job is to choose the right sequence of milestones, nothing more.
+3. EVERY step that has an argsSchema in AVAILABLE STEP KINDS MUST include an \`args\` object matching that schema. The args you emit are passed VERBATIM to the executor — no downstream LLM re-extracts them from the email body. You have the full email thread above; read it and fill the args in. Use the SAME material codes / LS numbers / vehicle numbers the email thread uses (do not invent or normalise). If a step's argsSchema is null/none, omit \`args\` entirely.
+   For SAP-mutating steps (va02, zload2, zloading_close, stock_precheck) the args drive REAL transactions. If you would have to guess to fill them in, do NOT emit the step — emit email_clarify_branch / email_clarify_plant instead (see rule 15).
 4. If you are unsure what the email means, or the right action requires authority you don't have, set escalate=true and put the question in escalation_question. Leave steps as [].
-5. Re-read the audit trail. If a step has ALREADY been completed, do not repeat it. Example: if ZLOAD1 already fired, modifying qty must use zload2, never zload1.
+5. Re-read the audit trail. The trail lists every step that has already completed on this SO (step_completed events). DO NOT re-emit a step the trail shows as completed unless the latest inbound is explicitly asking for a re-do. The engine no longer suppresses duplicates for you — YOU are the suppression. If the latest inbound looks like one you have already handled (e.g. a dispatch_confirmation was already sent this round and the branch's reply is "ok, confirmed"), either (i) continue forward to the next stage, (ii) emit nothing and STOP (steps=[], stop_after_index=-1), or (iii) emit email_clarify_* if you can't tell why we're being re-triggered.
+   Example: if ZLOAD1 already fired (step_completed zload1 in audit), modifying qty must use zload2, never zload1.
 
 THE STANDARD DISPATCH SEQUENCE (memorise this — every order goes through it):
 
@@ -384,10 +560,12 @@ ANYTIME / OTHER:
 
 WHEN A REPLY IS UNCLEAR / INCOMPLETE — ASK A CLARIFYING QUESTION:
  15. If the latest inbound is ambiguous, contradictory, or only partially answers what we asked, emit a single email_clarify_branch (or email_clarify_plant if the sender was the plant) step. STOP. Provide the exact question on the step as the "question" field. The reply will trigger a fresh plan.
+     - **Clarify-on-guess (hard rule).** If filling in the \`args\` for a SAP-mutating step (va02, zload2, zloading_close, stock_precheck) would require you to GUESS — material code not clearly stated, quantity ambiguous or missing, batch unclear, vehicle number partial, bundle assignment unclear — you MUST emit email_clarify_* instead. Confidence threshold is HIGH: only proceed if the reply explicitly names the material AND the new quantity (or material AND delete). Wrong args land in SAP unchecked, so when in doubt, ask.
      - Example: we asked for vehicle tonnage AND truck number; the branch replied only with the truck number → emit email_clarify_branch with question="You shared the truck number. Could you also confirm the vehicle tonnage (in tonnes)?".
      - Example: branch replied "modify the order" with no material code or quantity → emit email_clarify_branch asking for the specific material + new quantity.
+     - Example: branch replied "increase M-A" with no number → emit email_clarify_branch asking for the new total quantity.
      - Keep the question SHORT (1–3 sentences). Quote back the part of their message you understood so they know you read it. Do not invent details. Do not ask more than one question per email unless they are tightly linked.
-     - Do NOT use clarification as a stalling move. If the reply is clearly actionable, ACT. Use a clarification only when proceeding without the missing fact would be wrong or destructive.
+     - Do NOT use clarification as a stalling move. If the reply is clearly actionable AND the args can be filled in unambiguously from the thread, ACT. Use clarification only when proceeding without the missing fact would be wrong or destructive.
 
 WHEN YOU ARE STUCK — ASK THE SUPERVISOR:
  16. If you genuinely cannot decide what step to take next — for example the audit trail looks inconsistent, two rules above seem to conflict, or the email asks for something outside the standard process — emit a single email_supervisor_question step. STOP. On the step provide:
@@ -437,6 +615,47 @@ async function buildUserPrompt(args: {
 // Public entry point
 // -----------------------------------------------------------------------------
 
+/**
+ * Write the literal (system, user) prompt pair for this plan call to a file
+ * under `test_artifacts/planner-prompts/` for offline inspection. Gated on
+ * the PLANNER_DUMP_PROMPTS env flag so prod stays clean.
+ *
+ * Filename: `<UTC-timestamp>__<soNumber>__<triggerEmailId>.txt`
+ *   - Timestamp first → lexicographic sort == chronological sort.
+ *   - soNumber second → easy human-scan inside the folder.
+ *   - triggerEmailId last → guarantees uniqueness; a single trigger that
+ *     gets retried (e.g. zod-parse failure → re-plan on next tick) writes
+ *     a second file with a different timestamp prefix.
+ *
+ * Any failure here is swallowed — the dump must never break a real plan call.
+ */
+async function dumpPromptToFile(
+  salesOrderId: string,
+  triggerEmailId: string,
+  systemPrompt: string,
+  userPrompt: string,
+): Promise<void> {
+  if ((process.env.PLANNER_DUMP_PROMPTS ?? 'false').toLowerCase() !== 'true') return;
+  try {
+    const so = await prisma.salesOrder.findUnique({
+      where: { id: salesOrderId },
+      select: { soNumber: true },
+    });
+    const soNumber = so?.soNumber ?? 'unknown';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const dir = path.join(process.cwd(), 'test_artifacts', 'planner-prompts');
+    fs.mkdirSync(dir, { recursive: true });
+    const filePath = path.join(dir, `${ts}__${soNumber}__${triggerEmailId}.txt`);
+    const content =
+      `=== SYSTEM ===\n${systemPrompt}\n\n=== USER ===\n${userPrompt}\n`;
+    fs.writeFileSync(filePath, content, 'utf8');
+  } catch (err) {
+    console.warn(
+      `[llm-planner] PLANNER_DUMP_PROMPTS write failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 export async function planNextSteps(args: {
   salesOrderId: string;
   triggerEmailId: string;
@@ -444,6 +663,8 @@ export async function planNextSteps(args: {
 }): Promise<PlanResult> {
   const systemPrompt = loadManagerPrompt();
   const userPrompt = await buildUserPrompt(args);
+
+  await dumpPromptToFile(args.salesOrderId, args.triggerEmailId, systemPrompt, userPrompt);
 
   const openai = new OpenAI();
   const completion = await openai.chat.completions.create({

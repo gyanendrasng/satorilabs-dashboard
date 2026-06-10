@@ -20,8 +20,9 @@ export type ScenarioEventType =
   | 'scenario_completed'
   | 'scenario_aborted'
   | 'scenario_failed'
-  // Phase 2 (unified classifier): emitted when classifyReply returns
-  // action='other' and the reply is escalated to a human supervisor.
+  // Emitted when an inbound reply is escalated to the human supervisor
+  // (either via planner-emitted email_supervisor_question or a dispatcher
+  // fallback when no actionable plan can be produced).
   | 'email_escalated';
 
 export interface EmitEventArgs {

@@ -1,15 +1,16 @@
 /**
- * Scenario engine — the state-machine that walks a Scenario's step list, one
- * external event at a time. Persists progress in ScenarioProgress so we
- * survive process restarts and serverless cold starts.
+ * Scenario engine — the state-machine that walks a planner-emitted step
+ * list, one external event at a time. Persists progress in ScenarioProgress
+ * so we survive process restarts and serverless cold starts.
  *
  * Entry points:
- *   - handleReplyV2:        invoked from handleBranchReply (feature-flag gated)
- *                           or from email-reply-checker for plant modifications
- *   - handleSecondReleaseReply: invoked from email-reply-checker when a branch
- *                           reply lands on a '2nd_release' email
+ *   - handleReplyV2:        invoked from email-reply-checker for every
+ *                           SO-tied inbound. Calls the LLM planner and
+ *                           walks the returned step list.
+ *   - handleSecondReleaseReply: thin wrapper around handleReplyV2 kept for
+ *                           external callers (test scripts).
  *   - maybeAdvanceScenario: called from /step-status and from
- *                           checkAndSendBatchToAman / triggerVto1n success paths
+ *                           checkAndSendBatchToAman / triggerVto1n success paths.
  *
  * The engine is dormant when SCENARIO_ENGINE_ENABLED !== 'true'.
  */
@@ -19,15 +20,22 @@ import {
   sendReplyEmail,
   getMessageRfc822Id,
 } from './gmail';
-import { type BranchReplyIntent } from './branch-reply-classifier';
-import { classifyDispatchConfirmation } from './dispatch-confirmation-classifier';
 import {
   deriveStage,
   type Step,
   type StepKind,
 } from './dispatch-scenarios';
 import type { PlannedStep } from './llm-planner';
-import type { MaterialModification } from './material-modification-extractor';
+
+// Per-material modification shape used by the planner-driven email senders
+// (sendSecondReleaseEmail, sendPlantChangeNotificationEmail). The planner emits
+// args of this shape; the senders render them into the outbound body.
+type EmailMaterialMod = {
+  material_code: string;
+  batch: string;
+  quantity: number;
+  operation?: 'keep' | 'increase' | 'decrease' | 'delete';
+};
 
 // -----------------------------------------------------------------------------
 // Planner-mode step list: every active ScenarioProgress in the new code path
@@ -147,43 +155,16 @@ export function isScenarioEngineEnabled(): boolean {
   return (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true';
 }
 
-/**
- * Phase 2 unified-classifier flag. When true, handleReplyV2 dispatches non-
- * scenario LLM actions (dispatch_confirmation_decision, vehicle_details_extraction,
- * etc.) to the appropriate refactored handler with pre-classified fields,
- * instead of coercing them to 'unknown' (today's behavior).
- *
- * Defaults to false — until Phase 3 collapses the email-reply-checker switch,
- * the only callers of handleReplyV2 are scenario-shaped emails, so the
- * dispatcher's non-scenario branches stay dormant.
- */
-export function isUnifiedClassifierEnabled(): boolean {
-  return (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
-}
-
-/**
- * Phase F (segmented execution). When true, each scenario walks until the
- * first outbound email then marks itself `completed`. Subsequent inbound
- * emails re-enter handleReplyV2 → classifyReply to pick a new sheet row.
- *
- * Defaults to false — preserves the legacy multi-segment behavior where one
- * scenario row runs to the end with multiple `awaiting_reply` pauses.
- */
-export function isSegmentedExecutionEnabled(): boolean {
-  return (process.env.SEGMENTED_EXECUTION_ENABLED ?? 'false').toLowerCase() === 'true';
-}
+// Segmented-execution semantics are now the only mode: every scenario walks
+// up to the first outbound email and marks itself `completed`. The next
+// inbound re-enters the planner from scratch. The legacy "one ScenarioProgress
+// runs end-to-end with multiple awaiting_reply pauses" model has been
+// retired; the previous gate (isSegmentedExecutionEnabled / SEGMENTED_EXECUTION_ENABLED)
+// is removed. Likewise the unified-classifier gate (UNIFIED_CLASSIFIER_ENABLED)
+// is gone — the planner is the single entry point for every inbound.
 
 // -----------------------------------------------------------------------------
-// Plant-reply classifier — same shape as classifyBranchReply but tighter prompt.
-// Plants only send `modify` (a quantity correction) or an invoice PDF.
-// The legacy `classifyPlantReply` was removed in Phase E — the LLM
-// scenario selector in src/lib/scenario-selector.ts handles both branch
-// and plant senders through a single Manager prompt with sender-filtered
-// valid scenario keys.
-// -----------------------------------------------------------------------------
-
-// -----------------------------------------------------------------------------
-// 2nd-release email — the only genuinely new email type
+// 2nd-release email
 // -----------------------------------------------------------------------------
 
 /**
@@ -193,7 +174,7 @@ export function isSegmentedExecutionEnabled(): boolean {
  */
 export async function sendSecondReleaseEmail(args: {
   salesOrderId: string;
-  modifications: BranchReplyIntent['materials'];
+  modifications: EmailMaterialMod[];
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
   const { salesOrderId, modifications, log } = args;
@@ -235,7 +216,7 @@ export async function sendSecondReleaseEmail(args: {
   });
 
   // Index modifications by material code for quick lookup.
-  const modsByCode = new Map<string, BranchReplyIntent['materials'][number]>();
+  const modsByCode = new Map<string, EmailMaterialMod>();
   for (const m of modifications) {
     if (m.operation && m.operation !== 'keep') modsByCode.set(m.material_code, m);
   }
@@ -506,7 +487,7 @@ export async function sendOrderStatusEmail(args: {
  */
 export async function sendPlantChangeNotificationEmail(args: {
   salesOrderId: string;
-  modifications: BranchReplyIntent['materials'];
+  modifications: EmailMaterialMod[];
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
   const { salesOrderId, modifications, log } = args;
@@ -758,18 +739,15 @@ export async function handleSecondReleaseReply(
 }
 
 // -----------------------------------------------------------------------------
-// Main entry: handleReplyV2 — Phase E (LLM-as-scenario-selector)
+// Main entry: handleReplyV2 — LLM planner dispatch
 //
 // 1. Loads the email + SO.
 // 2. Detects active scenario (most recent non-terminal ScenarioProgress).
-// 3. Renders the email thread + builds material list + filters valid keys.
-// 4. Calls the LLM Manager (selectScenarioForReply).
-// 5. Handles 4 outcomes:
-//    a. fresh + valid key       → create new ScenarioProgress, fire step 0
-//    b. fresh + 'unknown'       → escalate (aborted ScenarioProgress)
-//    c. mid-flow + abort_and_replace → abort old + start new
-//    d. mid-flow + escalate     → abort old (operator review)
-// 6. Emits ScenarioEvent at every transition.
+// 3. Calls planNextSteps (src/lib/llm-planner.ts) with the SO's audit trail
+//    + email thread; the planner emits the next step list including args.
+// 4. Creates a new ScenarioProgress and walks the step list up to the next
+//    outbound email. Aborts any prior in-flight scenario for this SO.
+// 5. Emits ScenarioEvent at every transition.
 // -----------------------------------------------------------------------------
 
 export async function handleReplyV2(args: {
@@ -1058,13 +1036,6 @@ async function handleAnytimeIntent(args: {
   });
 }
 
-// -----------------------------------------------------------------------------
-// Phase 2: dispatcher for non-scenario classifier actions. Called from
-// handleReplyV2 when UNIFIED_CLASSIFIER_ENABLED=true and the LLM picked
-// something other than 'scenario'. Routes to the refactored handlers with
-// pre-classified fields so each handler skips its own classifier call.
-// -----------------------------------------------------------------------------
-
 // Helper used by handleReplyV2 for compact email excerpts in event payloads.
 function stripAndExcerpt(html: string, maxLen: number): string {
   const stripped = html
@@ -1088,8 +1059,8 @@ export async function executeScenario(args: {
   const log = args.log ?? ((m: string) => console.log(`[${new Date().toISOString()}] ${m}`));
 
   // The most recent non-terminal progress is the "active" one — there can
-  // be multiple historical rows per SO (aborted, completed) since the unique
-  // constraint was dropped in Phase E.
+  // be multiple historical rows per SO (aborted, completed) since each new
+  // inbound starts a fresh ScenarioProgress.
   const progress = await prisma.scenarioProgress.findFirst({
     where: {
       salesOrderId: args.salesOrderId,
@@ -1255,116 +1226,30 @@ export async function executeScenario(args: {
 
 type FireResult = 'pause' | 'advance_now' | 'complete_segment';
 
-/**
- * DB-state fallback for the per-material modification extractor.
- *
- * Used by zload2 / zloading_close when the LLM extractor returns no
- * modifications on the trigger reply — e.g. the trigger is a bare "yes"
- * on a round-2 dispatch_confirmation, AFTER va02 + zso_visibility have
- * already moved the SO into its new state. In that path the canonical
- * source of truth is the DB:
- *
- *   - Material.orderQuantity per material = the NEW target (written by the
- *     most recent zso_visibility callback after va02).
- *   - sum(LoadingSlipItem.orderQuantity) per material = what's currently
- *     loaded onto the LSs in SAP (unchanged since the original ZLOAD1).
- *
- * Wherever the two disagree AND an LSI line exists, that's an unapplied
- * modification we still need to push to SAP. Returns the same shape the
- * LLM extractor produces so callers can swap it in transparently.
- *
- * Stockouts (Material.orderQuantity > 0, no LSI created because there was
- * nothing to load) are excluded — they're not a zload2 case, they're a
- * fresh-zload1 / never-ordered case.
- */
-async function computeModificationsFromDbDelta(salesOrderId: string): Promise<{
-  increases: MaterialModification[];
-  decreases: MaterialModification[];
-  deletes: MaterialModification[];
-  // material code → quantity on the LS BEFORE the unapplied modification.
-  // Only populated for materials that ended up in increases/decreases/deletes,
-  // so the caller can render "was N" alongside the new quantity in logs.
-  wasQtyByMaterial: Map<string, number>;
-}> {
-  const [materialRows, lsiRows] = await Promise.all([
-    prisma.material.findMany({
-      where: { salesOrderId },
-      select: { material: true, orderQuantity: true },
-    }),
-    prisma.loadingSlipItem.findMany({
-      where: { salesOrderId },
-      select: { material: true, orderQuantity: true },
-    }),
-  ]);
-
-  const materialQty = new Map<string, number>();
-  for (const r of materialRows) {
-    materialQty.set(r.material, (materialQty.get(r.material) ?? 0) + (r.orderQuantity ?? 0));
-  }
-  const lsiQty = new Map<string, number>();
-  for (const r of lsiRows) {
-    lsiQty.set(r.material, (lsiQty.get(r.material) ?? 0) + (r.orderQuantity ?? 0));
-  }
-
-  const increases: MaterialModification[] = [];
-  const decreases: MaterialModification[] = [];
-  const deletes: MaterialModification[] = [];
-  const wasQtyByMaterial = new Map<string, number>();
-  const allCodes = new Set<string>([...materialQty.keys(), ...lsiQty.keys()]);
-
-  for (const code of allCodes) {
-    const matQty = materialQty.get(code) ?? 0;
-    const lsiSum = lsiQty.get(code) ?? 0;
-    // No LSI for this material → outside zload2/zloading_close territory.
-    if (lsiSum <= 0) continue;
-    const delta = matQty - lsiSum;
-    if (delta === 0) continue;
-    wasQtyByMaterial.set(code, lsiSum);
-    if (matQty <= 0) {
-      deletes.push({ material_code: code, operation: 'delete', quantity: undefined });
-    } else if (delta > 0) {
-      increases.push({ material_code: code, operation: 'increase', quantity: matQty });
-    } else {
-      decreases.push({ material_code: code, operation: 'decrease', quantity: matQty });
-    }
-  }
-
-  return { increases, decreases, deletes, wasQtyByMaterial };
-}
-
 async function fireStep(
   step: Step,
   progress: { id: string; salesOrderId: string; classifierOutput: string },
   _plannedStep: PlannedStep | undefined,
   log: (msg: string) => void,
 ): Promise<FireResult> {
-  // In planner mode, fireStep cases that need data from the inbound reply
-  // call loadTriggerReply() + extractMaterialModifications() themselves —
-  // the LLM planner only emits step kinds, never data. Cases that work off
-  // DB state alone (stock_precheck, zso_visibility, zload1, ...) don't need
-  // any extraction at all.
+  // Planner-driven mode: each step carries its own `args` (read by the LLM
+  // planner directly from the email thread). Handlers coerce those args into
+  // the typed Prisma payloads via `./planner-step-args`. No second LLM extractor
+  // runs here. DB-only steps (zso_visibility, zload1, ...) ignore args.
 
   switch (step.kind) {
     // -------- Pre-VA02 free-stock gate (replaces "Zmatana" Step 2) --------
     case 'stock_precheck': {
       const { runStockPrecheck } = await import('./stock-precheck');
-      const { extractMaterialModifications } = await import('./material-modification-extractor');
-      const trigger = await loadTriggerReply(progress.id);
-      if (!trigger) {
-        log('[ENGINE] stock_precheck — no trigger reply; assuming sufficient and advancing');
-        return 'advance_now';
-      }
-      const mods = await extractMaterialModifications({
-        salesOrderId: progress.salesOrderId,
-        replyHtml: trigger.replyHtml,
-      });
+      const { coerceStockPrecheckArgs } = await import('./planner-step-args');
+      const materials = coerceStockPrecheckArgs(_plannedStep);
       const result = await runStockPrecheck({
         salesOrderId: progress.salesOrderId,
         classification: {
-          materials: mods.materials.map((m) => ({
+          materials: materials.map((m) => ({
             material_code: m.material_code,
-            operation: m.operation ?? 'keep',
-            quantity: m.quantity ?? 0,
+            operation: m.operation,
+            quantity: m.quantity,
           })),
         },
       });
@@ -1447,29 +1332,10 @@ async function fireStep(
       // value. Run ONLY for materials whose quantity is being INCREASED;
       // decreases and deletes are handled downstream (zload2, zloading_close).
       //
-      // The planner emitted this step kind without data; we extract the
-      // modification list from the trigger reply ourselves.
-      const trigger = await loadTriggerReply(progress.id);
-      if (!trigger) {
-        log('[ENGINE] va02 — no trigger reply found; cannot extract modifications. Aborting.');
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: 'va02 step but no trigger reply on ScenarioProgress' },
-        });
-        return 'pause';
-      }
-      const { extractMaterialModifications } = await import('./material-modification-extractor');
-      const mods = await extractMaterialModifications({
-        salesOrderId: progress.salesOrderId,
-        replyHtml: trigger.replyHtml,
-      });
-      const items = mods.increases
-        .filter((m) => m.quantity !== undefined && m.quantity > 0)
-        .map((m) => ({ material: m.material_code, orderQuantity: m.quantity! }));
-      if (items.length === 0) {
-        log('[ENGINE] va02 — extractor found no increase materials in reply; skipping');
-        return 'advance_now';
-      }
+      // Materials + new quantities come from the planner step args. The planner
+      // reads the email thread and emits them directly; no extractor here.
+      const { coerceVa02Args } = await import('./planner-step-args');
+      const items = coerceVa02Args(_plannedStep);
       const soNumber = await soNumberFor(progress.salesOrderId);
       log(`[ENGINE] va02 firing for ${items.length} increase line(s): ${items.map((i) => `${i.material}→${i.orderQuantity}`).join(', ')}`);
       await triggerVa02(soNumber, items);
@@ -1504,43 +1370,14 @@ async function fireStep(
       // modified. SAP opens the LS, expects the material to be on it, and
       // fails outright otherwise.
       //
-      // Each material we modify is resolved to its LS via the LSI table
-      // (LSI = which materials sit on which LS). When the branch modifies
-      // materials that live on different LSs, we fire ONE ZLOAD2 per LS.
-      const trigger = await loadTriggerReply(progress.id);
-      if (!trigger) {
-        log('[ENGINE] zload2 — no trigger reply found; cannot extract modifications. Aborting.');
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: 'zload2 step but no trigger reply on ScenarioProgress' },
-        });
-        return 'pause';
-      }
-      const { extractMaterialModifications } = await import('./material-modification-extractor');
-      const mods = await extractMaterialModifications({
-        salesOrderId: progress.salesOrderId,
-        replyHtml: trigger.replyHtml,
-      });
-      let requested = [...mods.increases, ...mods.decreases]
-        .filter((m) => m.quantity !== undefined && m.quantity > 0);
-      if (requested.length === 0) {
-        // DB-delta fallback. Trigger reply ("yes" on a round-2
-        // dispatch_confirmation, post-VA02) carries no material text but
-        // the unapplied modification is sitting in Material vs LSI.
-        log('[ENGINE] zload2 — extractor found no inc/dec materials in reply; checking DB-delta fallback');
-        const delta = await computeModificationsFromDbDelta(progress.salesOrderId);
-        const fromDelta = [...delta.increases, ...delta.decreases];
-        if (fromDelta.length === 0) {
-          log('[ENGINE] zload2 — DB delta shows no inc/dec either; skipping');
-          return 'advance_now';
-        }
-        log(`[ENGINE] zload2 — using DB-delta fallback: ${fromDelta.map((m) => `${m.material_code} ${m.operation} ${delta.wasQtyByMaterial.get(m.material_code) ?? '?'}→${m.quantity}`).join(', ')}`);
-        requested = fromDelta;
-      }
+      // The planner emits {lsNumber?, material, batch?, qty} per revision.
+      // When lsNumber/batch are omitted we resolve them via the LSI table
+      // (the source of truth for "which materials sit on which LS").
+      const { coerceZload2Args } = await import('./planner-step-args');
+      const requested = coerceZload2Args(_plannedStep);
 
-      // Resolve each requested material → its (lsNumber, batch). Source of
-      // truth is the LSI table: a row for (salesOrderId, material) tells us
-      // which LS holds that material. Batch comes from the Material row.
+      // Fallback batch lookup: when the planner omits batch, Material rows
+      // hold the SO-level batch — same as the pre-arg-era resolution path.
       const materialRows = await prisma.material.findMany({
         where: { salesOrderId: progress.salesOrderId },
         select: { material: true, batch: true },
@@ -1552,52 +1389,57 @@ async function fireStep(
         }
       }
 
-      // Group materials by LS. One ZLOAD2 call per LS. Each LSI carries
-      // its own batch (post-LoadingSlip refactor), so we read batch from
-      // the LSI directly. The Material.batch fallback is only used when
-      // an LSI hasn't been populated yet (pre-PDF-parser fallback rows).
+      // Group revisions by LS. One ZLOAD2 call per LS.
       type LsBucket = { lsNumber: string; items: Array<{ material: string; batch: string; orderQuantity: number }> };
       const byLs = new Map<string, LsBucket>();
       const unresolved: string[] = [];
       const ambiguous: string[] = [];
 
-      for (const m of requested) {
-        // Find every LSI row that carries this material on this SO. With
-        // per-batch LSIs the same material can have multiple rows (across
-        // batches and/or LSs). If we get >1 distinct (lsNumber, batch)
-        // combinations, the modification is ambiguous — branch said
-        // "reduce M-A by 20" but M-A lives on 3 different lines. Surface
-        // to the operator rather than guess.
-        const lsiRows = await prisma.loadingSlipItem.findMany({
-          where: { salesOrderId: progress.salesOrderId, material: m.material_code },
-          select: { lsNumber: true, batch: true },
-        });
-        if (lsiRows.length === 0) {
-          unresolved.push(m.material_code);
+      for (const r of requested) {
+        // Resolve (lsNumber, batch) for this revision.
+        // 1. If both planner-supplied, use as-is.
+        // 2. If only material is supplied, find LSI rows for (so, material)
+        //    and disambiguate.
+        let targetLs = r.lsNumber;
+        let targetBatch = r.batch;
+
+        if (!targetLs || !targetBatch) {
+          const lsiRows = await prisma.loadingSlipItem.findMany({
+            where: {
+              salesOrderId: progress.salesOrderId,
+              material: r.material,
+              ...(targetLs ? { lsNumber: targetLs } : {}),
+              ...(targetBatch ? { batch: targetBatch } : {}),
+            },
+            select: { lsNumber: true, batch: true },
+          });
+          if (lsiRows.length === 0) {
+            unresolved.push(r.material);
+            continue;
+          }
+          const distinctTargets = new Set(lsiRows.map((row) => `${row.lsNumber}|${row.batch}`));
+          if (distinctTargets.size > 1) {
+            ambiguous.push(`${r.material} → ${[...distinctTargets].join(' / ')}`);
+            continue;
+          }
+          const hit = lsiRows[0];
+          targetLs = targetLs ?? hit.lsNumber;
+          targetBatch = targetBatch ?? hit.batch ?? batchByCode.get(r.material);
+        }
+        if (!targetLs) {
+          unresolved.push(`${r.material} (no LS found)`);
           continue;
         }
-        const distinctTargets = new Set(lsiRows.map((r) => `${r.lsNumber}|${r.batch}`));
-        if (distinctTargets.size > 1) {
-          ambiguous.push(
-            `${m.material_code} → ${[...distinctTargets].join(' / ')}`
-          );
+        if (!targetBatch) {
+          unresolved.push(`${r.material} (no batch on LSI or Material)`);
           continue;
         }
-        const target = lsiRows[0];
-        // Prefer the LSI's own batch (authoritative per PDF). Fall back to
-        // the SO-level Material.batch if the LSI was created via the
-        // PENDING fallback and never enriched.
-        const batch = target.batch || batchByCode.get(m.material_code);
-        if (!batch) {
-          unresolved.push(`${m.material_code} (no batch on LSI or Material)`);
-          continue;
-        }
-        let bucket = byLs.get(target.lsNumber);
+        let bucket = byLs.get(targetLs);
         if (!bucket) {
-          bucket = { lsNumber: target.lsNumber, items: [] };
-          byLs.set(target.lsNumber, bucket);
+          bucket = { lsNumber: targetLs, items: [] };
+          byLs.set(targetLs, bucket);
         }
-        bucket.items.push({ material: m.material_code, batch, orderQuantity: m.quantity! });
+        bucket.items.push({ material: r.material, batch: targetBatch, orderQuantity: r.orderQuantity });
       }
 
       if (unresolved.length > 0) {
@@ -1634,53 +1476,37 @@ async function fireStep(
       // SAP transaction is keyed on a specific LS number, so we must
       // resolve each material → its LS via the LSI table and fan out one
       // call per distinct LS.
-      const trigger = await loadTriggerReply(progress.id);
-      if (!trigger) {
-        log('[ENGINE] zloading_close — no trigger reply found; aborting.');
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: 'zloading_close step but no trigger reply' },
-        });
-        return 'pause';
-      }
-      const { extractMaterialModifications } = await import('./material-modification-extractor');
-      const mods = await extractMaterialModifications({
-        salesOrderId: progress.salesOrderId,
-        replyHtml: trigger.replyHtml,
-      });
-      let codes = mods.deletes.map((m) => m.material_code);
-      if (codes.length === 0) {
-        // DB-delta fallback. After va02-with-delete + re-visibility,
-        // a material's Material row drops to qty 0 (or disappears) while
-        // its LSI row still exists — that's the delete we need to push.
-        log('[ENGINE] zloading_close — extractor found no delete materials; checking DB-delta fallback');
-        const delta = await computeModificationsFromDbDelta(progress.salesOrderId);
-        if (delta.deletes.length === 0) {
-          log('[ENGINE] zloading_close — DB delta shows no deletes either; skipping');
-          return 'advance_now';
-        }
-        log(`[ENGINE] zloading_close — using DB-delta fallback: deleting ${delta.deletes.map((m) => `${m.material_code} (was ${delta.wasQtyByMaterial.get(m.material_code) ?? '?'})`).join(', ')}`);
-        codes = delta.deletes.map((m) => m.material_code);
-      }
+      //
+      // The planner emits {lsNumber?, material, batch?} per deletion. We
+      // resolve lsNumber via LSI when omitted. Batch isn't required for
+      // ZLOAD_Delete (deletion is by material on the LS), so we ignore it.
+      const { coerceZloadingCloseArgs } = await import('./planner-step-args');
+      const deletions = coerceZloadingCloseArgs(_plannedStep);
 
-      // Group delete codes by LS. A material can sit on multiple LSs (or
-      // multiple batches on the same LS); deletion removes ALL lines for
-      // that material on whatever LSs it appears, since the branch said
-      // "drop M-C" without qualifying by batch.
+      // Group delete codes by LS. When the planner supplies an explicit
+      // lsNumber, target only that LS. Otherwise look up every LSI row for
+      // the material on this SO — a material can sit on multiple LSs.
       const byLs = new Map<string, Set<string>>();
       const unresolved: string[] = [];
-      for (const code of codes) {
+      for (const d of deletions) {
+        if (d.lsNumber) {
+          // Trust the planner: just queue the delete on the stated LS.
+          const bucket = byLs.get(d.lsNumber) ?? new Set<string>();
+          bucket.add(d.material);
+          byLs.set(d.lsNumber, bucket);
+          continue;
+        }
         const lsiRows = await prisma.loadingSlipItem.findMany({
-          where: { salesOrderId: progress.salesOrderId, material: code },
+          where: { salesOrderId: progress.salesOrderId, material: d.material },
           select: { lsNumber: true },
         });
         if (lsiRows.length === 0) {
-          unresolved.push(code);
+          unresolved.push(d.material);
           continue;
         }
         for (const r of lsiRows) {
           const bucket = byLs.get(r.lsNumber) ?? new Set<string>();
-          bucket.add(code);
+          bucket.add(d.material);
           byLs.set(r.lsNumber, bucket);
         }
       }
@@ -1707,8 +1533,7 @@ async function fireStep(
     }
 
     case 'zload1': {
-      // Fan out ZLOAD1 per (Bundle, SO) pair via the shared helper. Same
-      // code path as handleDispatchConfirmation's 'yes' branch, so the
+      // Fan out ZLOAD1 per (Bundle, SO) pair via the shared helper. The
       // /step-status callback advances the engine on each completion.
       const so = await prisma.salesOrder.findUnique({
         where: { id: progress.salesOrderId },
@@ -1726,76 +1551,28 @@ async function fireStep(
       return 'pause';
     }
 
-    // -------- existing email senders --------
-    // In segmented-execution mode (SEGMENTED_EXECUTION_ENABLED=true) each
-    // outbound email step marks the scenario `completed` and stops; the next
-    // inbound email re-classifies into a new sheet row.
+    // -------- email senders --------
+    // Each outbound email step marks the scenario `completed` and stops;
+    // the next inbound email triggers a fresh planner call.
     case 'email_confirm_product_details': {
-      // This step represents "ls_dispatch email is/was sent and branch
-      // has replied". When the engine reaches it, one of two situations
-      // applies:
-      //
-      //   (a) Fresh scenario triggered by a branch reply on ls_dispatch
-      //       (release_all / release_part / modify_delete). The
-      //       ls_dispatch is already sent AND the reply is already in;
-      //       the step is a milestone, not a wait. Advance.
-      //
-      //   (b) Post-VA02 re-visibility (modify_increase / inc_dec / inc_del).
-      //       The /visibility-data callback re-sends ls_dispatch; we
-      //       genuinely need to wait for the branch's reply on the
-      //       re-sent email. Segment-complete here.
-      //
-      // Distinguish: if a sent ls_dispatch email already exists for the
-      // PO AND it has a reply (replyHtml/repliedAt set), case (a) — advance.
-      // Otherwise case (b) — segment-complete and wait.
-      // Round-scoped reply detection. After a VA02 modification, the PO is
-      // on a new dispatchRound; the previous round's ls_dispatch has a
-      // replyHtml/repliedAt set (from the modification reply itself), so
-      // without scoping the engine would falsely "advance" through round-2
-      // without waiting for the branch's actual round-2 confirmation.
-      const so = await prisma.salesOrder.findUnique({
-        where: { id: progress.salesOrderId },
-        select: { purchaseOrderId: true },
-      });
-      const poRow = so?.purchaseOrderId
-        ? await prisma.purchaseOrder.findUnique({
-            where: { id: so.purchaseOrderId },
-            select: { dispatchRound: true },
-          })
-        : null;
-      const currentRound = poRow?.dispatchRound ?? 1;
-      // Match both `sent` and `replied` — once branch replies, the row
-      // flips to `replied`, and a `sent`-only filter would miss the row
-      // we actually need to inspect for replyHtml/repliedAt.
-      const lsDispatch = so?.purchaseOrderId
-        ? await prisma.email.findFirst({
-            where: {
-              purchaseOrderId: so.purchaseOrderId,
-              emailType: 'ls_dispatch',
-              status: { in: ['sent', 'replied'] },
-              dispatchRound: currentRound,
-            },
-            orderBy: { sentAt: 'desc' },
-            select: { id: true, replyHtml: true, repliedAt: true },
-          })
-        : null;
-      const alreadyReplied = !!(lsDispatch && (lsDispatch.replyHtml || lsDispatch.repliedAt));
-      if (alreadyReplied) {
-        log(`[ENGINE] email_confirm_product_details — round ${currentRound} ls_dispatch already sent + replied; advancing`);
-        return 'advance_now';
-      }
-      log(`[ENGINE] email_confirm_product_details — waiting for branch reply on round ${currentRound} ls_dispatch`);
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      // The ls_dispatch email is auto-sent by the zso_visibility callback;
+      // this step is just the "wait for branch reply" sentinel. The planner
+      // controls when this step is emitted (rule 5: don't repeat completed
+      // steps), so the engine no longer second-guesses with a round-scoped
+      // advance_now check — just wait.
+      log(`[ENGINE] email_confirm_product_details — waiting for branch reply on ls_dispatch`);
+      return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
 
     case 'email_confirm_bundle_details': {
       // Build the release plan from Material rows and send the
-      // dispatch_confirmation email. Previously this was a no-op stub that
-      // relied on the legacy `handleBranchReply` path to send the email
-      // — that path is bypassed when UNIFIED_CLASSIFIER_ENABLED is true,
-      // so without this the flow stalls (no email → no reply → no ZLOAD1).
+      // dispatch_confirmation email. The planner owns the decision to emit
+      // this step — if a prior dispatch_confirmation already covers what's
+      // needed, the planner reads its audit trail (rule 5) and doesn't emit.
+      // The engine no longer second-guesses with a round-scoped duplicate
+      // check.
       const { sendDispatchConfirmationEmail } = await import('./auto-gui-trigger');
       const so = await prisma.salesOrder.findUnique({
         where: { id: progress.salesOrderId },
@@ -1803,39 +1580,16 @@ async function fireStep(
       });
       if (!so?.purchaseOrderId) {
         log('[ENGINE] email_confirm_bundle_details — no PO; segment-completing');
-        if (isSegmentedExecutionEnabled()) return 'complete_segment';
+        return 'complete_segment';
         await markAwaitingReply(progress.id);
         return 'pause';
       }
 
-      // Round-scoped idempotency. After a VA02 modification, `email_2nd_release`
-      // bumps PO.dispatchRound so the next dispatch_confirmation belongs to a
-      // fresh round and is NOT skipped by the guard. Lets this handler be
-      // safely re-entered if the scenario re-fires within the same round.
-      const poRow = await prisma.purchaseOrder.findUnique({
-        where: { id: so.purchaseOrderId },
-        select: { dispatchRound: true },
-      });
-      const currentRound = poRow?.dispatchRound ?? 1;
-      // Match both `sent` and `replied` — once branch replies on the
-      // dispatch_confirmation the row flips to `replied`, and a `sent`-only
-      // filter would let a duplicate Dispatch Confirmation go out instead
-      // of routing to the diff-update path.
-      const alreadySent = await prisma.email.findFirst({
-        where: {
-          purchaseOrderId: so.purchaseOrderId,
-          emailType: 'dispatch_confirmation',
-          status: { in: ['sent', 'replied'] },
-          dispatchRound: currentRound,
-        },
-        select: { id: true },
-      });
-
       // Recompute the per-material dispatch quantity from scratch on every
       // run: min(orderQuantity, availableStock). Reading a prior round's
       // `dispatchQuantity` here was the source of the cross-round staleness
-      // bug — after branch revised orderQuantity 250 → 257, the guard kept
-      // returning 250 because that's what the previous round committed.
+      // bug — after branch revised orderQuantity 250 → 257, the previous
+      // value kept being returned.
       const materials = await prisma.material.findMany({
         where: { salesOrderId: progress.salesOrderId },
       });
@@ -1853,7 +1607,7 @@ async function fireStep(
 
       if (items.length === 0) {
         log('[ENGINE] email_confirm_bundle_details — no items with qty>0; segment-completing without email');
-        if (isSegmentedExecutionEnabled()) return 'complete_segment';
+        return 'complete_segment';
         await markAwaitingReply(progress.id);
         return 'pause';
       }
@@ -1882,29 +1636,6 @@ async function fireStep(
         totalWeightKg: totalKg,
       };
 
-      if (alreadySent) {
-        // A dispatch_confirmation already went out for this round — send a
-        // short diff reply on the same thread instead of duplicating the
-        // full form. dispatchRound only bumps on email_2nd_release, so a
-        // bumped round is the signal for a fresh full confirmation.
-        const { sendDispatchConfirmationUpdate } = await import('./auto-gui-trigger');
-        const result = await sendDispatchConfirmationUpdate({
-          purchaseOrderId: so.purchaseOrderId,
-          currentRound,
-          plans: [plan],
-          totalTonnes: totalKg / 1000,
-          log,
-        });
-        if (result.sent) {
-          log(`[ENGINE] email_confirm_bundle_details — round ${currentRound} diff update sent (replaced full dispatch_confirmation duplicate)`);
-        } else {
-          log(`[ENGINE] email_confirm_bundle_details — round ${currentRound} already has dispatch_confirmation ${alreadySent.id}; no diff (${result.reason ?? 'unknown'}); segment-completing`);
-        }
-        if (isSegmentedExecutionEnabled()) return 'complete_segment';
-        await markAwaitingReply(progress.id);
-        return 'pause';
-      }
-
       // Per-PO branch thread anchoring is handled inside sendDispatchConfirmationEmail.
       await sendDispatchConfirmationEmail({
         purchaseOrderId: so.purchaseOrderId,
@@ -1916,7 +1647,7 @@ async function fireStep(
       });
 
       log(`[ENGINE] email_confirm_bundle_details — dispatch_confirmation sent (${items.length} item(s), ${(totalKg / 1000).toFixed(2)}t)`);
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
@@ -1929,29 +1660,35 @@ async function fireStep(
       if (so?.purchaseOrderId) {
         await checkAndSendCombinedVehicleEmailForPo(so.purchaseOrderId);
       }
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
 
     case 'email_to_plant': {
-      // Branch's vehicle-details reply has arrived; extract truck/driver/LR,
-      // persist on the Bundle, and forward LS PDFs to the plant. The existing
-      // handleVehicleDetailsReply does extraction + persistence + sending in
-      // one call (its own internal LLM extractor handles the parsing).
+      // Branch's vehicle-details reply has arrived; persist on the Bundle
+      // and forward LS PDFs to the plant. Vehicle details come from the
+      // planner step args — no second LLM extractor here.
       const trigger = await loadTriggerReply(progress.id);
       if (!trigger) {
-        log('[ENGINE] email_to_plant — no trigger reply; cannot extract vehicle details. Aborting.');
+        log('[ENGINE] email_to_plant — no trigger reply; cannot proceed. Aborting.');
         await prisma.scenarioProgress.update({
           where: { id: progress.id },
           data: { state: 'failed', error: 'email_to_plant step but no trigger reply' },
         });
         return 'pause';
       }
+      const { coerceVehiclesArgs } = await import('./planner-step-args');
+      const vehicles = coerceVehiclesArgs(_plannedStep);
       const { handleVehicleDetailsReply } = await import('./auto-gui-trigger');
-      const result = await handleVehicleDetailsReply(trigger.emailId, trigger.replyHtml, progress.salesOrderId);
+      const result = await handleVehicleDetailsReply(
+        trigger.emailId,
+        trigger.replyHtml,
+        progress.salesOrderId,
+        { vehicles },
+      );
       for (const line of result.logs) log(line);
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       return 'advance_now';
     }
 
@@ -2066,7 +1803,7 @@ async function fireStep(
         }
       }
 
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       return 'advance_now';
     }
 
@@ -2101,20 +1838,9 @@ async function fireStep(
     }
 
     case 'process_tonnage_reply': {
-      // Branch replied to a tonnage_inquiry email with the vehicle tonnage.
-      // Parse the number out of the reply (any unit form: "35", "35 t",
-      // "35 tonnes", "35000 kg") and write it to po.weightage. The next
-      // inbound (or planner-triggered re-evaluation) resumes dispatch.
-      const trigger = await loadTriggerReply(progress.id);
-      if (!trigger) {
-        log('[ENGINE] process_tonnage_reply — no trigger reply; cannot parse tonnage. Aborting.');
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: 'process_tonnage_reply but no trigger reply' },
-        });
-        return 'pause';
-      }
-
+      // Branch replied to a tonnage_inquiry with the vehicle tonnage. The
+      // planner reads the reply and emits { tonnage: { value, unit } } on
+      // the step; the coercion helper handles kg→t conversion.
       const so = await prisma.salesOrder.findUnique({
         where: { id: progress.salesOrderId },
         select: { purchaseOrderId: true, soNumber: true },
@@ -2124,70 +1850,8 @@ async function fireStep(
         return 'advance_now';
       }
 
-      // ─── Reply text isolation ────────────────────────────────────────
-      // Gmail replies quote the prior thread inline. Our own tonnage_inquiry
-      // includes example phrases like "Vehicle Tonnage: 35 t" that the
-      // regex below would otherwise match before the branch's actual answer.
-      // Strip the quoted portion first.
-      //
-      // Two markers are common:
-      //   1. <blockquote class="gmail_quote"> wraps the entire quoted thread
-      //      (Gmail web + most clients that respect the convention).
-      //   2. "On <date>, <addr> wrote:" — fallback plain-text marker.
-      let isolated = trigger.replyHtml
-        // Drop the gmail quote block entirely.
-        .replace(/<blockquote[^>]*class="[^"]*gmail_quote[^"]*"[^>]*>[\s\S]*?<\/blockquote>/gi, ' ')
-        // Strip every other tag.
-        .replace(/<[^>]*>/g, ' ')
-        // Collapse whitespace early so the "On … wrote:" anchor isn't broken
-        // across newlines.
-        .replace(/\s+/g, ' ')
-        .trim();
-      // Plain-text quote anchor: cut from "On <day-of-week or date>, ... wrote:" onward.
-      const wroteIdx = isolated.search(/On\s+.{0,120}?\bwrote\s*:/i);
-      if (wroteIdx > 0) isolated = isolated.slice(0, wroteIdx).trim();
-
-      // Also drop our own outbound boilerplate if the client inlined it
-      // (some replies don't blockquote and don't use the "wrote:" anchor).
-      // The example phrasing on the tonnage_inquiry includes the literal
-      // "For example:" preface — anything after that is OUR text, not theirs.
-      const exampleIdx = isolated.search(/\bFor example\s*:/i);
-      if (exampleIdx > 0) isolated = isolated.slice(0, exampleIdx).trim();
-
-      const text = isolated || trigger.replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-
-      // Try units in this order: kg first (so "35000 kg" doesn't get read as
-      // 35000 t), then tonnes/t/mt, then a bare number near the words
-      // "tonnage" / "capacity" / "truck" / "vehicle". Returns tonnes.
-      let tonnes: number | null = null;
-      const kgMatch = text.match(/(\d+(?:\.\d+)?)\s*kg\b/i);
-      if (kgMatch) {
-        const kg = parseFloat(kgMatch[1]);
-        if (kg > 0) tonnes = kg / 1000;
-      }
-      if (tonnes === null) {
-        const tMatch = text.match(/(\d+(?:\.\d+)?)\s*(?:tonnes?|tons?|mt|t)\b/i);
-        if (tMatch) {
-          const t = parseFloat(tMatch[1]);
-          if (t > 0) tonnes = t;
-        }
-      }
-      if (tonnes === null) {
-        const ctxMatch = text.match(/(?:tonnage|capacity|truck|vehicle)[^\d]{0,30}(\d+(?:\.\d+)?)/i);
-        if (ctxMatch) {
-          const t = parseFloat(ctxMatch[1]);
-          if (t > 0 && t < 1000) tonnes = t; // sanity: tonnes is < 1000
-        }
-      }
-
-      if (tonnes === null) {
-        log(`[ENGINE] process_tonnage_reply — could not parse tonnage from reply: "${text.slice(0, 120)}"`);
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: 'tonnage not found in reply' },
-        });
-        return 'pause';
-      }
+      const { coerceTonnageArgs } = await import('./planner-step-args');
+      const tonnes = coerceTonnageArgs(_plannedStep);
 
       await prisma.purchaseOrder.update({
         where: { id: so.purchaseOrderId },
@@ -2322,69 +1986,45 @@ async function fireStep(
     }
 
     case 'email_2nd_release': {
-      // Ask branch to confirm the post-VA02 plan. Extract the modification
-      // list from the trigger reply (same as va02 reads it).
-      const trigger = await loadTriggerReply(progress.id);
-      if (!trigger) {
-        log('[ENGINE] email_2nd_release — no trigger reply; cannot summarise modifications. Aborting.');
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: 'email_2nd_release but no trigger reply' },
-        });
-        return 'pause';
-      }
-      const { extractMaterialModifications } = await import('./material-modification-extractor');
-      const mods = await extractMaterialModifications({
-        salesOrderId: progress.salesOrderId,
-        replyHtml: trigger.replyHtml,
-      });
-      // sendSecondReleaseEmail expects BranchReplyIntent['materials'] shape:
+      // Ask the PLANT to confirm the post-VA02 plan. The planner emits the
+      // modification list as step args (read from the email thread).
+      const { coerceEmailMaterialsArgs } = await import('./planner-step-args');
+      const summary = coerceEmailMaterialsArgs(_plannedStep, 'email_2nd_release');
+      // sendSecondReleaseEmail expects EmailMaterialMod[] shape:
       // { material_code, batch, operation, quantity }
-      const modifications = mods.materials.map((m) => ({
+      const modifications: EmailMaterialMod[] = summary.map((m) => ({
         material_code: m.material_code,
         batch: '',
-        operation: m.operation ?? 'keep' as const,
-        quantity: m.quantity ?? 0,
+        operation: m.operation === 'inc' ? 'increase' : m.operation === 'dec' ? 'decrease' : 'delete',
+        quantity: m.quantity,
       }));
       await sendSecondReleaseEmail({
         salesOrderId: progress.salesOrderId,
         modifications,
         log,
       });
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
 
     case 'email_to_branch_notifying_plant_change': {
       // R46-R51 — branch needs to ack plant-proposed modifications before we
-      // touch SAP. Extract the plant's proposed materials from its reply.
-      const trigger = await loadTriggerReply(progress.id);
-      if (!trigger) {
-        log('[ENGINE] email_to_branch_notifying_plant_change — no trigger reply; aborting.');
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: 'plant-change-notify step but no trigger reply' },
-        });
-        return 'pause';
-      }
-      const { extractMaterialModifications } = await import('./material-modification-extractor');
-      const mods = await extractMaterialModifications({
-        salesOrderId: progress.salesOrderId,
-        replyHtml: trigger.replyHtml,
-      });
-      const modifications = mods.materials.map((m) => ({
+      // touch SAP. Plant's proposed materials come from the planner step args.
+      const { coerceEmailMaterialsArgs } = await import('./planner-step-args');
+      const summary = coerceEmailMaterialsArgs(_plannedStep, 'email_to_branch_notifying_plant_change');
+      const modifications: EmailMaterialMod[] = summary.map((m) => ({
         material_code: m.material_code,
         batch: '',
-        operation: m.operation ?? 'keep' as const,
-        quantity: m.quantity ?? 0,
+        operation: m.operation === 'inc' ? 'increase' : m.operation === 'dec' ? 'decrease' : 'delete',
+        quantity: m.quantity,
       }));
       await sendPlantChangeNotificationEmail({
         salesOrderId: progress.salesOrderId,
         modifications,
         log,
       });
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }
@@ -2396,7 +2036,7 @@ async function fireStep(
         salesOrderId: progress.salesOrderId,
         log,
       });
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       return 'advance_now';
     }
 
@@ -2462,7 +2102,7 @@ async function fireStep(
       // pick up their reply (status='sent', workflowState='awaiting_reply')
       // and route it back through handleReplyV2 → planNextSteps, which now
       // sees the question + answer in the thread.
-      if (isSegmentedExecutionEnabled()) return 'complete_segment';
+      return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
     }

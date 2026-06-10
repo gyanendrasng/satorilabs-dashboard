@@ -1,8 +1,8 @@
 /**
- * Supervisor escalation — Phase 4 of the unified classifier rollout.
+ * Supervisor escalation.
  *
- * When `classifyReply` returns action='other', the dispatcher calls
- * `escalateToSupervisor`. This:
+ * When the planner emits `email_supervisor_question` or the dispatcher
+ * cannot classify a reply, `escalateToSupervisor` is called. This:
  *   1. Sends a `supervisor_inquiry` email to SUPERVISOR_EMAIL with the
  *      original SO context, the unclassifiable text, and a question.
  *   2. Records an Email row tied to the SO with emailType='supervisor_inquiry'

@@ -44,10 +44,7 @@ if (!process.env.BRANCH_EMAIL) process.env.BRANCH_EMAIL = 'test-branch@example.c
 if (!process.env.PLANT_EMAIL) process.env.PLANT_EMAIL = 'test-plant@example.com';
 if (!process.env.SAP_DEFAULT_PLANT) process.env.SAP_DEFAULT_PLANT = '7581';
 if (!process.env.SUPERVISOR_EMAIL) process.env.SUPERVISOR_EMAIL = 'amanrai369@gmail.com';
-// Segmented execution is the only supported mode for these tests.
 process.env.SCENARIO_ENGINE_ENABLED = 'true';
-process.env.UNIFIED_CLASSIFIER_ENABLED = 'true';
-process.env.SEGMENTED_EXECUTION_ENABLED = 'true';
 
 // -----------------------------------------------------------------------------
 // Gmail stub via require hook (installed BEFORE engine imports)

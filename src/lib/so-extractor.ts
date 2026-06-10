@@ -24,13 +24,11 @@ export interface OrderExtraction {
  * (e.g. "CUST-1234" or "42"). When absent, returns null and the caller may
  * skip Customer linking (the PO will be created without a customer).
  *
- * @deprecated Phase 4 rollout (UNIFIED_CLASSIFIER_ENABLED): the unified
- * `classifyReply` in src/lib/reply-classifier.ts now returns
- * action='new_order' with the same {customer_id, so_numbers} shape. This
- * function is kept as the flag-off fallback inside `checkForNewEmails`.
- * `extractOrderInfoFallback` (regex) below stays — it's the last-resort
- * fallback for both paths. Remove the AI variant once the unified flag is
- * the default everywhere.
+ * This is the NEW ORDER intake extractor — it runs BEFORE any SalesOrder /
+ * PurchaseOrder rows exist, so it predates the LLM planner. The planner
+ * takes over for every subsequent inbound on the thread.
+ * `extractOrderInfoFallback` (regex) below is the last-resort fallback when
+ * the AI call errors.
  */
 export async function extractOrderInfoWithAI(emailBody: string): Promise<OrderExtraction> {
   const openai = new OpenAI();
