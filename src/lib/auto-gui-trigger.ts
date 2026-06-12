@@ -818,8 +818,16 @@ function renderDispatchConfirmationBody(args: {
   totalTonnes: number;
   capacityTonnes: number;
   bundles: BundleForEmail[];
+  /** Optional per-material diff from previewBundlesForPo. Rendered as a
+   *  "Changes since last plan" section above the bundle list when present.
+   *  Used on post-modification dispatch_confirmation sends so the branch sees
+   *  exactly which lines / bundles shifted vs the previously-confirmed plan. */
+  diff?: import('./bundler').BundleDiffLine[];
+  /** True when the diff is non-empty AND every line stays in its current
+   *  bundle (only qty deltas, no migration). Drives a clearer label. */
+  pureQtyChange?: boolean;
 }): string {
-  const { poNumber, customerName, twoVehicles, totalTonnes, capacityTonnes, bundles } = args;
+  const { poNumber, customerName, twoVehicles, totalTonnes, capacityTonnes, bundles, diff, pureQtyChange } = args;
 
   const fmtT = (n: number) => n.toFixed(3);
   const totalStr = fmtT(totalTonnes);
@@ -827,6 +835,29 @@ function renderDispatchConfirmationBody(args: {
   const intro = twoVehicles
     ? `Vehicle split confirmed for Purchase Order ${poNumber} (${customerName}). Total dispatch ${totalStr} t across ${vehicleCount} vehicles (capacity ${capacityTonnes} t each).`
     : `Dispatch plan ready for Purchase Order ${poNumber} (${customerName}). Total ${totalStr} t — fits in 1 vehicle (capacity ${capacityTonnes} t).`;
+
+  // Build the diff block when present and non-empty.
+  let diffBlock = '';
+  if (diff && diff.length > 0) {
+    const heading = pureQtyChange
+      ? 'Changes since last plan (quantity adjustments only — loading slips will be updated):'
+      : 'Changes since last plan (composition shift — bundles will be re-organised):';
+    const diffLines = diff.map((d) => {
+      const label = `${d.material} (Batch ${d.batch})`;
+      if (d.currentQty === 0 && d.proposedQty > 0) {
+        return `  + ${label}: NEW LINE → ${d.proposedQty} units in Bundle ${d.proposedBundleNumber}`;
+      }
+      if (d.proposedQty === 0 && d.currentQty > 0) {
+        return `  - ${label}: REMOVED (was ${d.currentQty} units in Bundle ${d.currentBundleNumber ?? '?'})`;
+      }
+      const bundleNote =
+        d.currentBundleNumber !== null && d.currentBundleNumber !== d.proposedBundleNumber
+          ? ` (moved from Bundle ${d.currentBundleNumber} → Bundle ${d.proposedBundleNumber})`
+          : '';
+      return `  • ${label}: ${d.currentQty} → ${d.proposedQty} units${bundleNote}`;
+    });
+    diffBlock = [heading, '', ...diffLines, ''].join('\n');
+  }
 
   const sections = bundles
     .map((b) => {
@@ -848,20 +879,36 @@ function renderDispatchConfirmationBody(args: {
     })
     .join('\n\n');
 
+  // When we have a diff (post-modification cycle), the closing call-to-action
+  // changes slightly: confirming means we'll RUN the modification (ZLOAD2),
+  // not create LSs from scratch.
+  const closingLines = diff && diff.length > 0
+    ? [
+        'Please reply with:',
+        '  - "yes" / "confirm" to apply the above changes (we will update the existing loading slips and send the revised slips to the plant), or',
+        '  - any further adjustments you want to make.',
+        '',
+        'Once confirmed we will update the loading slips and re-share them with the plant.',
+      ]
+    : [
+        'Please reply with:',
+        '  - "yes" / "confirm" to proceed with the above plan, or',
+        '  - the changes you want (e.g. "skip OOWJ on SO 1234567", "send only 15 of OP7WJ").',
+        '',
+        'Once confirmed we will create the loading slips.',
+      ];
+
   return [
     'Dear Branch Team,',
     '',
     intro,
     '',
+    ...(diffBlock ? [diffBlock] : []),
     'Proposed dispatch (grouped by bundle):',
     '',
     sections,
     '',
-    'Please reply with:',
-    '  - "yes" / "confirm" to proceed with the above plan, or',
-    '  - the changes you want (e.g. "skip OOWJ on SO 1234567", "send only 15 of OP7WJ").',
-    '',
-    'Once confirmed we will create the loading slips.',
+    ...closingLines,
     '',
     'Best regards,',
     'Sales Order Dispatch Co-ordinator',
@@ -898,14 +945,46 @@ export async function sendDispatchConfirmationEmail(args: {
   }
 
   // 2) Compute bundles now (FFD bin-pack into trucks of po.weightage*1000 kg)
-  //    so the email can list items truck-by-truck. Bundler is idempotent, so
-  //    handleDispatchConfirmation re-running it later produces the same result.
-  //    When po.weightage is null (NEW ORDER didn't include it; branch hasn't
-  //    replied to tonnage_inquiry yet), the bundler throws — surface clearly
-  //    and skip the email; the cron will retry when weightage lands.
-  let bundleResult;
+  //    so the email can list items truck-by-truck.
+  //
+  // Two modes:
+  //  - INITIAL dispatch_confirmation (no LSs exist for this PO yet) → run the
+  //    destructive computeBundlesForPo so Bundle rows are written; ZLOAD1's
+  //    fan-out later groups by these bundle rows.
+  //  - MODIFICATION dispatch_confirmation (LSs already exist, but plant_ls
+  //    NOT yet sent — Rule 9/10b flow) → run previewBundlesForPo: compute
+  //    the proposed plan + structured diff in memory ONLY. Do NOT wipe LSs
+  //    here; ZLOAD2 (Rule 10b path b) will update them in-place after the
+  //    branch confirms this email. Wiping pre-zload2 would destroy the LSs
+  //    zload2 is meant to update.
+  //  - When po.weightage is null, the bundler throws — surface clearly and
+  //    skip the email; cron retries once weightage lands.
+  const existingLsCount = await prisma.loadingSlip.count({
+    where: { salesOrder: { purchaseOrderId } },
+  });
+  let bundleResult: { bundleCount: number; totalKg: number; capacityKg: number };
+  let previewDiff: import('./bundler').BundleDiffLine[] = [];
+  let previewPureQtyChange = false;
+  let previewUnchanged = false;
   try {
-    bundleResult = await computeBundlesForPo(purchaseOrderId);
+    if (existingLsCount > 0) {
+      const { previewBundlesForPo } = await import('./bundler');
+      const preview = await previewBundlesForPo(purchaseOrderId);
+      bundleResult = {
+        bundleCount: preview.bundleCount,
+        totalKg: preview.totalKg,
+        capacityKg: preview.capacityKg,
+      };
+      previewDiff = preview.diff;
+      previewPureQtyChange = preview.pureQtyChange;
+      previewUnchanged = preview.unchanged;
+      log(
+        `[DispatchConfirm] Preview mode (${existingLsCount} LS(s) already exist): ` +
+          `${preview.bundleCount} bundle(s), unchanged=${preview.unchanged}, pureQtyChange=${preview.pureQtyChange}, diff=${preview.diff.length} line(s)`,
+      );
+    } else {
+      bundleResult = await computeBundlesForPo(purchaseOrderId);
+    }
   } catch (err) {
     const { BundlerWeightageMissingError } = await import('./bundler');
     if (err instanceof BundlerWeightageMissingError) {
@@ -947,6 +1026,12 @@ export async function sendDispatchConfirmationEmail(args: {
     totalTonnes,
     capacityTonnes,
     bundles: bundlesForEmail,
+    // Only surface the diff section when we ran preview mode AND there are
+    // real differences. previewUnchanged is true when nothing changed since
+    // the last saved plan — in that case skip the diff block; the email is
+    // just a re-confirmation request and the bundle list speaks for itself.
+    diff: existingLsCount > 0 && !previewUnchanged ? previewDiff : undefined,
+    pureQtyChange: existingLsCount > 0 ? previewPureQtyChange : undefined,
   });
   const subject = `Dispatch Confirmation - PO ${po.poNumber}`;
 

@@ -1128,6 +1128,166 @@ const CASES: TestCase[] = [
       sentEmailTypes: ['ls_dispatch', 'dispatch_confirmation', 'vehicle_details', 'plant_ls', '2nd_release'],
     },
   },
+
+  // 11 — Post-ZLOAD1 / pre-plant_ls modify: increase (mirrors SO 3260649 incident)
+  {
+    id: 'modify_increase_after_zload1_before_plant_ls',
+    description:
+      'Branch asks to increase a material on a vehicle_details thread AFTER ZLOAD1 fired but BEFORE plant_ls was sent. ' +
+      'Expect the full update cycle (VA02 → 2nd_release → ZSO_Visibility → dispatch_confirmation → ZLOAD2 → email_modified_ls_to_plant) ' +
+      'to run BEFORE any plant_ls fires. Plant must receive PDFs reflecting the post-modification quantity.',
+    soNumber: '3290111',
+    customerId: 'TEST-CUST-PRE-PLANT-INC',
+    newOrderBody: NEW_ORDER_BODY('3290111', 'TEST-CUST-PRE-PLANT-INC'),
+    visibility: STANDARD_MATERIALS,
+    replies: [
+      // Phase A: normal release up to vehicle_details email (LSs created, plant_ls NOT yet sent)
+      { targetEmailType: 'ls_dispatch', sender: 'branch', replyText: 'Confirmed.' },
+      { targetEmailType: 'dispatch_confirmation', sender: 'branch', replyText: 'Confirmed.' },
+      // Phase B: branch replies on the vehicle_details email with a modification (NOT vehicle details).
+      // This is the SO 3260649 chain: the system must NOT treat this as vehicle details
+      // and must NOT skip ZLOAD2.
+      {
+        targetEmailType: 'vehicle_details',
+        sender: 'branch',
+        replyText: 'Actually, please increase YV6FRYENE0000PJP (M-B) from 100 to 130 first.',
+        note: 'Branch increases on vehicle_details thread post-ZLOAD1, pre-plant_ls',
+      },
+      // Phase C: plant confirms 2nd release
+      { targetEmailType: '2nd_release', sender: 'branch', replyText: 'Yes, do the second release.' },
+      // Phase D: branch confirms round-2 ls_dispatch. Critically — even if this reply
+      // smells like vehicle details, the planner must apply Rule 9 deterministically and
+      // emit email_confirm_bundle_details.
+      {
+        targetEmailType: 'ls_dispatch',
+        sender: 'branch',
+        replyText: 'Product details look good.',
+        note: 'Branch confirms round-2 ls_dispatch — Rule 9 must fire email_confirm_bundle_details',
+      },
+      // Phase E: branch confirms round-2 dispatch_confirmation → triggers ZLOAD2 + plant resend
+      {
+        targetEmailType: 'dispatch_confirmation',
+        sender: 'branch',
+        replyText: 'Confirmed. Proceed with revised bundle plan.',
+        note: 'Branch confirms revised bundle plan → triggers ZLOAD2 + email_modified_ls_to_plant',
+      },
+      // Phase F: planner re-asks for vehicle details (stale-vehicle-details detection,
+      // Rule 10c — the prior vehicle_details reply was a modification, not vehicle details)
+      {
+        targetEmailType: 'vehicle_details',
+        sender: 'branch',
+        replyText: 'Vehicle: MH12ST7891, Driver: 9555555556, LR: LR-011 dated 2026-06-15',
+        note: 'Branch supplies fresh vehicle details for the post-modification bundle plan',
+      },
+      // Phase G: plant invoice closes the loop
+      { targetEmailType: 'plant_ls', sender: 'plant', replyText: 'Invoice 7682614530 OBD 5070000133 attached.' },
+    ],
+    expect: {
+      // ZLOAD2 must appear in the SAP transaction list BEFORE plant_ls fires (since
+      // plant_ls is sent via the email_to_plant step which is in the email path, not SAP).
+      // The SAP sequence: initial visibility + ZLOAD1, then the modification cycle's
+      // VA02 + visibility + ZLOAD2, then plant invoice ZLOAD3 and VT01N.
+      sapTransactions: ['ZSO-VISIBILITY', 'ZLOAD1', 'VA02', 'ZSO-VISIBILITY', 'ZLOAD2', 'ZLOAD3-B1', 'VTO1N-B'],
+      finalSoStatus: 'completed',
+      sentEmailTypes: [
+        'ls_dispatch',
+        'dispatch_confirmation',
+        'vehicle_details',
+        '2nd_release',
+        'modified_ls_to_plant',
+        'plant_ls',
+      ],
+    },
+  },
+
+  // 12 — Post-ZLOAD1 / pre-plant_ls modify: branch keeps iterating on the material list
+  {
+    id: 'modify_increase_after_zload1_iterative',
+    description:
+      'Branch increases qty, but on the round-2 ls_dispatch they ask for ANOTHER increase before accepting. ' +
+      'The system must restart the modify cycle (VA02 + 2nd_release + ZSO_Visibility + fresh ls_dispatch) ' +
+      'rather than jumping ahead to dispatch_confirmation. Only after the branch finally accepts a material ' +
+      'list does the bundle plan get shown. Then bundle plan can also be iterated.',
+    soNumber: '3290112',
+    customerId: 'TEST-CUST-PRE-PLANT-ITER',
+    newOrderBody: NEW_ORDER_BODY('3290112', 'TEST-CUST-PRE-PLANT-ITER'),
+    visibility: STANDARD_MATERIALS,
+    replies: [
+      // Phase A: initial release through to vehicle_details email
+      { targetEmailType: 'ls_dispatch', sender: 'branch', replyText: 'Confirmed.' },
+      { targetEmailType: 'dispatch_confirmation', sender: 'branch', replyText: 'Confirmed.' },
+      // Phase B: branch asks for first increase on the vehicle_details thread
+      {
+        targetEmailType: 'vehicle_details',
+        sender: 'branch',
+        replyText: 'Please increase YV6FRYENE0000PJP (M-B) to 130 before we proceed.',
+        note: 'First modification request',
+      },
+      // Phase C: plant confirms 2nd release for first increase
+      { targetEmailType: '2nd_release', sender: 'branch', replyText: 'Yes, second release done.' },
+      // Phase D: branch sees round-2 ls_dispatch and asks for ANOTHER increase
+      // (Rule 9 case c: restart the modify cycle, NOT advance to dispatch_confirmation)
+      {
+        targetEmailType: 'ls_dispatch',
+        sender: 'branch',
+        replyText: 'Actually make it 150 instead of 130.',
+        note: 'SECOND modification request on round-2 ls_dispatch — Rule 9 case c: restart modify cycle',
+      },
+      // Phase E: plant confirms 2nd release for the second increase
+      { targetEmailType: '2nd_release', sender: 'branch', replyText: 'Yes, second release done.' },
+      // Phase F: branch accepts the round-3 ls_dispatch (material list)
+      {
+        targetEmailType: 'ls_dispatch',
+        sender: 'branch',
+        replyText: 'Yes, the product list is final now.',
+        note: 'Branch accepts material list → Rule 9 case a fires email_confirm_bundle_details',
+      },
+      // Phase G: branch confirms the (round-2) dispatch_confirmation showing revised bundles
+      {
+        targetEmailType: 'dispatch_confirmation',
+        sender: 'branch',
+        replyText: 'Bundle plan confirmed. Proceed.',
+        note: 'Branch confirms bundle plan → Rule 10 case (b) emits zload2 + email_modified_ls_to_plant',
+      },
+      // Phase H: planner re-asks for vehicle details against the finalised plan (Rule 10c)
+      {
+        targetEmailType: 'vehicle_details',
+        sender: 'branch',
+        replyText: 'Vehicle: MH12ST7892, Driver: 9555555557, LR: LR-012 dated 2026-06-16',
+        note: 'Fresh vehicle details for the post-modification plan',
+      },
+      // Phase I: plant invoice closes the loop
+      { targetEmailType: 'plant_ls', sender: 'plant', replyText: 'Invoice 7682614531 OBD 5070000134 attached.' },
+    ],
+    expect: {
+      // Two modification cycles before ZLOAD2:
+      //  initial:        ZSO-VISIBILITY + ZLOAD1
+      //  mod 1 (130):    VA02 + ZSO-VISIBILITY
+      //  mod 2 (150):    VA02 + ZSO-VISIBILITY     ← Rule 9 case c restarts the cycle
+      //  finalisation:   ZLOAD2  (only after both ls_dispatch and dispatch_confirmation are accepted)
+      //  closure:        ZLOAD3-B1 + VTO1N-B
+      sapTransactions: [
+        'ZSO-VISIBILITY',
+        'ZLOAD1',
+        'VA02',
+        'ZSO-VISIBILITY',
+        'VA02',
+        'ZSO-VISIBILITY',
+        'ZLOAD2',
+        'ZLOAD3-B1',
+        'VTO1N-B',
+      ],
+      finalSoStatus: 'completed',
+      sentEmailTypes: [
+        'ls_dispatch',
+        'dispatch_confirmation',
+        'vehicle_details',
+        '2nd_release',
+        'modified_ls_to_plant',
+        'plant_ls',
+      ],
+    },
+  },
 ];
 
 // -----------------------------------------------------------------------------

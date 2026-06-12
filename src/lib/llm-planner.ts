@@ -607,16 +607,107 @@ trigger email type, to decide whose intent this is.
      modify loading slips (rule 11 covers branch-requested LS modifications
      on a plant_ls thread, which is a different scenario).
 
-  9. INBOUND: branch confirmation on a round-2 ls_dispatch.
-     (Audit trail shows TWO ls_dispatch emails AND one 2nd_release ✓.)
-     EMIT: email_confirm_bundle_details. STOP.
+  9. INBOUND: branch reply on a round-2-or-later ls_dispatch (modification
+     cycle in progress — material list re-confirmation stage).
+     TRIGGER: the planner is invoked because the branch replied on an
+     ls_dispatch email AND the audit trail shows AT LEAST one prior va02 ✓
+     AND AT LEAST one prior 2nd_release email_sent AND at least two
+     email_sent ls_dispatch events.
 
- 10. INBOUND: branch confirmation on a round-2 dispatch_confirmation.
-     (Audit trail shows va02 ✓ + zso_visibility ✓ × 2 + ls_dispatch ✓ × 2 + dispatch_confirmation ✓ × 2.)
-     CHOOSE based on whether LoadingSlipItem rows already exist:
+     **The order of approval is STRICT: materials first (this rule),
+     bundles second (Rule 10), ZLOAD2 third (Rule 10b). The branch must
+     accept the material list before they see the bundle plan; they must
+     accept the bundle plan before any loading slips are touched.**
+
+     Decide by reading the branch's reply body:
+
+     (a) PLAIN CONFIRMATION ("ok", "yes", "confirmed", "proceed",
+         "release as available", "looks good") → the branch has accepted
+         the updated material list. EMIT email_confirm_bundle_details to
+         move on to bundle re-approval. STOP.
+
+     (b) REPLY CARRIES VEHICLE DETAILS (truck no, driver, container) but
+         is NOT a further modification → treat as PLAIN CONFIRMATION on
+         the material list. IGNORE the vehicle details (they reference
+         the PRE-modification bundle plan, which the branch has not yet
+         re-approved). EMIT email_confirm_bundle_details. The planner
+         will re-ask for vehicle details later (Rule 10c) against the
+         finalised post-modification plan.
+
+     (c) FURTHER MODIFICATION REQUEST (another qty change, add or
+         remove a material) → DO NOT advance to bundle confirmation.
+         The material list itself is not yet accepted. RESTART the
+         modify cycle: apply Rule 6/6b for an increase or Rule 11
+         shape for a decrease/delete. EMIT
+         stock_precheck → va02 → email_2nd_release  (for an increase),
+         or zload2 / zloading_close shape (for decrease/delete) — same
+         step list as the originating Rule 6/6b/11 path. The cycle
+         will eventually return to this Rule 9 on the next round-N
+         ls_dispatch, and the branch can keep iterating on the
+         material list until they accept it.
+
+     (d) GENUINELY UNCLEAR / AMBIGUOUS reply → emit
+         email_clarify_branch with a short, specific question.
+
+     Tie-break heuristics for case (a) vs (c) vs (d):
+       - If the reply names a material code + a number (and that
+         number differs from the current SO qty) → case (c).
+       - If the reply names ONLY a truck / driver / container / LR
+         number → case (b).
+       - If the reply is a short affirmative phrase OR an affirmative
+         phrase plus vehicle details → case (a) or (b).
+       - When in genuine doubt between (a) and (c), prefer (d) —
+         clarify rather than guess. Wrong VA02 args are destructive.
+     Do NOT emit email_to_plant or email_modified_ls_to_plant here —
+     LSs in DB still reflect pre-modification quantities and would
+     ship stale to the plant. ZLOAD2 (Rule 10b) is the only path that
+     re-syncs them.
+
+ 10. INBOUND: branch reply on a round-2-or-later dispatch_confirmation
+     (modification cycle in progress — bundle plan re-confirmation stage).
+     (Audit trail shows va02 ✓ + zso_visibility ✓ ≥ 2 + ls_dispatch ✓ ≥ 2 + dispatch_confirmation ✓ ≥ 2.)
+
+     **The branch has already accepted the new material list (Rule 9 case
+     a/b fired). Now they're reacting to the bundle / truck plan.**
+
+     Decide by reading the branch's reply body:
+
+     **PLAIN CONFIRMATION** on the bundle plan ("yes", "confirm",
+     "proceed", "go ahead") → CHOOSE based on whether LoadingSlipItem
+     rows already exist:
        (a) NO LSIs yet → EMIT zload1 → email_to_branch_for_vehicle. STOP.
        (b) LSIs already exist (audit trail has a prior step_completed zload1 ✓ from BEFORE the modification) → EMIT zload2 → email_modified_ls_to_plant. STOP.
      A prior "step_completed zload1" event in the audit trail = path (b). No prior zload1 = path (a).
+
+     **FURTHER MODIFICATION REQUEST** on the bundle plan (another qty
+     change or a request to redistribute) → DO NOT fire ZLOAD2. The
+     bundle plan is not yet accepted. RESTART the modify cycle from
+     Rule 6/6b (for an increase) or Rule 11 shape (for a decrease /
+     delete). The cycle will return through Rule 9 (material list
+     re-confirm) then Rule 10 (bundle re-confirm) again. The branch
+     can keep iterating on either approval until they're satisfied.
+
+     **UNCLEAR / AMBIGUOUS** → email_clarify_branch.
+
+     **VEHICLE DETAILS in the reply** → treat as PLAIN CONFIRMATION on
+     the bundle plan and follow path (b) (assuming LSs exist; that's
+     the post-modification case). IGNORE the vehicle details — they
+     are for the pre-modification plan. Rule 10c below will collect
+     fresh vehicle details after ZLOAD2 finishes.
+
+ 10c. STALE-VEHICLE-DETAILS DETECTION (runs as a final step after Rule 10b).
+      After Rule 10b emits zload2 + email_modified_ls_to_plant — i.e.
+      the LS rows in SAP now reflect the post-modification quantities
+      and the plant has the regenerated PDFs — check whether the
+      vehicle details on file are still valid:
+        - If the audit trail's MOST RECENT "email_sent vehicle_details"
+          event is OLDER than the most recent "step_completed va02",
+          those vehicle details reference a stale (pre-modification)
+          bundle plan. EMIT email_to_branch_for_vehicle (after the
+          zload2 / email_modified_ls_to_plant steps in the SAME plan)
+          to collect fresh vehicle details against the now-stable plan.
+        - If vehicle_details is NEWER than the most recent va02, the
+          details on file are valid — do not re-ask.
 
  11. INBOUND: branch MODIFY-DECREASE / MODIFY-DELETE / MODIFY-DEC-DEL reply on a plant_ls email.
      (Audit trail: zload1 ✓ and plant_ls ✓ already happened. SENDER=branch.)

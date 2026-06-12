@@ -302,6 +302,36 @@ function diffBundleComposition(
  * Capacity = `PO.weightage * 1000` kg. Bin packing delegated to
  * `packMaterialsIntoBundles` — material-grouping is enforced there.
  */
+/**
+ * Per-material qty change between proposed and current. Used by preview mode
+ * to surface what's about to change in the dispatch_confirmation email.
+ */
+export interface BundleDiffLine {
+  material: string;
+  batch: string;
+  /** dispatchQuantity in the most recent saved bundle plan, 0 if newly added. */
+  currentQty: number;
+  /** dispatchQuantity in the freshly computed proposed plan. */
+  proposedQty: number;
+  /** bundleNumber the line lives in under the proposed plan (1-based). */
+  proposedBundleNumber: number;
+  /** bundleNumber the line lived in under the current plan, null when new. */
+  currentBundleNumber: number | null;
+}
+
+export interface BundlePreviewResult {
+  bundleCount: number;
+  totalKg: number;
+  capacityKg: number;
+  /** True when proposed and current compositions match exactly (including qty). */
+  unchanged: boolean;
+  /** True when only per-line qty deltas exist; no material moves between bundles
+   *  and no material is added or removed. Pure-qty change → zload2 covers it. */
+  pureQtyChange: boolean;
+  /** Per-material diff vs the current saved plan. Empty when unchanged. */
+  diff: BundleDiffLine[];
+}
+
 export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
   bundleCount: number;
   totalKg: number;
@@ -481,6 +511,169 @@ async function wipeAndCommit(
   }
 
   return { bundleCount: proposedBins.length, totalKg, capacityKg };
+}
+
+/**
+ * Read-only preview of what `computeBundlesForPo` WOULD produce, plus a
+ * per-material diff against the current saved plan. Used by
+ * `sendDispatchConfirmationEmail` post-modification (LSs already exist but
+ * plant_ls not yet sent) so the dispatch_confirmation email can show the
+ * branch the exact per-line qty/bundle changes without destroying the
+ * current LS rows. ZLOAD2 (Rule 10b) runs against the existing LSs after
+ * the branch confirms — no wipe-and-recreate happens until/unless a
+ * composition change forces it.
+ *
+ * Returns the proposed bundle list (in-memory only), the structured diff,
+ * and two flags:
+ *   - `unchanged`: composition + qty match exactly. No action needed.
+ *   - `pureQtyChange`: every line stays in its existing bundle, only qty
+ *     changes. Rule 10b's zload2 is sufficient.
+ * When both are false, composition genuinely changed (material moved,
+ * added, or removed) — Rule 10b's zload2 alone is not sufficient; the
+ * caller decides whether to fall back to the full wipe path. This is the
+ * "rebundle when needed" case the user described.
+ */
+export async function previewBundlesForPo(purchaseOrderId: string): Promise<BundlePreviewResult> {
+  const po = await prisma.purchaseOrder.findUnique({ where: { id: purchaseOrderId } });
+  if (!po) throw new Error(`PurchaseOrder ${purchaseOrderId} not found`);
+
+  const rawWeightage = po.weightage ? Number(po.weightage) : 0;
+  if (rawWeightage <= 0) {
+    throw new BundlerWeightageMissingError(po.poNumber);
+  }
+  const capacityKg = rawWeightage * 1000;
+
+  const materials = await prisma.material.findMany({
+    where: {
+      salesOrder: { purchaseOrderId },
+      dispatchQuantity: { gt: 0 },
+    },
+  });
+
+  if (materials.length === 0) {
+    return {
+      bundleCount: 0,
+      totalKg: 0,
+      capacityKg,
+      unchanged: true,
+      pureQtyChange: false,
+      diff: [],
+    };
+  }
+
+  // Build the proposed plan in memory (mirrors phase 1 of computeBundlesForPo).
+  const matIndex = new Map<string, { material: string; batch: string; dispatchQuantity: number }>();
+  const weighted: BundlerInput[] = materials.map((m) => {
+    const dispatchQty = m.dispatchQuantity!;
+    const orderedQty = m.orderQuantity || 0;
+    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    const weightKg = orderedQty > 0 ? (dispatchQty / orderedQty) * fullWeight : 0;
+    matIndex.set(m.id, { material: m.material, batch: m.batch ?? '', dispatchQuantity: dispatchQty });
+    return { id: m.id, material: m.material, weightKg };
+  });
+  const totalKg = weighted.reduce((s, w) => s + w.weightKg, 0);
+  const proposedBins = packMaterialsIntoBundles(weighted, capacityKg, (msg) => console.warn(msg));
+
+  // Build (material|batch) → bundleNumber maps for both proposed and current,
+  // plus the per-line qty for each.
+  const proposedByKey = new Map<string, { bundleNumber: number; qty: number }>();
+  for (const bin of proposedBins) {
+    for (const id of bin.itemIds) {
+      const m = matIndex.get(id);
+      if (!m) continue;
+      const key = `${m.material}|${m.batch ?? ''}`;
+      // Multiple Material rows can collapse to the same key (same material+batch
+      // but split across SOs in the PO). Accumulate qty so the diff is honest.
+      const prev = proposedByKey.get(key);
+      if (prev) {
+        prev.qty += m.dispatchQuantity;
+      } else {
+        proposedByKey.set(key, { bundleNumber: bin.bundleNumber, qty: m.dispatchQuantity });
+      }
+    }
+  }
+
+  const currentBundles = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    include: {
+      materials: { select: { material: true, batch: true, dispatchQuantity: true } },
+    },
+  });
+  const currentByKey = new Map<string, { bundleNumber: number; qty: number }>();
+  for (const b of currentBundles) {
+    for (const m of b.materials) {
+      const key = `${m.material}|${m.batch ?? ''}`;
+      const prev = currentByKey.get(key);
+      const q = m.dispatchQuantity ?? 0;
+      if (prev) {
+        prev.qty += q;
+      } else {
+        currentByKey.set(key, { bundleNumber: b.bundleNumber, qty: q });
+      }
+    }
+  }
+
+  // Build the diff. We emit a row for every key that exists on EITHER side
+  // and changed (qty differs, bundle differs, or one side is missing).
+  const allKeys = new Set<string>([...proposedByKey.keys(), ...currentByKey.keys()]);
+  const diff: BundleDiffLine[] = [];
+  let movedOrChangedComposition = false;
+  for (const key of allKeys) {
+    const proposed = proposedByKey.get(key);
+    const current = currentByKey.get(key);
+    const [material, batch] = key.split('|');
+
+    if (!proposed) {
+      // Material disappeared from the plan (qty went to 0 or material removed).
+      diff.push({
+        material,
+        batch,
+        currentQty: current?.qty ?? 0,
+        proposedQty: 0,
+        proposedBundleNumber: -1,
+        currentBundleNumber: current?.bundleNumber ?? null,
+      });
+      movedOrChangedComposition = true;
+      continue;
+    }
+    if (!current) {
+      // New material in the plan.
+      diff.push({
+        material,
+        batch,
+        currentQty: 0,
+        proposedQty: proposed.qty,
+        proposedBundleNumber: proposed.bundleNumber,
+        currentBundleNumber: null,
+      });
+      movedOrChangedComposition = true;
+      continue;
+    }
+    const qtyChanged = proposed.qty !== current.qty;
+    const bundleChanged = proposed.bundleNumber !== current.bundleNumber;
+    if (!qtyChanged && !bundleChanged) continue;
+    if (bundleChanged) movedOrChangedComposition = true;
+    diff.push({
+      material,
+      batch,
+      currentQty: current.qty,
+      proposedQty: proposed.qty,
+      proposedBundleNumber: proposed.bundleNumber,
+      currentBundleNumber: current.bundleNumber,
+    });
+  }
+
+  const unchanged = diff.length === 0;
+  const pureQtyChange = !unchanged && !movedOrChangedComposition;
+
+  return {
+    bundleCount: proposedBins.length,
+    totalKg,
+    capacityKg,
+    unchanged,
+    pureQtyChange,
+    diff,
+  };
 }
 
 /**
