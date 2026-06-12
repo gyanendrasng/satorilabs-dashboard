@@ -1280,8 +1280,86 @@ async function fireStep(
         return 'pause';
       }
 
+      if (result.outcome === 'substituted') {
+        // Every short line was covered by a cross-plant equivalent. The
+        // current plan can't continue as-is — its va02 step still carries
+        // the ORIGINAL material codes. Emit step_completed with the
+        // substitutions payload (so the audit trail records it), mark the
+        // current scenario completed, and re-enter handleReplyV2 against
+        // the same trigger email. The fresh planner call will see the
+        // substitutions in audit and emit va02 (with substitute codes) →
+        // lone_zmatana → email_2nd_release per Rule 6c of the manager prompt.
+        log(`[ENGINE] stock_precheck — substituted ${result.substitutions.length} line(s) via cross-plant equivalents: ${result.substitutions.map((s) => `${s.originalMaterial}→${s.substituteMaterial}@${s.substitutePlant}`).join(', ')}`);
+        try {
+          const { emitEvent } = await import('./scenario-events');
+          await emitEvent({
+            salesOrderId: progress.salesOrderId,
+            scenarioProgressId: progress.id,
+            type: 'step_completed',
+            payload: {
+              kind: 'stock_precheck',
+              scenario_key: 'planner',
+              substitutions: result.substitutions,
+            },
+          });
+        } catch {}
+
+        // Terminate the current scenario and re-plan against the same trigger.
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'completed' },
+        });
+        const triggerEmailId = (
+          await prisma.scenarioProgress.findUnique({
+            where: { id: progress.id },
+            select: { triggerEmailId: true },
+          })
+        )?.triggerEmailId;
+        if (triggerEmailId) {
+          const trigger = await prisma.email.findUnique({
+            where: { id: triggerEmailId },
+            select: { replyHtml: true, recipientEmail: true },
+          });
+          if (trigger?.replyHtml) {
+            const sender: 'branch' | 'plant' =
+              PLANT_EMAIL && trigger.recipientEmail === PLANT_EMAIL ? 'plant' : 'branch';
+            log(`[ENGINE] stock_precheck — re-entering handleReplyV2 with substituted audit trail`);
+            const r = await handleReplyV2({
+              emailId: triggerEmailId,
+              replyHtml: trigger.replyHtml,
+              originalEmailHtml: '',
+              sourceEmailType: sender,
+            });
+            for (const line of r.logs) log(line);
+          }
+        }
+        return 'pause';
+      }
+
       // 'short' — email the party that requested the increase and abort.
       // Their reply re-enters via the standard reply pipeline.
+      //
+      // Mixed-result case: result may also carry `substitutions` for lines
+      // that DID get covered. We emit a step_completed event for those (so
+      // the planner can still use them on its next call) AND send the
+      // shortage email for the remaining gap.
+      if (result.substitutions && result.substitutions.length > 0) {
+        log(`[ENGINE] stock_precheck — MIXED: ${result.substitutions.length} substituted, ${result.shortages.length} still short`);
+        try {
+          const { emitEvent } = await import('./scenario-events');
+          await emitEvent({
+            salesOrderId: progress.salesOrderId,
+            scenarioProgressId: progress.id,
+            type: 'step_completed',
+            payload: {
+              kind: 'stock_precheck',
+              scenario_key: 'planner',
+              substitutions: result.substitutions,
+              partial: true,
+            },
+          });
+        } catch {}
+      }
       const triggerEmailId = (
         await prisma.scenarioProgress.findUnique({
           where: { id: progress.id },
@@ -1326,6 +1404,85 @@ async function fireStep(
       return 'pause';
     }
 
+    case 'bundle_capacity_assessment': {
+      // Post-plant-intimation guard. Compute, per item, whether the requested
+      // increase fits in the current bundle, an alternate bundle on the same
+      // PO, or no bundle at all. Emit a step_completed event with the
+      // per-item verdicts, terminate the current scenario, and re-enter
+      // handleReplyV2 against the same trigger email — the next plan call
+      // will see the verdicts in the audit trail and pick the right per-item
+      // step path (Rule 11). Mirrors the stock_precheck → substituted re-plan
+      // pattern.
+      const { coerceBundleCapacityArgs } = await import('./planner-step-args');
+      const { assessPostLsIncrease } = await import('./bundle-capacity');
+      const items = coerceBundleCapacityArgs(_plannedStep);
+      let result;
+      try {
+        result = await assessPostLsIncrease({
+          salesOrderId: progress.salesOrderId,
+          items: items.map((i) => ({ material: i.material, deltaKg: i.deltaKg })),
+        });
+      } catch (assessErr) {
+        log(`[ENGINE] bundle_capacity_assessment — helper failed: ${assessErr instanceof Error ? assessErr.message : String(assessErr)}`);
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: `bundle_capacity_assessment: ${assessErr instanceof Error ? assessErr.message : String(assessErr)}` },
+        });
+        return 'pause';
+      }
+
+      log(
+        `[ENGINE] bundle_capacity_assessment — verdicts: ${result.verdicts.map((v) => `${v.material}:${v.verdict}${v.bundleId ? `(${v.bundleId})` : ''}`).join(', ')}`,
+      );
+      try {
+        const { emitEvent } = await import('./scenario-events');
+        await emitEvent({
+          salesOrderId: progress.salesOrderId,
+          scenarioProgressId: progress.id,
+          type: 'step_completed',
+          payload: {
+            kind: 'bundle_capacity_assessment',
+            scenario_key: 'planner',
+            verdicts: result.verdicts,
+            capacityKg: result.capacityKg,
+          },
+        });
+      } catch {}
+
+      // Terminate the current scenario and re-plan against the same trigger
+      // email so the planner picks the per-item path now that the verdicts
+      // are in audit.
+      await prisma.scenarioProgress.update({
+        where: { id: progress.id },
+        data: { state: 'completed' },
+      });
+      const triggerEmailId = (
+        await prisma.scenarioProgress.findUnique({
+          where: { id: progress.id },
+          select: { triggerEmailId: true },
+        })
+      )?.triggerEmailId;
+      if (triggerEmailId) {
+        const trigger = await prisma.email.findUnique({
+          where: { id: triggerEmailId },
+          select: { replyHtml: true, recipientEmail: true },
+        });
+        if (trigger?.replyHtml) {
+          const sender: 'branch' | 'plant' =
+            PLANT_EMAIL && trigger.recipientEmail === PLANT_EMAIL ? 'plant' : 'branch';
+          log('[ENGINE] bundle_capacity_assessment — re-entering handleReplyV2 with verdicts in audit');
+          const r = await handleReplyV2({
+            emailId: triggerEmailId,
+            replyHtml: trigger.replyHtml,
+            originalEmailHtml: '',
+            sourceEmailType: sender,
+          });
+          for (const line of r.logs) log(line);
+        }
+      }
+      return 'pause';
+    }
+
     // -------- SAP transactions --------
     case 'va02': {
       // VA02 in SAP changes the order quantity to a new (typically larger)
@@ -1346,6 +1503,22 @@ async function fireStep(
     case 'zso_visibility': {
       const soNumber = await soNumberFor(progress.salesOrderId);
       await triggerZsoVisibility(soNumber);
+      await markAwaitingCallback(progress.id);
+      return 'pause';
+    }
+
+    case 'lone_zmatana': {
+      // After stock_precheck substituted a material with a cross-plant
+      // equivalent and va02 swapped the SO line, run ZMatana standalone to
+      // populate the substitute Material's batch + availableStock. One
+      // WorkQueue row per material; /backend/orders/aman/zmatana-data is
+      // the callback.
+      const { coerceLoneZmatanaArgs } = await import('./planner-step-args');
+      const { triggerLoneZmatana } = await import('./auto-gui-trigger');
+      const codes = coerceLoneZmatanaArgs(_plannedStep);
+      const soNumber = await soNumberFor(progress.salesOrderId);
+      log(`[ENGINE] lone_zmatana firing for ${codes.length} material(s): ${codes.join(', ')}`);
+      await triggerLoneZmatana(soNumber, codes);
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
@@ -1533,8 +1706,37 @@ async function fireStep(
     }
 
     case 'zload1': {
-      // Fan out ZLOAD1 per (Bundle, SO) pair via the shared helper. The
-      // /step-status callback advances the engine on each completion.
+      // Two modes:
+      //   1. Initial — no args; fan out per (Bundle, SO) from the SO's
+      //      computed bundles via fanOutZload1ForPo (which calls the bundler).
+      //   2. Append — args.appendToBundleId + args.materials; issue a single
+      //      new LS onto the named existing bundle for the appended materials.
+      //      Used post-plant-intimation when bundle_capacity_assessment
+      //      returns fits_other_bundle. Bypasses the bundler entirely so the
+      //      BundlesFrozenError guard never fires.
+      const { coerceZload1AppendArgs } = await import('./planner-step-args');
+      const appendArgs = coerceZload1AppendArgs(_plannedStep);
+
+      if (appendArgs) {
+        const { fanOutZload1AppendToBundle } = await import('./auto-gui-trigger');
+        const fanOut = await fanOutZload1AppendToBundle({
+          salesOrderId: progress.salesOrderId,
+          appendToBundleId: appendArgs.appendToBundleId,
+          materials: appendArgs.materials.map((m) => ({
+            material_code: m.code,
+            batch: m.batch,
+            quantity: m.qty,
+          })),
+          log,
+        });
+        if (fanOut.fired === 0) {
+          log('[ENGINE] zload1 (append) fired 0 rows — advancing immediately');
+          return 'advance_now';
+        }
+        await markAwaitingCallback(progress.id);
+        return 'pause';
+      }
+
       const so = await prisma.salesOrder.findUnique({
         where: { id: progress.salesOrderId },
         select: { purchaseOrderId: true },
@@ -2104,6 +2306,31 @@ async function fireStep(
       // sees the question + answer in the thread.
       return 'complete_segment';
       await markAwaitingReply(progress.id);
+      return 'pause';
+    }
+
+    case 'email_branch_request_new_so': {
+      // Terminal step on the post-plant-intimation no-capacity path. Tells
+      // the branch the requested increase doesn't fit and asks them to
+      // raise a new SO for the overflow.
+      const { coerceBranchNewSoArgs } = await import('./planner-step-args');
+      const { sendBranchRequestNewSoEmail } = await import('./branch-new-so-email');
+      const overflow = coerceBranchNewSoArgs(_plannedStep);
+      const trigger = await prisma.scenarioProgress.findUnique({
+        where: { id: progress.id },
+        select: { triggerEmailId: true },
+      });
+      await sendBranchRequestNewSoEmail({
+        salesOrderId: progress.salesOrderId,
+        triggerEmailId: trigger?.triggerEmailId ?? '',
+        overflow,
+        log,
+      });
+      await prisma.scenarioProgress.update({
+        where: { id: progress.id },
+        data: { state: 'completed' },
+      });
+      log(`[ENGINE] email_branch_request_new_so — sent for ${overflow.length} overflow item(s); scenario completed`);
       return 'pause';
     }
 

@@ -273,6 +273,22 @@ export async function POST(request: Request) {
     }
   }
 
+  // ── 2b. Live-update Bundle.totalWeightKg ──
+  // ZLOAD2 changes line quantities on the LS; the upstream VA02 → ZSO_Visibility
+  // path already updated the Material rows. Recompute this bundle's weight
+  // from its Material rows so the post-plant bundle_capacity_assessment helper
+  // reads an honest value. No-op when the value hasn't drifted.
+  if (loadingSlip.bundleId) {
+    try {
+      const { recomputeBundleWeight } = await import('@/lib/bundle-capacity');
+      await recomputeBundleWeight(loadingSlip.bundleId);
+    } catch (recomputeErr) {
+      console.warn(
+        `[ZLOAD2 Data] Bundle weight recompute failed for bundle ${loadingSlip.bundleId} (LS ${lsNumber}): ${recomputeErr instanceof Error ? recomputeErr.message : String(recomputeErr)}`,
+      );
+    }
+  }
+
   // ── 3. Forward updated PDF to the plant ──
   // Reply in-thread on the most recent plant_ls email for this LS. Falls
   // back to a brand-new thread if no prior plant_ls exists (shouldn't

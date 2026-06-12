@@ -48,12 +48,18 @@ export async function POST(request: Request) {
     const soNumberField = formData.get('so_number') as string | null;
     const bundleNumberField = formData.get('bundle_number') as string | null;
     const bundleIdField = formData.get('bundle_id') as string | null;
+    // append-mode marker. When present, this ZLOAD1 was fired as an
+    // append-to-existing-bundle (post-plant-intimation fits_other_bundle
+    // path). We log louder + run the bundle-weight recompute against the
+    // named bundle directly so the rollup stays honest.
+    const appendToBundleIdField = formData.get('append_to_bundle_id') as string | null;
 
     console.log(
       `[ZLOAD1 Data] Received callback — file: ${file?.name || 'none'}, ` +
         `size: ${file?.size || 0}, so_number: ${soNumberField || 'not provided'}, ` +
         `bundle_number: ${bundleNumberField || 'not provided'}, ` +
-        `bundle_id (legacy): ${bundleIdField || 'not provided'}`
+        `bundle_id (legacy): ${bundleIdField || 'not provided'}` +
+        (appendToBundleIdField ? `, append_to_bundle_id: ${appendToBundleIdField}` : '')
     );
 
     if (!file) {
@@ -374,6 +380,21 @@ export async function POST(request: Request) {
         `lsId: ${loadingSlip?.id ?? '(unlinked)'}, ` +
         `source: ${useParsed ? 'pdf-parse' : 'PENDING-placeholder'}`
     );
+
+    // Live-update Bundle.totalWeightKg from the (potentially new) Material
+    // rows linked to this bundle. Covers both initial mode (no-op when the
+    // bundler's pre-set value already matches) and append mode (where the
+    // appended material adds weight that the bundler never knew about).
+    if (bundle) {
+      try {
+        const { recomputeBundleWeight } = await import('@/lib/bundle-capacity');
+        await recomputeBundleWeight(bundle.id);
+      } catch (recomputeErr) {
+        console.warn(
+          `[ZLOAD1 Data] Bundle weight recompute failed for bundle ${bundle.id} (LS ${lsNumber}): ${recomputeErr instanceof Error ? recomputeErr.message : String(recomputeErr)}`,
+        );
+      }
+    }
 
     // First LS landed → SO moves to ls_created. Idempotent.
     await prisma.salesOrder.update({

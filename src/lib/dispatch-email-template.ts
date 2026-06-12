@@ -7,6 +7,8 @@
  * /email/branch-reply LLM parses their reply.
  */
 
+import { getProduct } from './product-db';
+
 export interface DispatchMaterial {
   material: string;
   materialDescription: string | null;
@@ -18,7 +20,30 @@ export interface DispatchMaterial {
 
 export interface DispatchSoSection {
   soNumber: string;
+  /** The plant assigned to this SO (`SalesOrder.plant`). Compared against
+   *  each material's `plant_code` from product-db to detect substitutions. */
+  soPlant?: string | null;
   materials: DispatchMaterial[];
+}
+
+/**
+ * Returns the substitute material's plant code when the material's product-db
+ * `plant_code` differs from the SO's plant — meaning this line was sourced
+ * from a cross-plant equivalent via `stock_precheck` substitution. Returns
+ * null when the material belongs to the SO's own plant (the common case).
+ *
+ * Used by both ls_dispatch (this file's `proseLineFor`) and the
+ * dispatch_confirmation body builder in auto-gui-trigger.ts to surface the
+ * substitution explicitly to the branch.
+ */
+export function substituteSourcePlant(
+  material: string,
+  soPlant: string | null | undefined,
+): string | null {
+  if (!soPlant) return null;
+  const product = getProduct(material);
+  if (!product || !product.plant_code) return null;
+  return product.plant_code !== soPlant ? product.plant_code : null;
 }
 
 function escapeHtml(s: string | null | undefined): string {
@@ -31,7 +56,7 @@ function escapeHtml(s: string | null | undefined): string {
     .replace(/'/g, '&#39;');
 }
 
-function proseLineFor(m: DispatchMaterial): string {
+function proseLineFor(m: DispatchMaterial, soPlant: string | null | undefined): string {
   const requested = m.orderQuantity;
   const available = m.availableStock ?? requested;
   const labelBase = m.materialDescription ?? m.material;
@@ -39,15 +64,22 @@ function proseLineFor(m: DispatchMaterial): string {
     ? `${escapeHtml(labelBase)} <span style="color:#888;font-weight:normal;">[${escapeHtml(m.material)}]</span>`
     : `<b>${escapeHtml(labelBase)}</b>`;
 
+  // Substitution suffix — appended to lines whose material's plant differs
+  // from the SO's plant (cross-plant substitution via stock_precheck).
+  const subPlant = substituteSourcePlant(m.material, soPlant);
+  const subSuffix = subPlant
+    ? ` <i style="color:#a04;">(sourced from plant ${escapeHtml(subPlant)} as a cross-plant equivalent of the originally requested SKU)</i>`
+    : '';
+
   if (available <= 0) {
-    return `<li><b>${label}:</b> Currently out of stock. You may choose to wait for replenishment or ignore this material to process the rest of the order.</li>`;
+    return `<li><b>${label}:</b>${subSuffix} Currently out of stock. You may choose to wait for replenishment or ignore this material to process the rest of the order.</li>`;
   }
 
   if (available < requested) {
-    return `<li><b>${label}:</b> At the moment, we are not in a position to supply the entire quantity requested (${requested} units) as the total free stock across batches is ${available} units. We can offer the available quantity from Batch ${escapeHtml(m.batch)}. Alternatively, you may choose to wait until the entire stock is replenished after production or ignore this material to process the rest of the order.</li>`;
+    return `<li><b>${label}:</b>${subSuffix} At the moment, we are not in a position to supply the entire quantity requested (${requested} units) as the total free stock across batches is ${available} units. We can offer the available quantity from Batch ${escapeHtml(m.batch)}. Alternatively, you may choose to wait until the entire stock is replenished after production or ignore this material to process the rest of the order.</li>`;
   }
 
-  return `<li><b>${label}:</b> Stock is confirmed available. Proceed with ${requested} units from Batch ${escapeHtml(m.batch)}.</li>`;
+  return `<li><b>${label}:</b>${subSuffix} Stock is confirmed available. Proceed with ${requested} units from Batch ${escapeHtml(m.batch)}.</li>`;
 }
 
 function renderSoSection(section: DispatchSoSection): string {
@@ -57,7 +89,9 @@ function renderSoSection(section: DispatchSoSection): string {
 <p style="color:#555;">No materials returned for this sales order.</p>`;
   }
 
-  const bullets = section.materials.map(proseLineFor).join('\n');
+  const bullets = section.materials
+    .map((m) => proseLineFor(m, section.soPlant ?? null))
+    .join('\n');
   return `
 <h2 style="margin-top:32px;">Sales Order ${escapeHtml(section.soNumber)}</h2>
 <p style="color:#222;line-height:1.7;">

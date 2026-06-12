@@ -1,0 +1,295 @@
+/**
+ * Post-plant-intimation capacity assessment.
+ *
+ * Once `LoadingSlip.status='sent_to_plant'`, bundles are FROZEN — composition
+ * must not change. When the branch asks to increase or add a material, we
+ * have three deterministic outcomes:
+ *
+ *   - fits_same_bundle  → the bundle that already carries this material has
+ *                         enough headroom; just modify the existing LS via
+ *                         ZLOAD2 (no LSI migration).
+ *   - fits_other_bundle → no headroom in the current bundle, but a sibling
+ *                         bundle on the same PO has space; issue a NEW LS
+ *                         onto that bundle via ZLOAD1 (append mode).
+ *   - needs_new_so      → every bundle is full; tell the branch to raise a
+ *                         fresh SO for the overflow.
+ *
+ * The decision is pure arithmetic. The LLM planner consumes the per-item
+ * verdict from the audit trail and emits the corresponding step path (see
+ * `Rule 11` in `llm-planner.ts`).
+ *
+ * `Bundle.totalWeightKg` is the source of truth here. It is live-maintained
+ * by every LSI write site that changes weight (see `zload2-data/route.ts`).
+ * As a belt-and-braces measure this helper also self-heals stale bundles
+ * before returning a verdict — see `backfillStaleBundleWeights`.
+ */
+
+import { prisma } from './prisma';
+
+export type CapacityVerdict =
+  /** The bundle that already carries `material` has remainingKg ≥ deltaKg. */
+  | { material: string; verdict: 'fits_same_bundle'; bundleId: string; remainingKg: number }
+  /** A different bundle on the same PO can absorb the delta. */
+  | { material: string; verdict: 'fits_other_bundle'; bundleId: string; remainingKg: number }
+  /** No bundle has room — branch must raise a new SO. */
+  | { material: string; verdict: 'needs_new_so'; bundleId: null; remainingKg: 0 };
+
+export interface AssessPostLsIncreaseArgs {
+  salesOrderId: string;
+  items: Array<{ material: string; deltaKg: number }>;
+}
+
+export interface AssessPostLsIncreaseResult {
+  verdicts: CapacityVerdict[];
+  /** PO id resolved from the SO; useful for callers that want to scope follow-on work. */
+  purchaseOrderId: string;
+  /** Truck capacity (kg) read from `PurchaseOrder.weightage * 1000`. */
+  capacityKg: number;
+}
+
+/**
+ * Assess whether each requested delta fits within an existing bundle on the
+ * SO's PO. Read-only; never mutates Bundle rows beyond the self-heal of
+ * `totalWeightKg` for any bundle whose stored value disagrees with the live
+ * sum across its LoadingSlipItems.
+ */
+export async function assessPostLsIncrease(
+  args: AssessPostLsIncreaseArgs,
+): Promise<AssessPostLsIncreaseResult> {
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: args.salesOrderId },
+    select: { purchaseOrderId: true, soNumber: true },
+  });
+  if (!so) {
+    throw new Error(`assessPostLsIncrease: SalesOrder ${args.salesOrderId} not found`);
+  }
+
+  const po = await prisma.purchaseOrder.findUnique({
+    where: { id: so.purchaseOrderId },
+    select: { id: true, poNumber: true, weightage: true },
+  });
+  if (!po) {
+    throw new Error(`assessPostLsIncrease: PurchaseOrder ${so.purchaseOrderId} not found`);
+  }
+  const tonnes = po.weightage ? Number(po.weightage) : 0;
+  if (tonnes <= 0) {
+    throw new Error(
+      `assessPostLsIncrease: PO ${po.poNumber} has no vehicle tonnage — cannot compute capacity`,
+    );
+  }
+  const capacityKg = tonnes * 1000;
+
+  // Self-heal any stale Bundle.totalWeightKg rows so the per-bundle remaining
+  // calculation below is honest. Cheap and idempotent.
+  await backfillStaleBundleWeights(po.id);
+
+  const bundles = await prisma.bundle.findMany({
+    where: { purchaseOrderId: po.id },
+    select: {
+      id: true,
+      bundleNumber: true,
+      totalWeightKg: true,
+      status: true,
+    },
+    orderBy: { bundleNumber: 'asc' },
+  });
+
+  const verdicts: CapacityVerdict[] = [];
+  // Tentative in-memory weight per bundle so multiple items in one assessment
+  // don't all double-book the same headroom. We commit nothing here — the
+  // actual writes happen later via zload1/zload2 callbacks — but for
+  // decision-making across N items we have to debit as we go.
+  const tentativeWeightKg = new Map<string, number>();
+  for (const b of bundles) {
+    tentativeWeightKg.set(b.id, Number(b.totalWeightKg));
+  }
+  const dispatchedIds = new Set(bundles.filter((b) => b.status === 'dispatched').map((b) => b.id));
+
+  for (const item of args.items) {
+    const currentBundleId = await findCurrentBundleForMaterial({
+      salesOrderId: args.salesOrderId,
+      material: item.material,
+    });
+
+    const remainingFor = (bundleId: string): number => {
+      if (dispatchedIds.has(bundleId)) return 0; // dispatched bundles are fully frozen
+      const used = tentativeWeightKg.get(bundleId) ?? 0;
+      return Math.max(0, capacityKg - used);
+    };
+
+    // Case a — current bundle has room.
+    if (currentBundleId && remainingFor(currentBundleId) >= item.deltaKg) {
+      tentativeWeightKg.set(
+        currentBundleId,
+        (tentativeWeightKg.get(currentBundleId) ?? 0) + item.deltaKg,
+      );
+      verdicts.push({
+        material: item.material,
+        verdict: 'fits_same_bundle',
+        bundleId: currentBundleId,
+        remainingKg: remainingFor(currentBundleId),
+      });
+      continue;
+    }
+
+    // Case b — best-fit among other non-dispatched bundles. Mirror
+    // stock_precheck's tie-breaker: smallest sufficient remaining first.
+    const candidates = bundles
+      .filter((b) => b.id !== currentBundleId && !dispatchedIds.has(b.id))
+      .map((b) => ({ id: b.id, remainingKg: remainingFor(b.id) }))
+      .filter((c) => c.remainingKg >= item.deltaKg)
+      .sort((a, b) => a.remainingKg - b.remainingKg);
+    if (candidates.length > 0) {
+      const pick = candidates[0];
+      tentativeWeightKg.set(
+        pick.id,
+        (tentativeWeightKg.get(pick.id) ?? 0) + item.deltaKg,
+      );
+      verdicts.push({
+        material: item.material,
+        verdict: 'fits_other_bundle',
+        bundleId: pick.id,
+        remainingKg: pick.remainingKg - item.deltaKg,
+      });
+      continue;
+    }
+
+    // Case c — no bundle can take it.
+    verdicts.push({
+      material: item.material,
+      verdict: 'needs_new_so',
+      bundleId: null,
+      remainingKg: 0,
+    });
+  }
+
+  return {
+    verdicts,
+    purchaseOrderId: po.id,
+    capacityKg,
+  };
+}
+
+/**
+ * Returns the bundle that currently carries `material` for `salesOrderId`,
+ * or null if the material isn't on any bundle yet. We resolve via LSI →
+ * LoadingSlip.bundleId because that's authoritative once ZLOAD1 has run.
+ * As a fallback we also check `Material.bundleId` (set by the bundler
+ * pre-ZLOAD1).
+ */
+async function findCurrentBundleForMaterial(args: {
+  salesOrderId: string;
+  material: string;
+}): Promise<string | null> {
+  const lsi = await prisma.loadingSlipItem.findFirst({
+    where: {
+      salesOrderId: args.salesOrderId,
+      material: args.material,
+      loadingSlipId: { not: null },
+    },
+    select: { loadingSlip: { select: { bundleId: true } } },
+  });
+  if (lsi?.loadingSlip?.bundleId) return lsi.loadingSlip.bundleId;
+
+  const m = await prisma.material.findFirst({
+    where: { salesOrderId: args.salesOrderId, material: args.material },
+    select: { bundleId: true },
+  });
+  return m?.bundleId ?? null;
+}
+
+/**
+ * For every Bundle under the PO, compare stored `totalWeightKg` against the
+ * live recomputation from `Material` rows linked to the bundle and persist
+ * mismatches. Uses the same formula the bundler does on initial creation:
+ *   weight = (dispatchQuantity / orderQuantity) * orderWeightKg
+ * summed over every Material with `bundleId == bundle.id`. Cheap (one read
+ * per PO + per-bundle update only on drift). Idempotent.
+ *
+ * Why this is needed: `Bundle.totalWeightKg` was historically set once at
+ * bundle creation and never updated even when ZLOAD2 changed Material
+ * quantities. The new post-plant flow uses this field as the authority for
+ * remaining capacity, so we self-heal whenever the helper runs.
+ */
+async function backfillStaleBundleWeights(purchaseOrderId: string): Promise<void> {
+  const bundles = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    select: {
+      id: true,
+      totalWeightKg: true,
+      materials: {
+        select: {
+          dispatchQuantity: true,
+          orderQuantity: true,
+          orderWeightKg: true,
+        },
+      },
+    },
+  });
+  for (const b of bundles) {
+    if (b.materials.length === 0) continue; // pre-ZLOAD1 — leave bundler's value alone
+    const liveKg = computeBundleWeightFromMaterials(b.materials);
+    const stored = Number(b.totalWeightKg);
+    if (Math.abs(stored - liveKg) < 0.5) continue; // < 500 g drift — call it equal
+    await prisma.bundle.update({
+      where: { id: b.id },
+      data: { totalWeightKg: liveKg },
+    });
+    console.log(
+      `[bundle-capacity] Self-healed Bundle ${b.id}.totalWeightKg: ${stored} → ${liveKg} kg`,
+    );
+  }
+}
+
+/**
+ * Compute a bundle's live weight from its linked Material rows. Mirrors the
+ * formula in bundler.ts `computeBundlesForPo` so the rollup stays consistent
+ * with how the initial value was set.
+ */
+export function computeBundleWeightFromMaterials(
+  materials: Array<{
+    dispatchQuantity: number | null;
+    orderQuantity: number;
+    orderWeightKg: { toString(): string } | null;
+  }>,
+): number {
+  let total = 0;
+  for (const m of materials) {
+    const dispatchQty = m.dispatchQuantity ?? 0;
+    const orderedQty = m.orderQuantity || 0;
+    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    if (orderedQty > 0 && dispatchQty > 0 && fullWeight > 0) {
+      total += (dispatchQty / orderedQty) * fullWeight;
+    }
+  }
+  return total;
+}
+
+/**
+ * Recompute and persist `Bundle.totalWeightKg` for a single bundle. Call
+ * from every callback that mutates a Material row (qty, weight) under the
+ * bundle. Idempotent; safe to call repeatedly. No-op when the bundle has
+ * no linked materials yet (pre-ZLOAD1) or the value didn't drift.
+ */
+export async function recomputeBundleWeight(bundleId: string): Promise<void> {
+  const materials = await prisma.material.findMany({
+    where: { bundleId },
+    select: {
+      dispatchQuantity: true,
+      orderQuantity: true,
+      orderWeightKg: true,
+    },
+  });
+  if (materials.length === 0) return;
+  const live = computeBundleWeightFromMaterials(materials);
+  const current = await prisma.bundle.findUnique({
+    where: { id: bundleId },
+    select: { totalWeightKg: true },
+  });
+  if (!current) return;
+  if (Math.abs(Number(current.totalWeightKg) - live) < 0.5) return;
+  await prisma.bundle.update({
+    where: { id: bundleId },
+    data: { totalWeightKg: live },
+  });
+}

@@ -50,10 +50,21 @@ export type StepKind =
   // ZSO_Visibility + Zmatana — single step (Zmatana is part of the auto_gui2
   // ZSO-VISIBILITY pipeline, not a separate transaction).
   | 'zso_visibility'                  // triggerZsoVisibility
+  // ZMatana standalone — fetches batch + availability for a specific material
+  // code WITHOUT re-running ZSO_Visibility. Used after stock_precheck
+  // substitutes a short material with a cross-plant equivalent.
+  | 'lone_zmatana'                    // triggerLoneZmatana
   // Free-stock pre-check against the synced inventory_snapshot DB. Replaces
   // the spreadsheet's "Zmatana" Step 2 for increase-shaped modifications:
   // short → email branch & abort scenario; sufficient → advance to VA02.
   | 'stock_precheck'
+  // Post-plant-intimation guard. After plant_ls has been sent, bundles are
+  // frozen — LSIs cannot migrate between bundles. This step is a pure
+  // arithmetic helper (no SAP call) that decides, per material delta,
+  // whether the increase fits in the current bundle (→ zload2), an alternate
+  // bundle (→ zload1 in append mode), or no bundle at all (→ ask branch to
+  // raise a new SO). The planner reads the verdict from the audit trail.
+  | 'bundle_capacity_assessment'
   | 'va02'                            // triggerVa02
   | 'mb51'                            // daily FCFS reactivator — wait intent step
   | 'zload1'                          // triggerZload1 (via dispatch-confirmation path)
@@ -76,6 +87,10 @@ export type StepKind =
   | 'email_clarify_branch'            // Ask BRANCH to clarify an ambiguous / incomplete reply
   | 'email_clarify_plant'             // Ask PLANT to clarify an ambiguous / incomplete reply
   | 'email_supervisor_question'       // Ask the SUPERVISOR which option to pursue when stuck
+  // Tells the branch their post-plant increase cannot be accommodated within
+  // the existing bundle plan and asks them to raise a new SO for the
+  // overflow. Terminal (the new SO arrives as a fresh NEW ORDER email).
+  | 'email_branch_request_new_so'
   | 'process_plant_invoice'           // plant replied with invoice PDF → checkAndSendBatchToAman
   | 'process_tonnage_reply'           // branch replied to tonnage_inquiry → extract tonnage, write to PO.weightage
   | 'await_plant_invoice'             // sentinel — engine pauses; plant reply advances it

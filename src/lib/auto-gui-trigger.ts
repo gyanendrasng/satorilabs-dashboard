@@ -1,7 +1,7 @@
 import { prisma } from './prisma';
 import { downloadFromS3 } from './s3';
 import { sendPlainEmail, sendReplyEmail, sendHtmlEmail, sendHtmlReplyEmail, getMessageRfc822Id } from './gmail';
-import { buildDispatchApprovalHtml, type DispatchSoSection } from './dispatch-email-template';
+import { buildDispatchApprovalHtml, substituteSourcePlant, type DispatchSoSection } from './dispatch-email-template';
 import { enqueueWork, pumpQueue } from './work-queue';
 import { computeBundlesForPo } from './bundler';
 import { sendLSEmail } from './email-service';
@@ -807,7 +807,7 @@ type BundleForEmail = {
     dispatchQuantity: number | null;
     orderQuantity: number;
     orderWeightKg: import('@prisma/client').Prisma.Decimal | number | null;
-    salesOrder: { soNumber: string };
+    salesOrder: { soNumber: string; plant: string | null };
   }>;
 };
 
@@ -836,7 +836,13 @@ function renderDispatchConfirmationBody(args: {
         const orderedQty = m.orderQuantity || 0;
         const fullWeightKg = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
         const itemKg = orderedQty > 0 ? (dispatchQty / orderedQty) * fullWeightKg : 0;
-        return `  - SO ${m.salesOrder.soNumber} / ${m.material} (Batch ${m.batch}): ${dispatchQty} units, ${fmtT(itemKg / 1000)} t`;
+        // Append "(sourced from plant X)" for materials whose product-db plant
+        // differs from the SO's own plant — i.e. cross-plant substitutions
+        // chosen by stock_precheck. Branch sees explicitly which lines aren't
+        // coming from their usual plant.
+        const subPlant = substituteSourcePlant(m.material, m.salesOrder.plant);
+        const subSuffix = subPlant ? ` (sourced from plant ${subPlant})` : '';
+        return `  - SO ${m.salesOrder.soNumber} / ${m.material} (Batch ${m.batch}): ${dispatchQty} units, ${fmtT(itemKg / 1000)} t${subSuffix}`;
       });
       return `Bundle ${b.bundleNumber} — ${bundleT} t (of ${capacityTonnes} t capacity):\n${lines.join('\n')}`;
     })
@@ -916,7 +922,10 @@ export async function sendDispatchConfirmationEmail(args: {
     include: {
       materials: {
         where: { dispatchQuantity: { gt: 0 } },
-        include: { salesOrder: { select: { soNumber: true } } },
+        // `plant` is needed alongside soNumber so renderDispatchConfirmationBody
+        // can detect cross-plant substituted materials and surface them in the
+        // body (see substituteSourcePlant in dispatch-email-template.ts).
+        include: { salesOrder: { select: { soNumber: true, plant: true } } },
         orderBy: [{ material: 'asc' }],
       },
     },
@@ -1255,6 +1264,65 @@ export async function fanOutZload1ForPo(
 }
 
 /**
+ * Append-mode ZLOAD1 fan-out for the post-plant-intimation flow.
+ *
+ * Used when `bundle_capacity_assessment` returns `fits_other_bundle`: the
+ * branch added/increased a material that fits in a sibling bundle on the
+ * same PO, but the existing LSs on the current bundle can't absorb it. We
+ * issue a NEW loading slip onto the target bundle for just the appended
+ * materials — bypassing computeBundlesForPo entirely (which would throw
+ * BundlesFrozenError post-plant). The zload1-data callback reads the
+ * `append_to_bundle_id` from the WorkQueue meta and links the new LS to
+ * that bundle directly, then bumps Bundle.totalWeightKg.
+ *
+ * Refuses on dispatched bundles — once a truck has rolled, no appends.
+ */
+export async function fanOutZload1AppendToBundle(args: {
+  salesOrderId: string;
+  appendToBundleId: string;
+  materials: Array<{ material_code: string; batch?: string; quantity: number }>;
+  log: (msg: string) => void;
+}): Promise<{ fired: number }> {
+  const { salesOrderId, appendToBundleId, materials, log } = args;
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: salesOrderId },
+    select: { soNumber: true, purchaseOrderId: true },
+  });
+  if (!so) {
+    throw new Error(`fanOutZload1AppendToBundle: SO ${salesOrderId} not found`);
+  }
+  const bundle = await prisma.bundle.findUnique({
+    where: { id: appendToBundleId },
+    select: { id: true, bundleNumber: true, status: true, purchaseOrderId: true },
+  });
+  if (!bundle) {
+    throw new Error(`fanOutZload1AppendToBundle: Bundle ${appendToBundleId} not found`);
+  }
+  if (bundle.purchaseOrderId !== so.purchaseOrderId) {
+    throw new Error(
+      `fanOutZload1AppendToBundle: Bundle ${appendToBundleId} (PO ${bundle.purchaseOrderId}) does not belong to SO's PO (${so.purchaseOrderId})`,
+    );
+  }
+  if (bundle.status === 'dispatched') {
+    throw new Error(
+      `fanOutZload1AppendToBundle: Bundle ${appendToBundleId} is dispatched — no appends permitted`,
+    );
+  }
+
+  const payloadItems: MaterialItemPayload[] = materials.map((m) => ({
+    material_code: m.material_code,
+    batch: m.batch ?? '',
+    quantity: m.quantity,
+  }));
+
+  await triggerZload1(so.soNumber, payloadItems, bundle.id, bundle.bundleNumber, true);
+  log(
+    `[ZLOAD1-Append] Fired append-mode ZLOAD1 for SO ${so.soNumber} onto Bundle ${bundle.bundleNumber} (id=${bundle.id}): ${payloadItems.length} material(s)`,
+  );
+  return { fired: 1 };
+}
+
+/**
  * Branch replied to the dispatch confirmation email.
  * Light parsing: 'yes/confirm/proceed' → fire ZLOAD1 per SO from the saved
  * Material.dispatchQuantity values. Anything else (changes, 'no') is left
@@ -1312,6 +1380,72 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
   });
   await pumpQueue();
   console.log(`[ZSO-VISIBILITY] Enqueued for SO ${soNumber}`);
+}
+
+/**
+ * Run ZMatana standalone for one or more material codes on the current SO.
+ *
+ * Used after `stock_precheck` substitutes a short material with a cross-plant
+ * equivalent: VA02 has swapped the SO line to the new material code, and we
+ * need ZMatana to fetch its batch + per-SO availability so downstream steps
+ * (ls_dispatch, bundling) can ship it. We can't re-run ZSO_Visibility because
+ * that re-syncs the entire SO and would reset state we've intentionally
+ * changed.
+ *
+ * Enqueues ONE WorkQueue row per material. The auto_gui2 endpoint for the
+ * `ZMATANA_LONE` transaction is a parallel work item on the SAP-automation
+ * side; on success it POSTs to /backend/orders/aman/zmatana-data with the
+ * material's batch + available_stock_for_so.
+ */
+export async function triggerLoneZmatana(
+  soNumber: string,
+  materialCodes: string[],
+): Promise<void> {
+  if (materialCodes.length === 0) {
+    console.log(`[ZMATANA_LONE] No materials provided for SO ${soNumber} — skipping`);
+    return;
+  }
+  const normalized = Array.from(new Set(materialCodes));
+  const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
+
+  for (const material of normalized) {
+    // Dedup on (soNumber, material) — calling triggerLoneZmatana twice within
+    // a single flow for the same material is a no-op for already-queued or
+    // in-flight rows.
+    const existing = await prisma.workQueue.findFirst({
+      where: {
+        step: 'lone_zmatana',
+        state: { in: ['queued', 'firing', 'done'] },
+        AND: [
+          { payload: { contains: `"transaction_code":"ZMATANA_LONE"` } },
+          { payload: { contains: `"so_number":"${soNumber}"` } },
+          { payload: { contains: `"material":"${material}"` } },
+        ],
+      },
+      select: { id: true, state: true },
+    });
+    if (existing) {
+      console.log(`[ZMATANA_LONE] Already exists for SO ${soNumber} material ${material} (${existing.state}) — skipping`);
+      continue;
+    }
+
+    await enqueueWork({
+      salesOrderId: so?.id ?? null,
+      step: 'lone_zmatana',
+      payload: {
+        instruction:
+          `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+          `Transaction ZMATANA for Sales Order number ${soNumber}, material ${material}.`,
+        transaction_code: 'ZMATANA_LONE',
+        meta: {
+          so_number: soNumber,
+          material,
+        },
+      },
+    });
+  }
+  await pumpQueue();
+  console.log(`[ZMATANA_LONE] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${normalized.join(', ')})`);
 }
 
 /**
@@ -1639,6 +1773,10 @@ export async function assembleAndSendCombinedEmail(
   // Build the HTML body (we now compose it ourselves; no longer rely on auto_gui2's email_body)
   const sections: DispatchSoSection[] = includedSOs.map((so) => ({
     soNumber: so.soNumber,
+    // Used by `proseLineFor` / `substituteSourcePlant` to flag cross-plant
+    // substituted materials (their `plant_code` in product-db differs from
+    // the SO's own plant) so the body explicitly notes the source plant.
+    soPlant: so.plant,
     materials: so.materials.map((m) => ({
       material: m.material,
       materialDescription: m.materialDescription,
@@ -1928,7 +2066,14 @@ async function triggerZload1(
   soNumber: string,
   materials: MaterialItemPayload[],
   bundleId?: string,
-  bundleNumber?: number
+  bundleNumber?: number,
+  /**
+   * True when the planner asked for an APPEND-mode ZLOAD1: the resulting LS
+   * attaches to an EXISTING bundle and the zload1-data callback must skip
+   * the compute-bundles path. Surfaces as `meta.append_to_bundle_id` on the
+   * WorkQueue row.
+   */
+  appendMode?: boolean,
 ): Promise<void> {
   const materialsList = materials
     .map(
@@ -1989,12 +2134,13 @@ async function triggerZload1(
         so_number: soNumber,
         ...(bundleId ? { bundle_id: bundleId } : {}),
         ...(bundleNumber ? { bundle_number: bundleNumber } : {}),
+        ...(appendMode && bundleId ? { append_to_bundle_id: bundleId } : {}),
         dedup_key: dedupKey,
       },
     },
   });
   await pumpQueue();
-  console.log(`[ZLOAD1] Enqueued for SO ${soNumber}${bundleSuffix} (${materials.length} material(s))`);
+  console.log(`[ZLOAD1] Enqueued for SO ${soNumber}${bundleSuffix}${appendMode ? ' (APPEND mode)' : ''} (${materials.length} material(s))`);
 }
 
 /**

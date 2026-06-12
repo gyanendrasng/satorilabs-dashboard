@@ -14,6 +14,39 @@ export class BundlerWeightageMissingError extends Error {
   }
 }
 
+/**
+ * Thrown by computeBundlesForPo when at least one LoadingSlip under the PO
+ * has already been sent to the plant. The composition of those bundles is
+ * frozen and the wipe-and-recreate path would migrate LSIs across bundles,
+ * which the plant has already committed truck-side logistics against. The
+ * planner's Rule 11 handles post-plant modifications without this path; this
+ * guard exists as a hard backstop so any other caller that hits the bundler
+ * post-intimation fails loudly rather than silently rearranging composition.
+ */
+export class BundlesFrozenError extends Error {
+  constructor(public readonly purchaseOrderId: string, public readonly sentLsCount: number) {
+    super(
+      `PurchaseOrder ${purchaseOrderId}: ${sentLsCount} loading slip(s) already sent to plant — bundles are frozen and cannot be re-bundled. Use the post-plant modify flow (Rule 11) instead.`,
+    );
+    this.name = 'BundlesFrozenError';
+  }
+}
+
+/**
+ * Returns true when any LoadingSlip under `purchaseOrderId` has reached
+ * `status='sent_to_plant'` (or later — `invoiced`, `completed`). Used by
+ * computeBundlesForPo to refuse re-bundling once the plant has been told.
+ */
+export async function anyLoadingSlipSentToPlant(purchaseOrderId: string): Promise<boolean> {
+  const sentLs = await prisma.loadingSlip.count({
+    where: {
+      salesOrder: { purchaseOrderId },
+      status: { in: ['sent_to_plant', 'invoiced', 'completed'] },
+    },
+  });
+  return sentLs > 0;
+}
+
 export type BundlerInput = { id: string; material: string; weightKg: number };
 export type BundlerBin = { bundleNumber: number; totalKg: number; itemIds: string[] };
 
@@ -278,6 +311,22 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
     where: { id: purchaseOrderId },
   });
   if (!po) throw new Error(`PurchaseOrder ${purchaseOrderId} not found`);
+
+  // Bundle-freeze guard. Once a LoadingSlip on this PO has reached
+  // 'sent_to_plant' (or later), the truck-side composition is committed.
+  // Wipe-and-recreate would migrate LSIs across bundles, which is exactly
+  // what the plant has already committed against. Refuse loudly — Rule 11
+  // in the planner handles post-plant modifications via a different path
+  // (bundle_capacity_assessment → zload2 OR zload1-append OR new-SO email).
+  const sentLs = await prisma.loadingSlip.count({
+    where: {
+      salesOrder: { purchaseOrderId },
+      status: { in: ['sent_to_plant', 'invoiced', 'completed'] },
+    },
+  });
+  if (sentLs > 0) {
+    throw new BundlesFrozenError(purchaseOrderId, sentLs);
+  }
 
   // Vehicle capacity comes from the NEW ORDER email and is stored on the
   // PO directly. If it's null, the branch never told us — the intake

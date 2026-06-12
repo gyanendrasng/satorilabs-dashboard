@@ -165,6 +165,11 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
     argsSchema: '{ materials: [{ code: "<material code>", op: "inc"|"dec"|"del", qty?: <number, omit for del> }, ...] }',
   },
   {
+    kind: 'bundle_capacity_assessment',
+    description: 'Post-plant-intimation capacity check. Use AS THE VERY FIRST STEP (before stock_precheck) whenever plant_ls has been sent AND the branch is asking to INCREASE or ADD a material. The engine computes, per material delta in kg, whether the increase fits in the bundle that already carries the material, a different bundle on the same PO, or no bundle at all. The verdict appears in the audit trail as step_completed bundle_capacity_assessment with payload.verdicts = [{material, verdict, bundleId, remainingKg}]. Read those verdicts on your NEXT plan call (this step terminates the current plan) and emit the per-item path per Rule 11. No SAP transaction; one engine-side step only.',
+    argsSchema: '{ items: [{ material: "<code>", deltaKg: <number, positive — the additional weight in kg this material is gaining> }, ...] }',
+  },
+  {
     kind: 'va02',
     description: 'Modify SO line items in SAP. Use ONLY when increasing a material quantity. Decreases and deletes do not need va02.',
     argsSchema: '{ materials: [{ code: "<material code>", op: "inc", qty: <new total quantity, integer> }, ...] }',
@@ -175,14 +180,19 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
     argsSchema: null,
   },
   {
+    kind: 'lone_zmatana',
+    description: 'Run ZMatana standalone for one or more material codes — fetches per-material availability + batch from SAP WITHOUT re-running ZSO_Visibility. Use ONLY when stock_precheck substituted a short material with a cross-plant equivalent (you will see step_completed stock_precheck with a substitutions payload in the audit trail). Sequence: va02 (with the substitute material codes) → lone_zmatana (with the same substitute codes) → email_2nd_release. The substitute Material rows need batch + availableStock populated before any downstream step can ship them.',
+    argsSchema: '{ materials: [{ code: "<substitute material code>" }, ...] }',
+  },
+  {
     kind: 'mb51',
     description: 'Park on daily FCFS reactivator. Use only when waiting for new stock to arrive.',
     argsSchema: null,
   },
   {
     kind: 'zload1',
-    description: 'Create loading slips (LSs). Use ONLY when no LSs exist yet for this SO (i.e. SO.status != ls_created).',
-    argsSchema: null,
+    description: 'Create loading slips (LSs). Two modes: (1) initial — no args; fans out per-bundle from the SO\'s computed bundles. (2) APPEND mode — pass args.appendToBundleId + args.materials to issue a SINGLE new LS attached to an existing bundle. Use mode (2) ONLY after a bundle_capacity_assessment verdict of `fits_other_bundle` post-plant-intimation; the materials list is the just-VA02\'d new SO line(s) going onto the target bundle.',
+    argsSchema: '(optional, append mode only): { appendToBundleId: "<bundle cuid from audit>", materials: [{ code: "<material code>", batch: "<batch if known>", qty: <int> }, ...] }',
   },
   {
     kind: 'zload2',
@@ -258,6 +268,11 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
     kind: 'email_supervisor_question',
     description: 'Email the SUPERVISOR for guidance when you do not know which step to take. Use ONLY when the audit trail / email thread leave you genuinely unable to choose between options. Provide the exact question text as `question` and the alternatives you are weighing as `options` (each a short phrase). The executor sends the email and pauses; the supervisor reply will be classified by the next plan.',
     argsSchema: null,
+  },
+  {
+    kind: 'email_branch_request_new_so',
+    description: 'Send the branch a final-step email telling them their requested increase cannot be accommodated within the existing dispatch plan (every bundle on the PO is full and already intimated to the plant) and asking them to raise a fresh SO for the additional units. Use ONLY when a prior bundle_capacity_assessment returned `needs_new_so` for at least one item. Terminal — the new SO arrives as a normal NEW ORDER email and re-enters the pipeline.',
+    argsSchema: '{ items: [{ material: "<code>", deltaKg: <number, the overflow weight that cannot be accommodated> }, ...] }',
   },
   {
     kind: 'await_plant_invoice',
@@ -514,8 +529,66 @@ trigger email type, to decide whose intent this is.
   6. INBOUND: branch MODIFY-INCREASE on ls_dispatch (pre-LS, no LSs yet).
      EMIT: stock_precheck → va02 → email_2nd_release. STOP.
 
-  6b. INBOUND: branch MODIFY-INCREASE on plant_ls (post-LS, LSs already exist).
-      EMIT: stock_precheck → va02 → email_2nd_release. STOP.
+  6b. INBOUND: branch MODIFY-INCREASE — LSs exist but plant_ls NOT yet sent
+      (audit trail has step_completed zload1 ✓ but NO email_sent plant_ls).
+      Bundles can still be re-composed safely. EMIT: stock_precheck → va02 →
+      email_2nd_release. STOP. (Downstream re-bundling happens automatically
+      when the new release plan lands.)
+
+  6e. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL on a plant_ls
+      email — i.e. plant_ls has already been sent (CURRENT SO STATE shows
+      \`plant_ls email sent: yes\` AND audit trail has \`email_sent plant_ls\`).
+      Bundles are FROZEN: loading slips cannot migrate between bundles. Your
+      FIRST step MUST be bundle_capacity_assessment with one items[] entry
+      per material being increased / added. deltaKg = additional kilograms
+      this material is gaining (read it from the email — branch usually
+      states units; convert via the material's Material.orderWeightKg if
+      shown, otherwise read the email's weight figure directly). STOP after
+      bundle_capacity_assessment; the engine emits step_completed with
+      payload.verdicts = [{material, verdict, bundleId, remainingKg}] and
+      re-enters this planner. On the NEXT plan call:
+        - For each item with verdict='fits_same_bundle':
+          EMIT (per item) stock_precheck → va02 → email_2nd_release →
+          zso_visibility → zload2 → email_modified_ls_to_plant.
+        - For each item with verdict='fits_other_bundle':
+          EMIT (per item) stock_precheck → va02 → email_2nd_release →
+          zso_visibility → zload1 (APPEND mode — pass args.appendToBundleId
+          and args.materials carrying the new material code + qty) →
+          email_to_plant. The zload1 step here MUST include args; without
+          them the engine treats it as initial-mode which would re-bundle
+          and fail with BundlesFrozenError.
+        - If ANY item has verdict='needs_new_so':
+          EMIT email_branch_request_new_so with args.items =
+          [{material, deltaKg}] for the overflow items. STOP. Do NOT
+          emit va02 for those items. Items that DID fit (same or other
+          bundle) can be progressed on the same plan call; only the
+          overflow items are deferred to the new-SO request.
+      Multiple items in one reply MAY mix verdicts; emit per-item paths
+      in order (fits-bundle items first, overflow last).
+      Do NOT skip bundle_capacity_assessment when plant_ls has been sent —
+      Rule 6 / 6b apply only BEFORE plant_ls.
+
+  6c. RE-PLAN AFTER CROSS-PLANT SUBSTITUTION. If the audit trail shows a
+      step_completed for stock_precheck with a \`substitutions\` payload like
+      \`substitutions: [{ originalMaterial, substituteMaterial, substitutePlant, requested, ... }, ...]\`,
+      the stock_precheck engine swapped one or more short materials with
+      cross-plant equivalents. This means VA02 has NOT yet fired — the
+      previous plan was terminated after stock_precheck so a fresh plan
+      could emit VA02 with the correct substitute material codes. You must:
+        - EMIT va02 with materials = the SUBSTITUTE codes (NOT the originals).
+          For each substitutions row, the va02 step's \`args.materials\` entry
+          uses \`code: substituteMaterial\` and the same \`qty\` as \`requested\`
+          (the substitute fully replaces the original line).
+        - EMIT lone_zmatana with materials = the SAME substitute codes (one
+          entry per substitution). This fetches batch + availableStock for
+          the substitute Material rows so downstream steps can ship them.
+        - EMIT email_2nd_release to the plant (existing semantics — plant
+          confirms the swap). Its materials args carry the substitute codes
+          and qty (op="inc"), so the plant sees what they're confirming.
+      EMIT order: va02 → lone_zmatana → email_2nd_release. STOP.
+      Do NOT re-emit stock_precheck — it has already run and the
+      substitutions are recorded in the audit trail; re-emitting it would
+      re-do the lookup needlessly.
 
   7. INBOUND: branch MODIFY-DECREASE or MODIFY-DELETE on ls_dispatch (pre-LS).
      EMIT: email_confirm_bundle_details. STOP.

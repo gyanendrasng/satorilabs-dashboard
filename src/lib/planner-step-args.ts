@@ -88,6 +88,99 @@ export function coerceVa02Args(step: PlannedStep | undefined): Va02Item[] {
   });
 }
 
+// ─── zload1 (append mode) ──────────────────────────────────────────────────
+
+export interface Zload1AppendArgs {
+  appendToBundleId: string;
+  materials: Array<{ code: string; batch?: string; qty: number }>;
+}
+
+/**
+ * Returns the append-mode args when the planner supplied them, otherwise null
+ * (initial mode — no args, fan-out from computed bundles). Throws if the
+ * planner emitted a partial / malformed append payload.
+ */
+export function coerceZload1AppendArgs(step: PlannedStep | undefined): Zload1AppendArgs | null {
+  const raw = step?.args;
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (r.appendToBundleId === undefined && r.materials === undefined) return null;
+
+  const appendToBundleId = asString(r.appendToBundleId, 'appendToBundleId', 'zload1');
+  const materials = requireArray(r.materials, 'materials', 'zload1').map((m, i) => {
+    const item = m as Record<string, unknown>;
+    const code = asString(item.code, `materials[${i}].code`, 'zload1');
+    const batch = asOptionalString(item.batch);
+    const qty = asInt(item.qty, `materials[${i}].qty`, 'zload1');
+    if (qty <= 0) {
+      throw new PlannerArgsError(`zload1.args.materials[${i}].qty must be positive, got ${qty}`);
+    }
+    return { code, batch, qty };
+  });
+  return { appendToBundleId, materials };
+}
+
+// ─── bundle_capacity_assessment ────────────────────────────────────────────
+
+export interface BundleCapacityAssessmentItem {
+  material: string;
+  /** Additional weight in kilograms this material is being asked to add. */
+  deltaKg: number;
+}
+
+export function coerceBundleCapacityArgs(step: PlannedStep | undefined): BundleCapacityAssessmentItem[] {
+  const args = requireArgs(step, 'bundle_capacity_assessment');
+  const items = requireArray(args.items, 'items', 'bundle_capacity_assessment');
+  return items.map((raw, i) => {
+    const it = raw as Record<string, unknown>;
+    const material = asString(it.material, `items[${i}].material`, 'bundle_capacity_assessment');
+    if (typeof it.deltaKg !== 'number' || !Number.isFinite(it.deltaKg) || it.deltaKg <= 0) {
+      throw new PlannerArgsError(
+        `bundle_capacity_assessment.args.items[${i}].deltaKg must be a positive finite number, got ${JSON.stringify(it.deltaKg)}`,
+      );
+    }
+    return { material, deltaKg: it.deltaKg };
+  });
+}
+
+// ─── email_branch_request_new_so ───────────────────────────────────────────
+
+export interface BranchNewSoItem {
+  material: string;
+  deltaKg: number;
+}
+
+export function coerceBranchNewSoArgs(step: PlannedStep | undefined): BranchNewSoItem[] {
+  const args = requireArgs(step, 'email_branch_request_new_so');
+  const items = requireArray(args.items, 'items', 'email_branch_request_new_so');
+  return items.map((raw, i) => {
+    const it = raw as Record<string, unknown>;
+    const material = asString(it.material, `items[${i}].material`, 'email_branch_request_new_so');
+    if (typeof it.deltaKg !== 'number' || !Number.isFinite(it.deltaKg) || it.deltaKg <= 0) {
+      throw new PlannerArgsError(
+        `email_branch_request_new_so.args.items[${i}].deltaKg must be a positive finite number, got ${JSON.stringify(it.deltaKg)}`,
+      );
+    }
+    return { material, deltaKg: it.deltaKg };
+  });
+}
+
+// ─── lone_zmatana ──────────────────────────────────────────────────────────
+
+/**
+ * Returns the list of material codes the planner wants ZMatana run for. The
+ * planner emits `{ materials: [{ code }, ...] }`; we project to a flat string
+ * array since the trigger function only needs codes.
+ */
+export function coerceLoneZmatanaArgs(step: PlannedStep | undefined): string[] {
+  const args = requireArgs(step, 'lone_zmatana');
+  const materials = requireArray(args.materials, 'materials', 'lone_zmatana');
+  return materials.map((raw, i) => {
+    const m = raw as Record<string, unknown>;
+    return asString(m.code, `materials[${i}].code`, 'lone_zmatana');
+  });
+}
+
 // ─── zload2 ─────────────────────────────────────────────────────────────────
 
 export interface Zload2Revision {

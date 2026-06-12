@@ -11,7 +11,7 @@ const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
  */
 export const SAP_TEST_MODE = process.env.NEXT_PUBLIC_SAP_TEST_MODE === 'true';
 
-export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51' | 'zloading_close' | 'va02' | 'zload2';
+export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51' | 'zloading_close' | 'va02' | 'zload2' | 'lone_zmatana';
 
 /**
  * Retry policy: 1 initial attempt + 3 retries = 4 total. Uniform across all
