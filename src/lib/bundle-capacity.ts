@@ -266,6 +266,41 @@ export function computeBundleWeightFromMaterials(
 }
 
 /**
+ * Recompute and persist `Bundle.totalWeightKg` for every bundle that holds
+ * any Material under `salesOrderId`. Call from every callback that mutates
+ * Material rows on an SO (visibility-data, zmatana-data, etc.) so the
+ * post-plant capacity assessment reads honest values. Idempotent.
+ *
+ * Returns the number of bundles touched (drift detected and updated).
+ */
+export async function recomputeBundleWeightsForSo(salesOrderId: string): Promise<number> {
+  const bundleIds = await prisma.material.findMany({
+    where: { salesOrderId, bundleId: { not: null } },
+    select: { bundleId: true },
+    distinct: ['bundleId'],
+  });
+  let touched = 0;
+  for (const row of bundleIds) {
+    if (!row.bundleId) continue;
+    const before = await prisma.bundle.findUnique({
+      where: { id: row.bundleId },
+      select: { totalWeightKg: true },
+    });
+    await recomputeBundleWeight(row.bundleId);
+    if (before) {
+      const after = await prisma.bundle.findUnique({
+        where: { id: row.bundleId },
+        select: { totalWeightKg: true },
+      });
+      if (after && Math.abs(Number(before.totalWeightKg) - Number(after.totalWeightKg)) >= 0.5) {
+        touched++;
+      }
+    }
+  }
+  return touched;
+}
+
+/**
  * Recompute and persist `Bundle.totalWeightKg` for a single bundle. Call
  * from every callback that mutates a Material row (qty, weight) under the
  * bundle. Idempotent; safe to call repeatedly. No-op when the bundle has

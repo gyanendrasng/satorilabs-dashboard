@@ -109,6 +109,22 @@ export async function POST(request: Request) {
       `[ZmatanaData] Upserted Material(${materialCode}, batch=${batch}, avail=${body.available_stock_for_so ?? '?'}) for SO ${soNumber}`,
     );
 
+    // Live-update Bundle.totalWeightKg for any bundle that holds Material
+    // rows on this SO. ZMatana on a substitute material refreshes weight,
+    // and the parent VA02 → ZSO_Visibility step may have already updated
+    // the swapped line's qty — both are weight inputs we need rolled up.
+    try {
+      const { recomputeBundleWeightsForSo } = await import('@/lib/bundle-capacity');
+      const touched = await recomputeBundleWeightsForSo(salesOrder.id);
+      if (touched > 0) {
+        console.log(`[ZmatanaData] Recomputed Bundle.totalWeightKg for ${touched} bundle(s) of SO ${soNumber}`);
+      }
+    } catch (recomputeErr) {
+      console.warn(
+        `[ZmatanaData] Bundle weight recompute failed for SO ${soNumber}: ${recomputeErr instanceof Error ? recomputeErr.message : String(recomputeErr)}`,
+      );
+    }
+
     // Audit-trail event so the planner sees lone_zmatana as a completed
     // milestone on its next call.
     try {

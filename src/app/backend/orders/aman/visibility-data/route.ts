@@ -151,6 +151,23 @@ export async function POST(request: Request) {
       `[VisibilityData] Persisted ${persisted}/${materials.length} Material row(s) for SO ${soNumber}${skipped > 0 ? ` (${skipped} skipped — missing code)` : ''}`
     );
 
+    // Live-update Bundle.totalWeightKg for every bundle that holds a Material
+    // we just upserted. ZSO-VISIBILITY refreshes per-line weight + orderQuantity
+    // (after VA02 increases / decreases on the SO), so any bundle already
+    // linked to those Materials is now stale. No-op on the initial pre-bundle
+    // path where no Material has bundleId yet.
+    try {
+      const { recomputeBundleWeightsForSo } = await import('@/lib/bundle-capacity');
+      const touched = await recomputeBundleWeightsForSo(salesOrder.id);
+      if (touched > 0) {
+        console.log(`[VisibilityData] Recomputed Bundle.totalWeightKg for ${touched} bundle(s) of SO ${soNumber}`);
+      }
+    } catch (recomputeErr) {
+      console.warn(
+        `[VisibilityData] Bundle weight recompute failed for SO ${soNumber}: ${recomputeErr instanceof Error ? recomputeErr.message : String(recomputeErr)}`,
+      );
+    }
+
     // Audit-trail event so the LLM planner sees ZSO-VISIBILITY as a
     // completed milestone the next time it builds a plan for this SO.
     try {
