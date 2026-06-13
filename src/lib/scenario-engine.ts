@@ -79,6 +79,161 @@ function readPlanFromProgress(progress: { generatedSteps: string | null; stopAft
 }
 
 // -----------------------------------------------------------------------------
+// Safety net: if the planner emitted zload2 / zloading_close in this plan
+// but FORGOT to also emit a follow-on plant-email step, inject the right
+// one ourselves so the plant always sees the modification. Log loudly so
+// the regression is visible.
+//
+// Decision matrix (mirrors planner Rule 10b-i / 10b-ii / Rule 11):
+//   - No prior `email_sent plant_ls` event in audit AND zload2/zloading_close
+//     just fired → inject `email_to_plant` (full LS set, vehicle details from
+//     bundle).
+//   - At least one prior `email_sent plant_ls` event → inject
+//     `email_modified_ls_to_plant` (touched LSs only, in-thread).
+//
+// Returns true when a step was injected (and the caller should resume the
+// step-firing path against the updated plan), false when no injection was
+// needed (the caller should mark the scenario completed normally).
+// -----------------------------------------------------------------------------
+async function maybeInjectMissingPlantEmail(args: {
+  progressId: string;
+  salesOrderId: string;
+  plannedSteps: PlannedStep[];
+  currentStopAfterIndex: number;
+  log: (msg: string) => void;
+}): Promise<boolean> {
+  const { progressId, salesOrderId, plannedSteps, currentStopAfterIndex, log } = args;
+
+  // Did this plan fire any LS-mutating SAP step?
+  const modKinds = new Set<string>(['zload2', 'zloading_close']);
+  const hasModStep = plannedSteps.some((s) => modKinds.has(s.kind));
+  if (!hasModStep) return false;
+
+  // Did this plan ALSO already include a plant-bound email step?
+  // email_2nd_release counts here: the new pre-plant_ls modify cycle fires
+  // zloading_close (all) → va02 → email_2nd_release in one plan, then pauses
+  // for the plant's 2nd-release ack. The plant is informed of the wipe by
+  // virtue of receiving the 2nd-release request — no separate
+  // email_modified_ls_to_plant is needed in that intermediate state.
+  const plantEmailKinds = new Set<string>([
+    'email_to_plant',
+    'email_modified_ls_to_plant',
+    'email_2nd_release',
+  ]);
+  const hasPlantEmailStep = plannedSteps.some((s) => plantEmailKinds.has(s.kind));
+  if (hasPlantEmailStep) return false;
+
+  // Gap detected. Pick the right plant-email step based on whether the
+  // plant has been intimated previously for this SO.
+  const priorPlantLs = await prisma.email.findFirst({
+    where: {
+      salesOrderId,
+      emailType: 'plant_ls',
+      status: { in: ['sent', 'replied', 'processed'] },
+    },
+    select: { id: true },
+  });
+  const injectedKind: 'email_to_plant' | 'email_modified_ls_to_plant' = priorPlantLs
+    ? 'email_modified_ls_to_plant'
+    : 'email_to_plant';
+
+  // ── LOUD LOGGING — surface the planner failure ──
+  const stepList = plannedSteps.map((s) => s.kind).join(' → ');
+  log(
+    `[ENGINE][SAFETY NET] ⚠️ PLANNER GAP DETECTED for SO ${salesOrderId}: ` +
+      `plan emitted [${stepList}] which contains a LS-mutating step but NO follow-on plant email. ` +
+      `Auto-injecting "${injectedKind}" so the plant receives the modification. ` +
+      `THIS IS A FALLBACK — the planner should have emitted this step itself. Investigate the planner prompt / response.`,
+  );
+  console.error(
+    `[scenario-engine SAFETY NET] Planner failed to emit plant-email step after ${plannedSteps.filter((s) => modKinds.has(s.kind)).map((s) => s.kind).join(',')} for SO ${salesOrderId}; injecting ${injectedKind}. Plan was: ${stepList}`,
+  );
+
+  // For email_to_plant the planner normally supplies args.vehicles — derive
+  // from existing Bundle rows on the PO. For email_modified_ls_to_plant no
+  // args are needed (the engine scans WorkQueue for touched LSs).
+  let injectedStep: PlannedStep;
+  if (injectedKind === 'email_to_plant') {
+    const so = await prisma.salesOrder.findUnique({
+      where: { id: salesOrderId },
+      select: { purchaseOrderId: true },
+    });
+    let vehicles: Array<{ bundleNumber: number; vehicleNumber: string; driverMobile: string; containerNumber: string }> = [];
+    if (so?.purchaseOrderId) {
+      const bundles = await prisma.bundle.findMany({
+        where: { purchaseOrderId: so.purchaseOrderId },
+        orderBy: { bundleNumber: 'asc' },
+        select: {
+          bundleNumber: true,
+          vehicleNumber: true,
+          driverMobile: true,
+          containerNumber: true,
+        },
+      });
+      vehicles = bundles
+        .filter((b) => b.vehicleNumber && b.driverMobile)
+        .map((b) => ({
+          bundleNumber: b.bundleNumber,
+          vehicleNumber: b.vehicleNumber!,
+          driverMobile: b.driverMobile!,
+          containerNumber: b.containerNumber ?? '',
+        }));
+    }
+    if (vehicles.length === 0) {
+      log(
+        `[ENGINE][SAFETY NET] Cannot auto-inject email_to_plant for SO ${salesOrderId} — no bundles have vehicle details on file. ` +
+          `Marking scenario completed without injection; the operator will need to re-trigger.`,
+      );
+      console.error(
+        `[scenario-engine SAFETY NET] email_to_plant injection skipped for SO ${salesOrderId} — no bundle vehicle details available`,
+      );
+      return false;
+    }
+    injectedStep = {
+      kind: 'email_to_plant',
+      rationale: '[SAFETY NET] auto-injected because the planner emitted zload2/zloading_close without a follow-on plant email',
+      args: { vehicles },
+    };
+  } else {
+    injectedStep = {
+      kind: 'email_modified_ls_to_plant',
+      rationale: '[SAFETY NET] auto-injected because the planner emitted zload2/zloading_close without a follow-on plant email',
+    };
+  }
+
+  // Persist the appended step and bump stopAfterIndex so the walker
+  // actually fires it (instead of pausing before it).
+  const newPlannedSteps = [...plannedSteps, injectedStep];
+  const newStopAfterIndex = Math.max(currentStopAfterIndex, newPlannedSteps.length - 1);
+  await prisma.scenarioProgress.update({
+    where: { id: progressId },
+    data: {
+      generatedSteps: JSON.stringify(newPlannedSteps),
+      stopAfterIndex: newStopAfterIndex,
+    },
+  });
+
+  // Emit an audit event so the planner sees the fallback on its next plan.
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    await emitEvent({
+      salesOrderId,
+      scenarioProgressId: progressId,
+      type: 'safety_net_injection',
+      payload: {
+        injectedKind,
+        priorPlannedSteps: plannedSteps.map((s) => s.kind),
+        reason: 'planner emitted zload2/zloading_close without a follow-on plant email',
+      },
+    });
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
+
+  return true;
+}
+
+// -----------------------------------------------------------------------------
 // loadTriggerReply — fetch the inbound reply that triggered the current plan.
 //
 // Each ScenarioProgress carries `triggerEmailId` — the Email row whose reply
@@ -1095,23 +1250,46 @@ export async function executeScenario(args: {
     return;
   }
 
-  // Past the end? Or past the planner's stopAfterIndex? Mark completed.
+  // Past the end? Or past the planner's stopAfterIndex? Mark completed —
+  // UNLESS the safety net detects a planner gap (zload2/zloading_close
+  // fired but no follow-on plant email). In that case inject the missing
+  // step and continue.
   if (
     progress.currentStepIndex >= plan.steps.length ||
     progress.currentStepIndex > plan.stopAfterIndex
   ) {
-    log(`[ENGINE] Plan completed for SO ${args.salesOrderId} (idx=${progress.currentStepIndex}, stopAfter=${plan.stopAfterIndex})`);
-    await prisma.scenarioProgress.update({
-      where: { id: progress.id },
-      data: { state: 'completed' },
-    });
-    await emitEvent({
+    const gapFilled = await maybeInjectMissingPlantEmail({
+      progressId: progress.id,
       salesOrderId: args.salesOrderId,
-      scenarioProgressId: progress.id,
-      type: 'scenario_completed',
-      payload: { scenario_key: progress.scenarioKey, step_count: plan.steps.length },
+      plannedSteps: plan.plannedSteps,
+      currentStopAfterIndex: plan.stopAfterIndex,
+      log,
     });
-    return;
+    if (gapFilled) {
+      // Re-read plan with the injected step; fall through to the regular
+      // step-firing path below. currentStepIndex now points at the injected step.
+      const refreshed = await prisma.scenarioProgress.findUnique({ where: { id: progress.id } });
+      if (refreshed) {
+        const newPlan = readPlanFromProgress(refreshed);
+        plan.steps = newPlan.steps;
+        plan.plannedSteps = newPlan.plannedSteps;
+        plan.stopAfterIndex = newPlan.stopAfterIndex;
+        progress.currentStepIndex = refreshed.currentStepIndex;
+      }
+    } else {
+      log(`[ENGINE] Plan completed for SO ${args.salesOrderId} (idx=${progress.currentStepIndex}, stopAfter=${plan.stopAfterIndex})`);
+      await prisma.scenarioProgress.update({
+        where: { id: progress.id },
+        data: { state: 'completed' },
+      });
+      await emitEvent({
+        salesOrderId: args.salesOrderId,
+        scenarioProgressId: progress.id,
+        type: 'scenario_completed',
+        payload: { scenario_key: progress.scenarioKey, step_count: plan.steps.length },
+      });
+      return;
+    }
   }
 
   const step = plan.steps[progress.currentStepIndex];
@@ -1645,53 +1823,95 @@ async function fireStep(
     }
 
     case 'zloading_close': {
-      // ZLOAD_Delete — remove materials from existing LS. Like ZLOAD2 the
-      // SAP transaction is keyed on a specific LS number, so we must
-      // resolve each material → its LS via the LSI table and fan out one
-      // call per distinct LS.
-      //
-      // The planner emits {lsNumber?, material, batch?} per deletion. We
-      // resolve lsNumber via LSI when omitted. Batch isn't required for
-      // ZLOAD_Delete (deletion is by material on the LS), so we ignore it.
+      // ZLOAD_Delete — two modes:
+      //   1. WIPE-ALL (args.all=true) — pre-plant_ls modify cycle. Enumerate
+      //      every LSI on this SO, group by LS, fan out one triggerZloadingClose
+      //      per LS with the full material list (in SAP, deleting every line
+      //      of an LS deletes the LS itself). Guarded by the bundle-freeze
+      //      invariant: refuse if any LS on this SO has reached `sent_to_plant`
+      //      (or later).
+      //   2. SURGICAL (args.deletes=[...]) — post-plant_ls per-material delete
+      //      (Rule 11). Existing behavior: resolve lsNumber via LSI when omitted,
+      //      fan out per LS.
       const { coerceZloadingCloseArgs } = await import('./planner-step-args');
-      const deletions = coerceZloadingCloseArgs(_plannedStep);
+      const coerced = coerceZloadingCloseArgs(_plannedStep);
 
-      // Group delete codes by LS. When the planner supplies an explicit
-      // lsNumber, target only that LS. Otherwise look up every LSI row for
-      // the material on this SO — a material can sit on multiple LSs.
       const byLs = new Map<string, Set<string>>();
-      const unresolved: string[] = [];
-      for (const d of deletions) {
-        if (d.lsNumber) {
-          // Trust the planner: just queue the delete on the stated LS.
-          const bucket = byLs.get(d.lsNumber) ?? new Set<string>();
-          bucket.add(d.material);
-          byLs.set(d.lsNumber, bucket);
-          continue;
+
+      if (coerced.mode === 'all') {
+        // Bundle-freeze invariant: refuse wipe-all once plant_ls has been sent.
+        // Mirrors BundlesFrozenError in the bundler; protects against accidental
+        // composition migration even if the planner emits the wrong shape.
+        const sentLs = await prisma.loadingSlip.count({
+          where: {
+            salesOrder: { id: progress.salesOrderId },
+            status: { in: ['sent_to_plant', 'invoiced', 'completed'] },
+          },
+        });
+        if (sentLs > 0) {
+          const errMsg =
+            `zloading_close (all) refused: SO has ${sentLs} LS already sent_to_plant — ` +
+            `post-intimation modifications must use bundle_capacity_assessment + per-material ` +
+            `zload2/zload1-append per Rule 6e/Rule 11.`;
+          log(`[ENGINE] ${errMsg}`);
+          await prisma.scenarioProgress.update({
+            where: { id: progress.id },
+            data: { state: 'failed', error: errMsg },
+          });
+          return 'pause';
         }
+
+        // Enumerate every LSI on this SO, group by lsNumber.
         const lsiRows = await prisma.loadingSlipItem.findMany({
-          where: { salesOrderId: progress.salesOrderId, material: d.material },
-          select: { lsNumber: true },
+          where: { salesOrderId: progress.salesOrderId },
+          select: { lsNumber: true, material: true },
         });
         if (lsiRows.length === 0) {
-          unresolved.push(d.material);
-          continue;
+          log('[ENGINE] zloading_close (all) — no LSI rows on this SO; nothing to close. Advancing.');
+          return 'advance_now';
         }
         for (const r of lsiRows) {
           const bucket = byLs.get(r.lsNumber) ?? new Set<string>();
-          bucket.add(d.material);
+          bucket.add(r.material);
           byLs.set(r.lsNumber, bucket);
+        }
+        log(`[ENGINE] zloading_close (all) — wiping ${byLs.size} LS(s) across SO ${progress.salesOrderId}: ${[...byLs.keys()].join(', ')}`);
+      } else {
+        // Surgical: resolve each material → its LS via the LSI table when
+        // lsNumber isn't supplied by the planner.
+        const unresolved: string[] = [];
+        for (const d of coerced.deletions) {
+          if (d.lsNumber) {
+            const bucket = byLs.get(d.lsNumber) ?? new Set<string>();
+            bucket.add(d.material);
+            byLs.set(d.lsNumber, bucket);
+            continue;
+          }
+          const lsiRows = await prisma.loadingSlipItem.findMany({
+            where: { salesOrderId: progress.salesOrderId, material: d.material },
+            select: { lsNumber: true },
+          });
+          if (lsiRows.length === 0) {
+            unresolved.push(d.material);
+            continue;
+          }
+          for (const r of lsiRows) {
+            const bucket = byLs.get(r.lsNumber) ?? new Set<string>();
+            bucket.add(d.material);
+            byLs.set(r.lsNumber, bucket);
+          }
+        }
+
+        if (unresolved.length > 0) {
+          log(`[ENGINE] zloading_close — no LSI found for: ${unresolved.join(', ')}. Aborting (cannot determine which LS to close on).`);
+          await prisma.scenarioProgress.update({
+            where: { id: progress.id },
+            data: { state: 'failed', error: `zloading_close LS lookup failed: ${unresolved.join(', ')}` },
+          });
+          return 'pause';
         }
       }
 
-      if (unresolved.length > 0) {
-        log(`[ENGINE] zloading_close — no LSI found for: ${unresolved.join(', ')}. Aborting (cannot determine which LS to close on).`);
-        await prisma.scenarioProgress.update({
-          where: { id: progress.id },
-          data: { state: 'failed', error: `zloading_close LS lookup failed: ${unresolved.join(', ')}` },
-        });
-        return 'pause';
-      }
       if (byLs.size === 0) {
         log('[ENGINE] zloading_close — no LS buckets formed; skipping');
         return 'advance_now';

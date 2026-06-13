@@ -295,8 +295,12 @@ function diffBundleComposition(
  *        b. Diff against the existing Bundle/LoadingSlip state.
  *        c. If composition is unchanged → no-op (common case for
  *           "release as-is" replies after a clarification).
- *        d. If composition changed → enqueue ZLOADING_CLOSE for every
- *           affected SAP-issued LS, await completion, then wipe + recreate.
+ *        d. If composition changed → wipe the existing Bundle/LoadingSlip
+ *           rows in the DB and write the new bundle plan. The bundler is
+ *           PURE DB — it does NOT fire SAP transactions. The caller (the
+ *           planner) is responsible for emitting `zloading_close (all)`
+ *           upstream so that SAP-side cleanup is done before this is
+ *           invoked. See Rule 9c / Rule 10b in llm-planner.ts.
  *
  * Per-Material weight = (dispatchQuantity / orderQuantity) * orderWeightKg.
  * Capacity = `PO.weightage * 1000` kg. Bin packing delegated to
@@ -420,56 +424,16 @@ export async function computeBundlesForPo(purchaseOrderId: string): Promise<{
     };
   }
 
-  // ── Phase 3: SAP-aware cleanup of LSs that no longer match the plan ─────
+  // ── Phase 3: wipe and commit the new bundles ────────────────────────────
+  // The bundler is PURE DB — it never fires SAP transactions. ZLOADING_CLOSE
+  // must have been driven from the planner BEFORE this call (see Rule 9c /
+  // Rule 10b in llm-planner.ts; the planner emits `zloading_close (all)`
+  // upstream so the SAP side is wiped before re-bundling).
   if (diff.lssToClose.length > 0) {
     console.log(
-      `[Bundler] PO ${po.poNumber}: composition changed — closing ${diff.lssToClose.length} LS(s) in SAP before re-bundling: ${diff.lssToClose.join(', ')}`,
+      `[Bundler] PO ${po.poNumber}: composition changed — ${diff.lssToClose.length} LS(s) being wiped from DB: ${diff.lssToClose.join(', ')}. (SAP-side closure is planner-driven; this is the DB wipe phase only.)`,
     );
-
-    const { triggerZloadingClose } = await import('./auto-gui-trigger');
-    const { awaitWorkCompletion } = await import('./work-queue');
-
-    // For each LS to close, build the materials list from its LSI rows and
-    // emit ZLOADING_CLOSE. We collect the resulting WorkQueue ids so we can
-    // block on completion before wiping.
-    const workIdsToAwait: string[] = [];
-    for (const lsNumber of diff.lssToClose) {
-      const lsiRows = await prisma.loadingSlipItem.findMany({
-        where: { lsNumber },
-        select: { material: true },
-      });
-      const materialCodes = Array.from(new Set(lsiRows.map((r) => r.material)));
-      if (materialCodes.length === 0) {
-        console.warn(`[Bundler] LS ${lsNumber} has no LSI rows — skipping ZLOADING_CLOSE`);
-        continue;
-      }
-      // triggerZloadingClose enqueues + pumps internally. It dedupes on
-      // (lsNumber, materials) so re-calling within the same flow is safe.
-      await triggerZloadingClose(lsNumber, materialCodes);
-      // Pick up the work id we just enqueued for the wait. The trigger
-      // doesn't return it, so we re-query the most recent matching row.
-      const justQueued = await prisma.workQueue.findFirst({
-        where: {
-          step: 'zloading_close',
-          payload: { contains: `"ls_number":"${lsNumber}"` },
-          state: { in: ['queued', 'firing'] },
-        },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true },
-      });
-      if (justQueued) workIdsToAwait.push(justQueued.id);
-    }
-
-    if (workIdsToAwait.length > 0) {
-      console.log(
-        `[Bundler] PO ${po.poNumber}: awaiting ${workIdsToAwait.length} ZLOADING_CLOSE work row(s)…`,
-      );
-      await awaitWorkCompletion(workIdsToAwait, { timeoutMs: 120_000 });
-      console.log(`[Bundler] PO ${po.poNumber}: all ZLOADING_CLOSE work rows terminal`);
-    }
   }
-
-  // ── Phase 4: wipe and commit the new bundles ────────────────────────────
   return wipeAndCommit(purchaseOrderId, proposedBins, totalKg, capacityKg);
 }
 

@@ -2,11 +2,6 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { parseLoadingSlipPdf, type ParsedLoadingSlip } from '@/lib/ls-pdf-parser';
-import {
-  sendEmail,
-  sendReplyEmailWithAttachment,
-  getMessageRfc822Id,
-} from '@/lib/gmail';
 import { resolvePlantEmailForLoadingSlip } from '@/lib/plant-resolver';
 
 /**
@@ -23,17 +18,21 @@ const MIN_PARSER_CONFIDENCE = 0.85;
  * an existing loading slip in SAP. Mirrors the ZLOAD2 send_data callback
  * contract documented in BACKEND_ENDPOINTS.md §3.2.
  *
- * Three responsibilities:
+ * Two responsibilities:
  *   1. Persist the regenerated PDF to R2; update LoadingSlip.fileUrl.
  *   2. Re-parse the PDF and reconcile LSI rows so the DB matches what SAP
  *      actually saved (line counts/quantities/batches may have shifted).
- *   3. Forward the updated PDF to the LS's plant — in-thread on the original
- *      plant_ls email so the plant sees the modification as a follow-up on
- *      the same chain.
+ *
+ * Plant notification is PLANNER-DRIVEN — handled by the email_to_plant or
+ * email_modified_ls_to_plant step that the planner emits alongside zload2.
+ * If the planner truncates its plan and omits the email step, the engine's
+ * safety net (scenario-engine.ts handlePostModifyPlantEmailGap) detects the
+ * gap when the scenario terminates and auto-emits the correct step with
+ * loud logging so the failure is visible.
  *
  * Completion of the SAP run itself is reported separately on /step-status —
  * the work_id transitions to `done` there. This route is only the artifact
- * upload + downstream propagation.
+ * upload + LSI reconciliation.
  */
 export async function POST(request: Request) {
   let formData: FormData;
@@ -289,110 +288,16 @@ export async function POST(request: Request) {
     }
   }
 
-  // ── 3. Forward updated PDF to the plant ──
-  // Reply in-thread on the most recent plant_ls email for this LS. Falls
-  // back to a brand-new thread if no prior plant_ls exists (shouldn't
-  // happen — ZLOAD2 only fires after ZLOAD1 which led to a plant_ls send).
-  try {
-    const currentLs = await prisma.loadingSlip.findUnique({
-      where: { id: loadingSlip.id },
-      select: { plantEmail: true, salesOrderId: true },
-    });
-    const plantRecipient = currentLs?.plantEmail || process.env.PLANT_EMAIL || '';
-    if (!plantRecipient) {
-      console.warn(`[ZLOAD2 Data] No plant recipient available for LS ${lsNumber} — skipping plant notification`);
-    } else {
-      const subject = `Updated Loading Slip ${lsNumber} - SO ${soNumber}`;
-      const body = [
-        `The Loading Slip ${lsNumber} for Sales Order ${soNumber} has been updated.`,
-        ``,
-        `Please find the revised slip attached.`,
-      ].join('\n');
-      const attachment = {
-        filename: `${lsNumber}.PDF`,
-        content: fileBuffer,
-        mimeType: 'application/pdf',
-      };
-
-      // Find the most recent plant_ls email for this LS to anchor the reply.
-      const priorPlantLs = await prisma.email.findFirst({
-        where: {
-          loadingSlipId: loadingSlip.id,
-          emailType: 'plant_ls',
-        },
-        orderBy: { sentAt: 'desc' },
-        select: { id: true, gmailThreadId: true, gmailMessageId: true },
-      });
-
-      let sent: { messageId: string; threadId: string };
-      if (priorPlantLs?.gmailThreadId && priorPlantLs.gmailMessageId) {
-        try {
-          const rfc822Id = await getMessageRfc822Id(priorPlantLs.gmailMessageId);
-          if (rfc822Id) {
-            sent = await sendReplyEmailWithAttachment(
-              plantRecipient,
-              subject,
-              body,
-              priorPlantLs.gmailThreadId,
-              rfc822Id,
-              attachment
-            );
-            console.log(`[ZLOAD2 Data] Sent updated LS ${lsNumber} to ${plantRecipient} (in-thread reply on email ${priorPlantLs.id})`);
-          } else {
-            sent = await sendEmail(plantRecipient, subject, body, attachment);
-            console.log(`[ZLOAD2 Data] Sent updated LS ${lsNumber} to ${plantRecipient} (new thread — no rfc822Id for anchor)`);
-          }
-        } catch (replyErr) {
-          console.warn(
-            `[ZLOAD2 Data] in-thread send failed (${replyErr instanceof Error ? replyErr.message : replyErr}); falling back to new thread`
-          );
-          sent = await sendEmail(plantRecipient, subject, body, attachment);
-        }
-      } else {
-        sent = await sendEmail(plantRecipient, subject, body, attachment);
-        console.log(`[ZLOAD2 Data] Sent updated LS ${lsNumber} to ${plantRecipient} (new thread — no prior plant_ls found)`);
-      }
-
-      await prisma.email.create({
-        data: {
-          salesOrderId: loadingSlip.salesOrderId,
-          loadingSlipId: loadingSlip.id,
-          gmailMessageId: sent.messageId,
-          gmailThreadId: sent.threadId,
-          recipientEmail: plantRecipient,
-          subject,
-          status: 'sent',
-          emailType: 'plant_ls',
-          sentBody: body,
-        },
-      });
-
-      try {
-        const { emitEvent } = await import('@/lib/scenario-events');
-        await emitEvent({
-          salesOrderId: loadingSlip.salesOrderId,
-          type: 'email_sent',
-          payload: {
-            emailType: 'plant_ls',
-            recipient: plantRecipient,
-            subject,
-            ls_number: lsNumber,
-            gmailMessageId: sent.messageId,
-            updated_after: 'zload2',
-          },
-        });
-      } catch {
-        // Audit emission must never break the primary flow.
-      }
-    }
-  } catch (sendErr) {
-    console.error(
-      `[ZLOAD2 Data] Failed to forward updated LS ${lsNumber} to plant:`,
-      sendErr instanceof Error ? sendErr.message : sendErr
-    );
-    // Don't fail the upload — we still acked the SAP artifact. The operator
-    // can resend manually if needed.
-  }
+  // ── 3. Plant notification is now PLANNER-DRIVEN ──
+  // The planner decides which plant email to send after a zload2 cycle:
+  //   - email_to_plant (full set) when no prior plant_ls exists (Rule 10b-i).
+  //   - email_modified_ls_to_plant (touched LSs only) when plant_ls has
+  //     already been sent for this PO (Rule 10b-ii / Rule 11).
+  // The engine has a safety net that auto-emits the correct step if a
+  // scenario containing zload2/zloading_close ends without a plant email
+  // (see scenario-engine.ts handlePostModifyPlantEmailGap). Do not
+  // auto-send here — it would race with the planner-emitted step and
+  // duplicate the email to the plant.
 
   return NextResponse.json({
     received: true,

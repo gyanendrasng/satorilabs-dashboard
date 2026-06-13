@@ -1134,8 +1134,8 @@ const CASES: TestCase[] = [
     id: 'modify_increase_after_zload1_before_plant_ls',
     description:
       'Branch asks to increase a material on a vehicle_details thread AFTER ZLOAD1 fired but BEFORE plant_ls was sent. ' +
-      'Expect the full update cycle (VA02 → 2nd_release → ZSO_Visibility → dispatch_confirmation → ZLOAD2 → email_modified_ls_to_plant) ' +
-      'to run BEFORE any plant_ls fires. Plant must receive PDFs reflecting the post-modification quantity.',
+      'Expect the full re-bundle cycle (ZLOADING_CLOSE all → VA02 → 2nd_release → ZSO_Visibility → dispatch_confirmation (bundler wipes + re-creates Bundle rows) → ZLOAD1 fresh → vehicle_details → email_to_plant) ' +
+      'to run BEFORE any plant_ls fires. ZLOAD2 MUST NOT appear in the SAP sequence — pre-plant_ls modifications use wipe-and-re-bundle, not in-place revision.',
     soNumber: '3290111',
     customerId: 'TEST-CUST-PRE-PLANT-INC',
     newOrderBody: NEW_ORDER_BODY('3290111', 'TEST-CUST-PRE-PLANT-INC'),
@@ -1164,12 +1164,12 @@ const CASES: TestCase[] = [
         replyText: 'Product details look good.',
         note: 'Branch confirms round-2 ls_dispatch — Rule 9 must fire email_confirm_bundle_details',
       },
-      // Phase E: branch confirms round-2 dispatch_confirmation → triggers ZLOAD2 + plant resend
+      // Phase E: branch confirms round-2 dispatch_confirmation → triggers ZLOAD1 fresh
       {
         targetEmailType: 'dispatch_confirmation',
         sender: 'branch',
         replyText: 'Confirmed. Proceed with revised bundle plan.',
-        note: 'Branch confirms revised bundle plan → triggers ZLOAD2 + email_modified_ls_to_plant',
+        note: 'Branch confirms revised bundle plan → triggers ZLOAD1 fresh against new Bundles',
       },
       // Phase F: planner re-asks for vehicle details (stale-vehicle-details detection,
       // Rule 10c — the prior vehicle_details reply was a modification, not vehicle details)
@@ -1183,18 +1183,26 @@ const CASES: TestCase[] = [
       { targetEmailType: 'plant_ls', sender: 'plant', replyText: 'Invoice 7682614530 OBD 5070000133 attached.' },
     ],
     expect: {
-      // ZLOAD2 must appear in the SAP transaction list BEFORE plant_ls fires (since
-      // plant_ls is sent via the email_to_plant step which is in the email path, not SAP).
-      // The SAP sequence: initial visibility + ZLOAD1, then the modification cycle's
-      // VA02 + visibility + ZLOAD2, then plant invoice ZLOAD3 and VT01N.
-      sapTransactions: ['ZSO-VISIBILITY', 'ZLOAD1', 'VA02', 'ZSO-VISIBILITY', 'ZLOAD2', 'ZLOAD3-B1', 'VTO1N-B'],
+      // The new pre-plant_ls re-bundle cycle: initial visibility + ZLOAD1, then the
+      // wipe-and-rebundle modification (ZLOADING_CLOSE-all + VA02 + visibility +
+      // ZLOAD1 fresh), then plant invoice ZLOAD3 and VT01N.
+      // ZLOAD2 MUST NOT appear in the sequence.
+      sapTransactions: [
+        'ZSO-VISIBILITY',
+        'ZLOAD1',
+        'ZLOADING_CLOSE',
+        'VA02',
+        'ZSO-VISIBILITY',
+        'ZLOAD1',
+        'ZLOAD3-B1',
+        'VTO1N-B',
+      ],
       finalSoStatus: 'completed',
       sentEmailTypes: [
         'ls_dispatch',
         'dispatch_confirmation',
         'vehicle_details',
         '2nd_release',
-        'modified_ls_to_plant',
         'plant_ls',
       ],
     },
@@ -1260,20 +1268,23 @@ const CASES: TestCase[] = [
       { targetEmailType: 'plant_ls', sender: 'plant', replyText: 'Invoice 7682614531 OBD 5070000134 attached.' },
     ],
     expect: {
-      // Two modification cycles before ZLOAD2:
+      // Two modification cycles before final ZLOAD1:
       //  initial:        ZSO-VISIBILITY + ZLOAD1
-      //  mod 1 (130):    VA02 + ZSO-VISIBILITY
-      //  mod 2 (150):    VA02 + ZSO-VISIBILITY     ← Rule 9 case c restarts the cycle
-      //  finalisation:   ZLOAD2  (only after both ls_dispatch and dispatch_confirmation are accepted)
+      //  mod 1 (130):    ZLOADING_CLOSE + VA02 + ZSO-VISIBILITY
+      //  mod 2 (150):    ZLOADING_CLOSE + VA02 + ZSO-VISIBILITY  ← Rule 9c restarts the cycle
+      //  finalisation:   ZLOAD1 fresh (after both ls_dispatch and dispatch_confirmation accepted)
       //  closure:        ZLOAD3-B1 + VTO1N-B
+      // ZLOAD2 MUST NOT appear.
       sapTransactions: [
         'ZSO-VISIBILITY',
         'ZLOAD1',
+        'ZLOADING_CLOSE',
         'VA02',
         'ZSO-VISIBILITY',
+        'ZLOADING_CLOSE',
         'VA02',
         'ZSO-VISIBILITY',
-        'ZLOAD2',
+        'ZLOAD1',
         'ZLOAD3-B1',
         'VTO1N-B',
       ],
@@ -1283,7 +1294,76 @@ const CASES: TestCase[] = [
         'dispatch_confirmation',
         'vehicle_details',
         '2nd_release',
-        'modified_ls_to_plant',
+        'plant_ls',
+      ],
+    },
+  },
+
+  // 13 — Post-ZLOAD1 / pre-plant_ls modify: DECREASE (new scenario for ZLOADING_CLOSE-all path)
+  {
+    id: 'modify_decrease_after_zload1_before_plant_ls',
+    description:
+      'Branch asks to DECREASE a material on a vehicle_details thread AFTER ZLOAD1 fired but BEFORE plant_ls was sent. ' +
+      'The pre-plant_ls re-bundle cycle applies (ZLOADING_CLOSE all → ZSO_Visibility → dispatch_confirmation → ZLOAD1 fresh). ' +
+      'Decrease skips VA02 (decreases do not need an SO change). ZLOAD2 MUST NOT appear.',
+    soNumber: '3290113',
+    customerId: 'TEST-CUST-PRE-PLANT-DEC',
+    newOrderBody: NEW_ORDER_BODY('3290113', 'TEST-CUST-PRE-PLANT-DEC'),
+    visibility: STANDARD_MATERIALS,
+    replies: [
+      // Phase A: normal release up to vehicle_details email (LSs created, plant_ls NOT yet sent)
+      { targetEmailType: 'ls_dispatch', sender: 'branch', replyText: 'Confirmed.' },
+      { targetEmailType: 'dispatch_confirmation', sender: 'branch', replyText: 'Confirmed.' },
+      // Phase B: branch asks to DECREASE on the vehicle_details thread (not vehicle details)
+      {
+        targetEmailType: 'vehicle_details',
+        sender: 'branch',
+        replyText: 'Actually, please decrease YV6FRYENE0000PJP (M-B) from 100 to 70.',
+        note: 'Branch decreases on vehicle_details thread post-ZLOAD1, pre-plant_ls',
+      },
+      // Phase C: plant confirms 2nd release (decrease still goes through 2nd release per Rule 9c)
+      { targetEmailType: '2nd_release', sender: 'branch', replyText: 'Yes, second release done.' },
+      // Phase D: branch accepts round-2 ls_dispatch
+      {
+        targetEmailType: 'ls_dispatch',
+        sender: 'branch',
+        replyText: 'Yes, product list looks good.',
+        note: 'Branch accepts material list → Rule 9 case a fires email_confirm_bundle_details',
+      },
+      // Phase E: branch confirms round-2 dispatch_confirmation → triggers ZLOAD1 fresh
+      {
+        targetEmailType: 'dispatch_confirmation',
+        sender: 'branch',
+        replyText: 'Confirmed. Proceed with revised bundle plan.',
+        note: 'Branch confirms revised bundle plan → triggers ZLOAD1 fresh',
+      },
+      // Phase F: vehicle details collected against the new plan
+      {
+        targetEmailType: 'vehicle_details',
+        sender: 'branch',
+        replyText: 'Vehicle: MH12ST7893, Driver: 9555555558, LR: LR-013 dated 2026-06-17',
+        note: 'Branch supplies vehicle details for the post-modification plan',
+      },
+      // Phase G: plant invoice closes the loop
+      { targetEmailType: 'plant_ls', sender: 'plant', replyText: 'Invoice 7682614532 OBD 5070000135 attached.' },
+    ],
+    expect: {
+      // Decrease path: ZLOADING_CLOSE without VA02. ZLOAD2 MUST NOT appear.
+      sapTransactions: [
+        'ZSO-VISIBILITY',
+        'ZLOAD1',
+        'ZLOADING_CLOSE',
+        'ZSO-VISIBILITY',
+        'ZLOAD1',
+        'ZLOAD3-B1',
+        'VTO1N-B',
+      ],
+      finalSoStatus: 'completed',
+      sentEmailTypes: [
+        'ls_dispatch',
+        'dispatch_confirmation',
+        'vehicle_details',
+        '2nd_release',
         'plant_ls',
       ],
     },

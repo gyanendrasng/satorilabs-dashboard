@@ -217,10 +217,24 @@ export interface ZloadingCloseDeletion {
   batch?: string;
 }
 
-export function coerceZloadingCloseArgs(step: PlannedStep | undefined): ZloadingCloseDeletion[] {
+export type ZloadingCloseArgs =
+  | { mode: 'all' }
+  | { mode: 'surgical'; deletions: ZloadingCloseDeletion[] };
+
+/**
+ * Two-shape discriminated union:
+ *   - `{ all: true }` → wipe every line on every LS of the SO (pre-plant_ls
+ *     re-bundle path). Engine resolves the per-LS payload at fireStep time.
+ *   - `{ deletes: [...] }` → surgical post-plant_ls per-material delete
+ *     (Rule 11). Existing shape preserved verbatim.
+ */
+export function coerceZloadingCloseArgs(step: PlannedStep | undefined): ZloadingCloseArgs {
   const args = requireArgs(step, 'zloading_close');
+  if (args.all === true) {
+    return { mode: 'all' };
+  }
   const deletes = requireArray(args.deletes, 'deletes', 'zloading_close');
-  return deletes.map((raw, i) => {
+  const deletions = deletes.map((raw, i) => {
     const d = raw as Record<string, unknown>;
     const material = asString(d.material, `deletes[${i}].material`, 'zloading_close');
     return {
@@ -229,6 +243,7 @@ export function coerceZloadingCloseArgs(step: PlannedStep | undefined): Zloading
       batch: asOptionalString(d.batch),
     };
   });
+  return { mode: 'surgical', deletions };
 }
 
 // ─── stock_precheck ─────────────────────────────────────────────────────────

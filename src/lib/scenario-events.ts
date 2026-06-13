@@ -23,7 +23,12 @@ export type ScenarioEventType =
   // Emitted when an inbound reply is escalated to the human supervisor
   // (either via planner-emitted email_supervisor_question or a dispatcher
   // fallback when no actionable plan can be produced).
-  | 'email_escalated';
+  | 'email_escalated'
+  // Emitted when the engine's safety net auto-injects a step into a plan
+  // because the planner produced an incomplete plan (e.g. zload2 without a
+  // follow-on plant email). Surfaced loudly in logs; the audit event lets
+  // the planner observe the fallback on its next plan call.
+  | 'safety_net_injection';
 
 export interface EmitEventArgs {
   salesOrderId: string;

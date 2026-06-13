@@ -17,12 +17,12 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import OpenAI from 'openai';
 import { z } from 'zod';
 import { prisma } from './prisma';
 import { renderEmailThreadForSO } from './email-thread';
 import { renderAuditTrailForSO } from './audit-trail';
 import { deriveStage, type StepKind } from './dispatch-scenarios';
+import { getLlmService } from './llm-service';
 
 // -----------------------------------------------------------------------------
 // Public types
@@ -201,8 +201,8 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'zloading_close',
-    description: 'Delete line items from an existing LS (ZLOAD_Delete). Use for material deletions after LS creation.',
-    argsSchema: '{ deletes: [{ lsNumber?: "<LS no if known>", material: "<code>", batch?: "<batch>" }, ...] }',
+    description: 'Delete line items from existing LSs (ZLOAD_Delete). Two modes: (1) SURGICAL — args.deletes lists per-material rows to remove from named LSs. Use ONLY for post-plant_ls deletes per Rule 11 (bundles are frozen; we are only revising specific lines). (2) WIPE-ALL — args.all=true wipes EVERY line of EVERY LS on this SO (in SAP, deleting all lines of an LS deletes the LS itself). Use this whenever a pre-plant_ls modification cycle needs to fire (Rule 9c, Rule 10b path b) — it must be the FIRST step in that chain, before va02/zso_visibility/zload1 fresh. args.all=true is ONLY valid when no `email_sent plant_ls` exists in the audit trail. Once plant_ls has been sent, the bundle composition is FROZEN — emit per-material surgical zloading_close (Rule 11) or bundle_capacity_assessment (Rule 6e) instead. The engine will refuse args.all=true post-plant_ls and fail the scenario.',
+    argsSchema: '{ all: true } | { deletes: [{ lsNumber?: "<LS no if known>", material: "<code>", batch?: "<batch>" }, ...] }',
   },
   {
     kind: 'email_2nd_release',
@@ -481,7 +481,7 @@ RULES:
    For SAP-mutating steps (va02, zload2, zloading_close, stock_precheck) the args drive REAL transactions. If you would have to guess to fill them in, do NOT emit the step — emit email_clarify_branch / email_clarify_plant instead (see rule 15).
 4. If you are unsure what the email means, or the right action requires authority you don't have, set escalate=true and put the question in escalation_question. Leave steps as [].
 5. Re-read the audit trail. The trail lists every step that has already completed on this SO (step_completed events). DO NOT re-emit a step the trail shows as completed unless the latest inbound is explicitly asking for a re-do. The engine no longer suppresses duplicates for you — YOU are the suppression. If the latest inbound looks like one you have already handled (e.g. a dispatch_confirmation was already sent this round and the branch's reply is "ok, confirmed"), either (i) continue forward to the next stage, (ii) emit nothing and STOP (steps=[], stop_after_index=-1), or (iii) emit email_clarify_* if you can't tell why we're being re-triggered.
-   Example: if ZLOAD1 already fired (step_completed zload1 in audit), modifying qty must use zload2, never zload1.
+   Example: if ZLOAD1 already fired (step_completed zload1 in audit) AND plant_ls has been sent, modifying qty post-plant_ls uses zload2 (per Rule 6e/Rule 11). If ZLOAD1 has fired but plant_ls has NOT been sent, modifying qty wipes the LSs first via zloading_close (args.all=true) and re-fires zload1 fresh — NEVER zload2 (per Rule 6b / Rule 9c / Rule 10b path b).
 
 THE STANDARD DISPATCH SEQUENCE (memorise this — every order goes through it):
 
@@ -531,9 +531,19 @@ trigger email type, to decide whose intent this is.
 
   6b. INBOUND: branch MODIFY-INCREASE — LSs exist but plant_ls NOT yet sent
       (audit trail has step_completed zload1 ✓ but NO email_sent plant_ls).
-      Bundles can still be re-composed safely. EMIT: stock_precheck → va02 →
-      email_2nd_release. STOP. (Downstream re-bundling happens automatically
-      when the new release plan lands.)
+      Bundles can still be re-composed safely, but ONLY by wiping every
+      existing LS first so the bundler can re-pack optimally for the new
+      quantities. EMIT: zloading_close (args.all=true) → stock_precheck →
+      va02 → email_2nd_release. STOP.
+      Do NOT emit zload2 in this case — pre-plant_ls modifications NEVER
+      use zload2. The wipe-and-re-bundle path produces optimal truck
+      packing; zload2 leaves the existing bundle composition frozen.
+      Downstream: after the plant acks 2nd_release, Rule 8 fires zso_visibility,
+      the visibility callback auto-sends a round-2 ls_dispatch, the branch
+      accepts the new material list (Rule 9 case a → email_confirm_bundle_details
+      which calls the bundler to wipe + recreate Bundle rows), the branch
+      accepts the new bundle plan (Rule 10b path a → zload1 fresh →
+      email_to_branch_for_vehicle). No ZLOAD2 anywhere in this chain.
 
   6e. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL on a plant_ls
       email — i.e. plant_ls has already been sent (CURRENT SO STATE shows
@@ -615,9 +625,11 @@ trigger email type, to decide whose intent this is.
      email_sent ls_dispatch events.
 
      **The order of approval is STRICT: materials first (this rule),
-     bundles second (Rule 10), ZLOAD2 third (Rule 10b). The branch must
-     accept the material list before they see the bundle plan; they must
-     accept the bundle plan before any loading slips are touched.**
+     bundles second (Rule 10), ZLOAD1 fresh third (Rule 10b path b). The
+     branch must accept the material list before they see the bundle plan;
+     they must accept the bundle plan before any loading slips are touched.
+     Pre-plant_ls modifications NEVER use zload2 — they use a full
+     wipe-and-recreate cycle so the bundler can re-pack optimally.**
 
      Decide by reading the branch's reply body:
 
@@ -637,14 +649,20 @@ trigger email type, to decide whose intent this is.
      (c) FURTHER MODIFICATION REQUEST (another qty change, add or
          remove a material) → DO NOT advance to bundle confirmation.
          The material list itself is not yet accepted. RESTART the
-         modify cycle: apply Rule 6/6b for an increase or Rule 11
-         shape for a decrease/delete. EMIT
-         stock_precheck → va02 → email_2nd_release  (for an increase),
-         or zload2 / zloading_close shape (for decrease/delete) — same
-         step list as the originating Rule 6/6b/11 path. The cycle
-         will eventually return to this Rule 9 on the next round-N
-         ls_dispatch, and the branch can keep iterating on the
+         modify cycle by re-applying Rule 6 / 6b. EMIT:
+           - For an INCREASE: zloading_close (args.all=true) →
+             stock_precheck → va02 → email_2nd_release.
+           - For a DECREASE / DELETE: zloading_close (args.all=true) →
+             email_2nd_release (the materials args summarise the
+             decrease/delete so the plant can still do 2nd release on
+             the unchanged lines; no va02 because decreases don't
+             change the SO).
+         The cycle will eventually return to this Rule 9 on the next
+         round-N ls_dispatch, and the branch can keep iterating on the
          material list until they accept it.
+         Do NOT emit zload2 here — pre-plant_ls modifications NEVER
+         use zload2. The wipe-all path lets the bundler re-pack
+         optimally for the new quantities.
 
      (d) GENUINELY UNCLEAR / AMBIGUOUS reply → emit
          email_clarify_branch with a short, specific question.
@@ -660,8 +678,10 @@ trigger email type, to decide whose intent this is.
          clarify rather than guess. Wrong VA02 args are destructive.
      Do NOT emit email_to_plant or email_modified_ls_to_plant here —
      LSs in DB still reflect pre-modification quantities and would
-     ship stale to the plant. ZLOAD2 (Rule 10b) is the only path that
-     re-syncs them.
+     ship stale to the plant. The pre-plant_ls re-bundle cycle
+     (zloading_close all → … → zload1 fresh) is what eventually
+     syncs them; the plant receives the final LSs via email_to_plant
+     only after Rule 10b path (a) fires zload1 fresh.
 
  10. INBOUND: branch reply on a round-2-or-later dispatch_confirmation
      (modification cycle in progress — bundle plan re-confirmation stage).
@@ -673,46 +693,59 @@ trigger email type, to decide whose intent this is.
      Decide by reading the branch's reply body:
 
      **PLAIN CONFIRMATION** on the bundle plan ("yes", "confirm",
-     "proceed", "go ahead") → CHOOSE based on whether LoadingSlipItem
-     rows already exist:
-       (a) NO LSIs yet → EMIT zload1 → email_to_branch_for_vehicle. STOP.
-       (b) LSIs already exist (audit trail has a prior step_completed zload1 ✓ from BEFORE the modification) → EMIT zload2 → email_modified_ls_to_plant. STOP.
-     A prior "step_completed zload1" event in the audit trail = path (b). No prior zload1 = path (a).
+     "proceed", "go ahead") → EMIT zload1 → email_to_branch_for_vehicle.
+     STOP.
+       NOTE: pre-plant_ls modifications MUST have wiped the prior LSs
+       upstream (Rule 6b / Rule 9c emit zloading_close args.all=true at
+       the top of the modify cycle). By the time this rule runs there
+       are no LSIs on the SO, so zload1 fires in initial mode (no args)
+       and the engine fans out across the freshly re-bundled Bundles.
+       The bundler call inside the email_confirm_bundle_details step
+       (the one that just generated the bundle plan the branch confirmed)
+       has already wiped+recreated the DB Bundle rows.
+       If you find audit trail evidence that suggests LSIs still exist
+       at this point (a prior step_completed zload1 with no subsequent
+       zloading_close args.all=true between it and the current point),
+       this is a bug in an earlier plan — emit email_supervisor_question
+       describing the inconsistency rather than emitting zload2 (which
+       is forbidden pre-plant_ls).
 
      **FURTHER MODIFICATION REQUEST** on the bundle plan (another qty
-     change or a request to redistribute) → DO NOT fire ZLOAD2. The
+     change or a request to redistribute) → DO NOT fire zload1. The
      bundle plan is not yet accepted. RESTART the modify cycle from
-     Rule 6/6b (for an increase) or Rule 11 shape (for a decrease /
-     delete). The cycle will return through Rule 9 (material list
+     Rule 6/6b (for an increase) or apply the decrease/delete branch
+     of Rule 9c. The cycle will return through Rule 9 (material list
      re-confirm) then Rule 10 (bundle re-confirm) again. The branch
      can keep iterating on either approval until they're satisfied.
 
      **UNCLEAR / AMBIGUOUS** → email_clarify_branch.
 
      **VEHICLE DETAILS in the reply** → treat as PLAIN CONFIRMATION on
-     the bundle plan and follow path (b) (assuming LSs exist; that's
-     the post-modification case). IGNORE the vehicle details — they
-     are for the pre-modification plan. Rule 10c below will collect
-     fresh vehicle details after ZLOAD2 finishes.
+     the bundle plan: EMIT zload1 → email_to_branch_for_vehicle.
+     IGNORE the vehicle details supplied in this reply — they
+     reference the PRE-modification plan, which is no longer current.
+     Rule 10c below will collect fresh vehicle details after zload1
+     finishes against the new bundles.
 
- 10c. STALE-VEHICLE-DETAILS DETECTION (runs as a final step after Rule 10b).
-      After Rule 10b emits zload2 + email_modified_ls_to_plant — i.e.
-      the LS rows in SAP now reflect the post-modification quantities
-      and the plant has the regenerated PDFs — check whether the
-      vehicle details on file are still valid:
+ 10c. STALE-VEHICLE-DETAILS DETECTION (runs after Rule 10b).
+      After Rule 10b emits zload1 fresh, the email_to_branch_for_vehicle
+      step naturally collects fresh vehicle details — no separate
+      stale-detection is needed in the pre-plant_ls path. (This rule
+      remains relevant only for the post-plant_ls Rule 11 path, where
+      zload2 / zloading_close can leave stale vehicle_details on file.)
+      For post-plant_ls modifications:
         - If the audit trail's MOST RECENT "email_sent vehicle_details"
-          event is OLDER than the most recent "step_completed va02",
-          those vehicle details reference a stale (pre-modification)
-          bundle plan. EMIT email_to_branch_for_vehicle (after the
-          zload2 / email_modified_ls_to_plant steps in the SAME plan)
-          to collect fresh vehicle details against the now-stable plan.
-        - If vehicle_details is NEWER than the most recent va02, the
-          details on file are valid — do not re-ask.
+          event is OLDER than the most recent "step_completed va02"
+          (or step_completed zload2 / zloading_close), EMIT
+          email_to_branch_for_vehicle to collect fresh vehicle details
+          against the now-stable plan.
+        - If vehicle_details is NEWER, the details on file are valid —
+          do not re-ask.
 
  11. INBOUND: branch MODIFY-DECREASE / MODIFY-DELETE / MODIFY-DEC-DEL reply on a plant_ls email.
      (Audit trail: zload1 ✓ and plant_ls ✓ already happened. SENDER=branch.)
      The BRANCH is requesting the change — they are the customer authority.
-     EMIT: zload2 (decrease/inc-dec) AND/OR zloading_close (delete) → email_modified_ls_to_plant. STOP.
+     EMIT: zload2 (decrease/inc-dec) AND/OR zloading_close (delete) AND email_modified_ls_to_plant — ALL IN THE SAME PLAN (steps array MUST end with email_modified_ls_to_plant). Do NOT emit just zload2/zloading_close alone; the plant must always be notified of the change. STOP after the email step.
      Do NOT emit email_to_branch_notifying_plant_change — that's for PLANT-proposed changes.
      Do NOT emit plain email_to_plant here — it would send EVERY LS to the plant, including unmodified ones. Use email_modified_ls_to_plant which sends only the touched LSs.
      No va02, no 2nd release. Decreases / deletes don't change the SO; they only revise the LS.
@@ -830,30 +863,32 @@ export async function planNextSteps(args: {
 
   await dumpPromptToFile(args.salesOrderId, args.triggerEmailId, systemPrompt, userPrompt);
 
-  const openai = new OpenAI();
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-5.2',
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-  });
-
-  const raw = completion.choices[0]?.message?.content;
-  if (!raw) {
-    return planFailure('OpenAI returned empty content');
-  }
-
-  let json: unknown;
+  // All LLM calls in the dashboard go through getLlmService(), which selects
+  // the provider/model from env vars (LLM_PROVIDER / LLM_MODEL / *_API_KEY).
+  // See src/lib/llm-service.ts for the full env contract.
+  const llm = getLlmService();
+  let result;
   try {
-    json = JSON.parse(raw);
+    result = await llm.chat({
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      requireJson: true,
+    });
   } catch (e) {
-    return planFailure(`JSON parse failed: ${e instanceof Error ? e.message : String(e)}`);
+    return planFailure(`LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  const validated = PlanResultSchema.safeParse(json);
+  if (!result.text) {
+    return planFailure(`LLM returned empty content (provider=${result.provider} model=${result.model})`);
+  }
+
+  // llm.chat() with requireJson=true already parsed JSON; if the model emitted
+  // something unparseable, chat() would have thrown above.
+  const validated = PlanResultSchema.safeParse(result.json);
   if (!validated.success) {
+    const raw = result.text;
     const preview = raw.length > 600 ? raw.slice(0, 600) + '…' : raw;
     console.warn(
       `[PLANNER_ZOD_FAIL] soId=${args.salesOrderId} emailId=${args.triggerEmailId} raw=${preview} errors=${JSON.stringify(validated.error.issues)}`,

@@ -244,14 +244,15 @@ export class WorkCompletionTimeoutError extends Error {
  * cancelled). Throws `WorkCompletionTimeoutError` if the timeout elapses
  * with rows still in `queued` or `firing`.
  *
- * Used by the SAP-aware re-bundle in `computeBundlesForPo`: when a
- * composition change requires closing existing LSs in SAP first, we enqueue
- * the `zloading_close` work and block here until SAP confirms via the
- * /step-status callback.
- *
  * pollIntervalMs default is 500ms — short enough to feel responsive in
  * tests, long enough to keep DB load minimal in prod. Override per call
  * if needed.
+ *
+ * Note: previously used by `computeBundlesForPo` to block on SAP-side
+ * ZLOADING_CLOSE before wiping the DB. That dependency was removed when
+ * the bundler became pure-DB (planner now drives ZLOADING_CLOSE upstream);
+ * the helper is kept as a general-purpose utility for any caller that
+ * needs to block on a batch of work rows.
  */
 export async function awaitWorkCompletion(
   workIds: string[],

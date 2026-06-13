@@ -56,11 +56,20 @@ Key Considerations:
   - If no bundle has room, email the Branch asking them to raise a fresh Sales Order for the additional units; the original SO ships as planned.
   Bundles are only freely re-composable BEFORE plant intimation. Before plant_ls, the system can ZLOADING_CLOSE the affected slips and rebundle optimally; after plant_ls, never.
 
-6b. Modifications that arrive AFTER Loading Slips are created but BEFORE they are intimated to the Plant (post-ZLOAD1, pre-plant_ls). Every increase or addition in this window must run through the full update cycle. Two stages of Branch approval are mandatory, in this strict order:
-  - **Material list approval** (round-N ls_dispatch). After VA02 → 2nd Release (Plant) → ZSO_Visibility, the system sends a refreshed ls_dispatch email showing the new per-material quantities. The Branch must accept this list before they see the bundle plan. If the Branch instead asks for ANOTHER modification at this stage, restart the modify cycle (VA02 → 2nd Release → ZSO_Visibility) and send a fresh ls_dispatch. The Branch can iterate on the material list as many times as they need.
-  - **Bundle plan approval** (dispatch_confirmation). Once the Branch accepts the material list, the system sends a dispatch_confirmation showing the revised bundle / truck plan (since adding tonnage may change vehicle count or composition). The Branch must accept this bundle plan. If the Branch asks for ANOTHER modification on the bundle plan stage, restart the modify cycle again. The Branch can iterate on either stage independently.
-  - Only AFTER both approvals does ZLOAD2 fire to update the Loading Slips in SAP, and only then are the revised slips re-shared with the Plant.
-  Decreases / deletes in this same window are handled in the same chain except VA02 is skipped (decreases do not require an SO change in SAP). The two-stage approval still applies — Branch must accept the revised material list AND the revised bundle plan before LSs are touched.
+6b. Modifications that arrive AFTER Loading Slips are created but BEFORE they are intimated to the Plant (post-ZLOAD1, pre-plant_ls). Every increase, addition, decrease, or delete in this window MUST run through the full re-bundle cycle. Pre-plant_ls modifications NEVER use ZLOAD2. The process is:
+  - Close every line of every existing Loading Slip via ZLOADING_CLOSE (in SAP, deleting all line items of an LS deletes the LS itself). This must be the FIRST step of the cycle.
+  - Run VA02 (for increases only; decreases / deletes skip VA02).
+  - Run 2nd Release on the Plant.
+  - Run ZSO_Visibility + ZMatana to refresh material availability.
+  - The Bundler re-packs every material into fresh Bundles optimally for the new quantities (it is free to redistribute materials across bundles because nothing has been intimated to the Plant yet).
+  - Send a dispatch_confirmation showing the new bundle / truck plan.
+  - Once the Branch confirms the new plan, run ZLOAD1 FRESH to create new Loading Slips against the new Bundles.
+  - Resume the standard vehicle_details → plant intimation flow.
+  Two stages of Branch approval remain mandatory, in this strict order:
+  - **Material list approval** (round-N ls_dispatch). After ZLOADING_CLOSE → VA02 → 2nd Release → ZSO_Visibility, the system sends a refreshed ls_dispatch email showing the new per-material quantities. The Branch must accept this list before they see the bundle plan. If the Branch instead asks for ANOTHER modification at this stage, restart the cycle from ZLOADING_CLOSE → VA02 → 2nd Release → ZSO_Visibility and send a fresh ls_dispatch. The Branch can iterate on the material list as many times as they need.
+  - **Bundle plan approval** (dispatch_confirmation). Once the Branch accepts the material list, the system sends a dispatch_confirmation showing the revised bundle / truck plan. The Branch must accept this bundle plan. If the Branch asks for ANOTHER modification on the bundle plan stage, restart the cycle again.
+  - Only AFTER both approvals does ZLOAD1 fire to create fresh Loading Slips. The plant_ls intimation then follows the normal post-ZLOAD1 path.
+  ZLOAD2 is reserved for post-plant_ls in-place revisions only (Rule 6a / Rule 11) where the bundle composition is FROZEN. In the pre-plant_ls window, ZLOAD2 would leave the existing bundle composition frozen and defeat optimisation, so it is explicitly disallowed.
 7. If any increase is requested, by Plant, but not supported by available stocks, then this means availability is there at Plant's end but not reflected with Order Processing Team. This needs GRN. In this scenario, intimate Plant and write a separate email to escalation authority. Do not proceed unless the escalation authority confirms GRN 
 8. If any intent is unknown to you or you do not find the steps in json given below, try to formulate the steps to best of your knowledge. Then write an email to escalation authority for confirmation. Do not proceed unless escalation authority confirms.
 9. If you have to wait, then wait. Do not suggest any future steps. Just STOP there itself
