@@ -247,10 +247,14 @@ class GeminiClient implements ProviderClient {
 
   private async getClient(): Promise<GeminiClientType> {
     if (this.client) return this.client;
-    // Dynamic import keeps `@google/genai` out of the webpack server bundle
-    // for non-Gemini users; only callers who actually configure
+    // The /* webpackIgnore: true */ pragma is REQUIRED — without it, Next.js'
+    // webpack still tries to walk @google/genai's ESM/conditional exports at
+    // build time (serverExternalPackages alone isn't enough for this dynamic
+    // import path) and fails with "Module not found". The pragma tells
+    // webpack to skip resolving this string entirely; Node resolves it from
+    // node_modules at runtime. Only callers that configure
     // LLM_PROVIDER=gemini ever pull the package.
-    const mod = await import('@google/genai');
+    const mod = await import(/* webpackIgnore: true */ '@google/genai');
     this.client = new mod.GoogleGenAI({ apiKey: this.cfg.apiKey });
     return this.client;
   }
