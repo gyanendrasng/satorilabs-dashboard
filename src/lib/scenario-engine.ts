@@ -1921,6 +1921,97 @@ async function fireStep(
       for (const [lsNumber, materialsForLs] of byLs.entries()) {
         await triggerZloadingClose(lsNumber, [...materialsForLs]);
       }
+
+      // ── DB-side cleanup for wipe-all mode ───────────────────────────────
+      // ZLOADING_CLOSE deletes the LSs in SAP, but nothing else cleans up
+      // the dashboard DB. When the planner later fires
+      // `email_confirm_bundle_details`, the bundler reads existing
+      // Bundle/LoadingSlip rows and compares against the new Material plan.
+      // If the new plan happens to match (same materials, same quantities,
+      // same packing) the bundler short-circuits with "re-bundle no-op",
+      // leaving the old Bundle rows in place. Then ZLOAD1 fan-out finds the
+      // PRIOR work_queue rows (state='done') and dedups against them — so
+      // the fresh ZLOAD1 never fires in SAP.
+      //
+      // The fix: when mode='all', delete the SO's LoadingSlipItem +
+      // LoadingSlip rows + Bundle backlinks immediately. Bundle rows
+      // themselves are kept (they're at PO scope and may also serve other
+      // SOs on the same PO), but their `loadingSlips` relation is now
+      // empty. Then nuke the dedup-blocking prior ZLOAD1 / ZLOAD2 work_queue
+      // rows for this SO so the post-cycle ZLOAD1 fan-out is treated as
+      // first-time fire.
+      //
+      // We do this AFTER enqueuing the SAP work (so a planner mistake that
+      // refuses the SAP step doesn't also blow away the DB), but BEFORE
+      // pausing for callback — the bundler that runs in a later plan call
+      // must see clean state.
+      if (coerced.mode === 'all') {
+        const lsRows = await prisma.loadingSlip.findMany({
+          where: { salesOrderId: progress.salesOrderId },
+          select: { id: true, lsNumber: true },
+        });
+        const lsIds = lsRows.map((r) => r.id);
+        const lsNumbers = lsRows.map((r) => r.lsNumber);
+
+        if (lsIds.length > 0) {
+          await prisma.loadingSlipItem.deleteMany({
+            where: { salesOrderId: progress.salesOrderId },
+          });
+          await prisma.loadingSlip.deleteMany({
+            where: { id: { in: lsIds } },
+          });
+          // Clear bundleId backlinks on this SO's Materials so the bundler
+          // treats them as freshly-staged (Materials themselves stay; their
+          // dispatchQuantity is what VA02 / ZSO_Visibility updated).
+          await prisma.material.updateMany({
+            where: { salesOrderId: progress.salesOrderId, bundleId: { not: null } },
+            data: { bundleId: null },
+          });
+          log(
+            `[ENGINE] zloading_close (all): wiped ${lsIds.length} LoadingSlip + LSIs ` +
+              `+ Material.bundleId backlinks for SO ${progress.salesOrderId}`,
+          );
+        }
+
+        // Bust prior ZLOAD1/ZLOAD2 dedup rows on this SO so the next ZLOAD1
+        // fan-out doesn't get short-circuited by "Skipping duplicate". We
+        // keep the WorkQueue rows themselves as audit history (state stays
+        // 'done') but remove the dedup_key so the (SO, bundleNumber) key
+        // becomes free again. The cheapest way: rewrite payload to a sentinel
+        // dedup_key per-row.
+        const priorZloads = await prisma.workQueue.findMany({
+          where: {
+            salesOrderId: progress.salesOrderId,
+            step: { in: ['zload1', 'zload2'] },
+            state: { in: ['queued', 'firing', 'done'] },
+          },
+          select: { id: true, payload: true },
+        });
+        for (const w of priorZloads) {
+          try {
+            const p = JSON.parse(w.payload);
+            if (p?.meta?.dedup_key) {
+              p.meta.dedup_key = `wiped-by-zloading-close-all:${w.id}`;
+              await prisma.workQueue.update({
+                where: { id: w.id },
+                data: { payload: JSON.stringify(p) },
+              });
+            }
+          } catch {
+            // Payload not JSON — leave it alone; the dedup check looks for
+            // the literal `"dedup_key":"..."` substring so non-JSON rows
+            // never match anyway.
+          }
+        }
+        if (priorZloads.length > 0) {
+          log(
+            `[ENGINE] zloading_close (all): voided dedup_key on ${priorZloads.length} ` +
+              `prior zload1/zload2 work_queue row(s) so the post-cycle fan-out fires fresh ` +
+              `(LS numbers were: ${lsNumbers.join(', ')})`,
+          );
+        }
+      }
+
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
