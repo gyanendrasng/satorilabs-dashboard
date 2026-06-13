@@ -247,16 +247,23 @@ class GeminiClient implements ProviderClient {
 
   private async getClient(): Promise<GeminiClientType> {
     if (this.client) return this.client;
-    // The /* webpackIgnore: true */ pragma is REQUIRED — without it, Next.js'
-    // webpack still tries to walk @google/genai's ESM/conditional exports at
-    // build time (serverExternalPackages alone isn't enough for this dynamic
-    // import path) and fails with "Module not found". The pragma tells
-    // webpack to skip resolving this string entirely; Node resolves it from
-    // node_modules at runtime. Only callers that configure
-    // LLM_PROVIDER=gemini ever pull the package.
-    const mod = await import(/* webpackIgnore: true */ '@google/genai');
-    this.client = new mod.GoogleGenAI({ apiKey: this.cfg.apiKey });
-    return this.client;
+    // Loading @google/genai needs two things:
+    //   1. Hide the specifier from webpack so it doesn't try to bundle it
+    //      (Next.js serverExternalPackages alone doesn't cover dynamic
+    //      imports — see https://github.com/vercel/next.js/issues).
+    //   2. Resolve from the app's CWD, not the bundled chunk's location.
+    //      A bare `await import('@google/genai')` from a webpack chunk
+    //      resolves relative to .next/server/chunks/ and Node can't find
+    //      the package there.
+    // We use Node's `createRequire` to get a real require() bound to the
+    // running process's CWD, then load the SDK's published `dist/node`
+    // entry directly so the conditional exports map is bypassed.
+    const { createRequire } = await import('node:module');
+    const requireFromCwd = createRequire(process.cwd() + '/');
+    const mod = requireFromCwd('@google/genai/dist/node/index.cjs');
+    const client = new mod.GoogleGenAI({ apiKey: this.cfg.apiKey }) as GeminiClientType;
+    this.client = client;
+    return client;
   }
 
   async chat(args: ChatArgs): Promise<ChatResult> {
