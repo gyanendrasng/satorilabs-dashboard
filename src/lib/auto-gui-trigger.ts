@@ -549,16 +549,51 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     return { sent: false, logs };
   }
 
-  // Idempotency — one combined email per PO. Match both `sent` and `replied`
-  // so the branch's vehicle-details reply doesn't trip the guard into "no
-  // email yet, send another."
+  // Idempotency — one combined email per PO, BUT only while it still
+  // describes the current set of LSs. After a pre-plant_ls modify cycle
+  // (ZLOADING_CLOSE all → … → fresh ZLOAD1) the LSs from the prior round
+  // are gone in SAP and a new wave has just landed. The prior
+  // vehicle_details email referenced LSs that no longer exist, so we must
+  // send a fresh one.
+  //
+  // Rule: an existing vehicle_details email is considered "still current"
+  // ONLY if its sentAt is newer than the latest done zload1 work_queue row
+  // on this PO. If a ZLOAD1 has completed AFTER the email was sent, the
+  // email is stale and we send a new one.
   const existing = await prisma.email.findFirst({
     where: { purchaseOrderId, emailType: 'vehicle_details', status: { in: ['sent', 'replied'] } },
-    select: { id: true },
+    orderBy: { sentAt: 'desc' },
+    select: { id: true, sentAt: true },
   });
   if (existing) {
-    log(`[VehicleDetails] PO ${purchaseOrderId} already has a vehicle_details email — skipping`);
-    return { sent: false, logs };
+    // Find the most recent done ZLOAD1 work on any SO of this PO. If it's
+    // newer than the email, the email is stale → fall through and send.
+    const latestZload1 = await prisma.workQueue.findFirst({
+      where: {
+        step: 'zload1',
+        state: 'done',
+        salesOrder: { purchaseOrderId },
+      },
+      orderBy: { finishedAt: 'desc' },
+      select: { finishedAt: true, id: true },
+    });
+
+    const emailSentAt = existing.sentAt.getTime();
+    const lastZload1At = latestZload1?.finishedAt?.getTime() ?? 0;
+
+    if (lastZload1At <= emailSentAt) {
+      log(
+        `[VehicleDetails] PO ${purchaseOrderId} already has a current vehicle_details email ` +
+          `(sentAt=${existing.sentAt.toISOString()}, latest ZLOAD1 finishedAt=${latestZload1?.finishedAt?.toISOString() ?? 'none'}) — skipping`,
+      );
+      return { sent: false, logs };
+    }
+
+    log(
+      `[VehicleDetails] PO ${purchaseOrderId} has a STALE vehicle_details email ` +
+        `(sentAt=${existing.sentAt.toISOString()}, but ZLOAD1 ${latestZload1?.id} finished at ` +
+        `${latestZload1?.finishedAt?.toISOString()} after that — likely a pre-plant_ls modify cycle just completed). Sending fresh email.`,
+    );
   }
 
   const po = await prisma.purchaseOrder.findUnique({
