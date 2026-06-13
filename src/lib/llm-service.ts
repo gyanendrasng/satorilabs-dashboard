@@ -247,20 +247,71 @@ class GeminiClient implements ProviderClient {
 
   private async getClient(): Promise<GeminiClientType> {
     if (this.client) return this.client;
-    // Loading @google/genai needs two things:
-    //   1. Hide the specifier from webpack so it doesn't try to bundle it
-    //      (Next.js serverExternalPackages alone doesn't cover dynamic
-    //      imports — see https://github.com/vercel/next.js/issues).
-    //   2. Resolve from the app's CWD, not the bundled chunk's location.
-    //      A bare `await import('@google/genai')` from a webpack chunk
-    //      resolves relative to .next/server/chunks/ and Node can't find
-    //      the package there.
-    // We use Node's `createRequire` to get a real require() bound to the
-    // running process's CWD, then load the SDK's published `dist/node`
-    // entry directly so the conditional exports map is bypassed.
+    // Resolving @google/genai at runtime from a webpack-bundled Next.js server
+    // chunk is fiddly:
+    //   - A bare static `import '@google/genai'` makes webpack try to bundle
+    //     it at build time and fails ("Module not found") because the package
+    //     is ESM-only with conditional exports.
+    //   - A dynamic `await import('@google/genai')` from the chunk resolves
+    //     from .next/server/chunks/ (no node_modules there) — fails at run.
+    //   - createRequire(process.cwd()) breaks when the process is started via
+    //     PM2/systemd from a different cwd.
+    //   - require('@google/genai/dist/node/index.cjs') is blocked by the
+    //     package's `exports` field (deep paths aren't whitelisted).
+    //
+    // Workaround: find the package's installed location by walking up from
+    // this source file looking for `node_modules/@google/genai`, then load
+    // its CJS entry FILE directly (bypassing the `exports` map, which only
+    // affects bare-specifier resolution, not absolute file paths).
     const { createRequire } = await import('node:module');
-    const requireFromCwd = createRequire(process.cwd() + '/');
-    const mod = requireFromCwd('@google/genai/dist/node/index.cjs');
+    const path = await import('node:path');
+    const fs = await import('node:fs');
+
+    // __dirname is unreliable in Next.js bundled chunks. Walk up from
+    // process.cwd() AND from a few well-known prod roots until we find the
+    // installed package. Most prod deploys keep node_modules at the repo
+    // root, which is one of these candidates.
+    const candidates: string[] = [];
+    const seen = new Set<string>();
+    const addUpwards = (start: string) => {
+      let dir = start;
+      // Cap at 8 levels to avoid an infinite loop on a weird FS.
+      for (let i = 0; i < 8; i++) {
+        if (seen.has(dir)) break;
+        seen.add(dir);
+        candidates.push(path.join(dir, 'node_modules/@google/genai/dist/node/index.cjs'));
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    };
+    addUpwards(process.cwd());
+    // Also try resolving from this module's own location if available
+    // (CommonJS-compiled chunks expose __dirname; ESM doesn't, so guard it).
+    if (typeof __dirname === 'string') addUpwards(__dirname);
+
+    const cjsEntry = candidates.find((p) => {
+      try {
+        return fs.statSync(p).isFile();
+      } catch {
+        return false;
+      }
+    });
+
+    if (!cjsEntry) {
+      throw new Error(
+        `[llm-service] Could not locate @google/genai in node_modules. ` +
+          `Looked under: ${candidates.slice(0, 4).join(', ')}${candidates.length > 4 ? ', ...' : ''}. ` +
+          `Run \`npm install @google/genai\` at the app root.`,
+      );
+    }
+
+    // Load the CJS file by absolute path. The `exports` field only gates
+    // bare-specifier resolution; loading a literal filesystem path bypasses
+    // it entirely, so this is safe regardless of how the package declares
+    // its conditional exports.
+    const requireFromHere = createRequire(cjsEntry);
+    const mod = requireFromHere(cjsEntry);
     const client = new mod.GoogleGenAI({ apiKey: this.cfg.apiKey }) as GeminiClientType;
     this.client = client;
     return client;
