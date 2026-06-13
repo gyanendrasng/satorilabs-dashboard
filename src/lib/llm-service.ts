@@ -39,7 +39,14 @@
  *   // result.usage → { inputTokens, outputTokens, totalTokens }
  */
 import OpenAI from 'openai';
-import { GoogleGenAI } from '@google/genai';
+
+// `@google/genai` is loaded LAZILY in the Gemini provider constructor below
+// (dynamic import). It is ESM-only and ships with conditional Node/web
+// exports — a top-level static `import` makes Next.js' webpack server bundler
+// try to resolve it at build time and fail with "Module not found", even when
+// the package is listed in `serverExternalPackages`. Lazy-loading keeps the
+// dependency optional: only Gemini users need it installed.
+type GeminiClientType = import('@google/genai').GoogleGenAI;
 
 export type LlmProvider =
   | 'openai'
@@ -235,15 +242,24 @@ class OpenAICompatibleClient implements ProviderClient {
 }
 
 class GeminiClient implements ProviderClient {
-  private readonly client: GoogleGenAI;
-  constructor(private readonly cfg: ResolvedConfig) {
-    this.client = new GoogleGenAI({ apiKey: cfg.apiKey });
+  private client: GeminiClientType | null = null;
+  constructor(private readonly cfg: ResolvedConfig) {}
+
+  private async getClient(): Promise<GeminiClientType> {
+    if (this.client) return this.client;
+    // Dynamic import keeps `@google/genai` out of the webpack server bundle
+    // for non-Gemini users; only callers who actually configure
+    // LLM_PROVIDER=gemini ever pull the package.
+    const mod = await import('@google/genai');
+    this.client = new mod.GoogleGenAI({ apiKey: this.cfg.apiKey });
+    return this.client;
   }
 
   async chat(args: ChatArgs): Promise<ChatResult> {
     const start = Date.now();
     const requireJson = args.requireJson ?? true;
     const model = args.modelOverride || this.cfg.model;
+    const client = await this.getClient();
 
     // Gemini takes the system prompt as a top-level `systemInstruction`. Pull
     // it out of the messages list and forward the rest as `contents`.
@@ -264,7 +280,7 @@ class GeminiClient implements ProviderClient {
       });
     }
 
-    const response = await this.client.models.generateContent({
+    const response = await client.models.generateContent({
       model,
       contents,
       config: {
