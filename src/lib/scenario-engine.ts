@@ -946,15 +946,21 @@ export async function handleReplyV2(args: {
 
   // Ensure the trigger Email row records this reply AND transitions out of
   // the cron's pending-reply set. Without flipping status/workflowState
-  // here the next cron tick re-picks this row (still `status='sent'`,
-  // `workflowState!='completed'`), re-classifies the same thread, and
-  // re-fires whatever the plan emits — exactly the duplicate-ZLOAD1 bug
-  // we hit in prod.
+  // here the next cron tick re-picks this row, re-classifies the same
+  // thread, and re-fires whatever the plan emits — exactly the
+  // duplicate-ZLOAD1 bug we hit in prod.
+  //
+  // CRITICAL: always overwrite `replyHtml` with the latest reply. The
+  // poller now polls `status='replied'` rows too (so follow-up replies on
+  // the same thread are detected); if we kept the prior replyHtml, the
+  // planner would re-read the OLD reply on the next round even though a
+  // newer one has arrived. ProcessedEmail dedup at the message-id level
+  // is what prevents re-firing the same reply twice.
   await prisma.email.update({
     where: { id: email.id },
     data: {
-      replyHtml: email.replyHtml ?? args.replyHtml,
-      repliedAt: email.repliedAt ?? new Date(),
+      replyHtml: args.replyHtml,
+      repliedAt: new Date(),
       status: 'replied',
       workflowState: 'completed',
     },

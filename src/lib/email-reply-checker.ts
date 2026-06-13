@@ -34,18 +34,34 @@ export async function checkForReplies(): Promise<{
     logs.push(logMessage);
   };
 
-  // Get all emails that are still in "sent" status and not yet completed
-  // by a workflow handler (handleBranchReply marks workflowState='completed'
-  // after firing ZLOAD1 fire-and-forget — those should not be reprocessed).
-  // NOTE: workflowState is NULL for legacy/plant_ls emails, so we must
-  // explicitly include NULL — `{ not: 'completed' }` alone excludes NULL
-  // due to standard SQL three-valued logic.
+  // Get every outbound email that may still attract a reply. Two cases:
+  //   1. status='sent'      — first reply hasn't arrived yet (the original
+  //                           polling case).
+  //   2. status='replied'   — a prior reply has been handled, but the branch
+  //                           may follow up on the same thread (asking for a
+  //                           modification, sending a clarification, etc.).
+  //                           Without polling these we miss follow-ups
+  //                           entirely — the thread effectively goes dark
+  //                           after the first reply.
+  // The ProcessedEmail table (keyed by Gmail message id) dedups each inbound
+  // message, so re-polling 'replied' emails is safe — the same reply won't
+  // be reprocessed twice.
+  //
+  // We exclude workflowState='completed' for status='sent' rows (those are
+  // terminal — e.g. ZLOAD1 has been fired and we don't want to reprocess),
+  // but for status='replied' rows we DO want to keep polling regardless of
+  // workflowState because the thread is still open for follow-ups.
   const pendingEmails = await prisma.email.findMany({
     where: {
-      status: 'sent',
       OR: [
-        { workflowState: null },
-        { workflowState: { not: 'completed' } },
+        {
+          status: 'sent',
+          OR: [
+            { workflowState: null },
+            { workflowState: { not: 'completed' } },
+          ],
+        },
+        { status: 'replied' },
       ],
     },
     include: {
@@ -113,10 +129,28 @@ export async function checkForReplies(): Promise<{
         continue;
       }
 
-      log(`[EmailChecker] Found ${replyMessages.length} reply(s) for SO ${soNumber} / LS ${lsNumber}`);
+      // Per-message dedup. ProcessedEmail is keyed by gmailMessageId — any
+      // reply we've already handled (on this email OR another email sharing
+      // the same thread) is in there. Drop those before picking the latest.
+      // Without this, polling status='replied' emails would reprocess the
+      // first reply on every cron tick.
+      const replyIds = replyMessages.map((m) => m.id).filter((id): id is string => !!id);
+      const alreadyProcessed = await prisma.processedEmail.findMany({
+        where: { gmailMessageId: { in: replyIds } },
+        select: { gmailMessageId: true },
+      });
+      const processedSet = new Set(alreadyProcessed.map((p) => p.gmailMessageId));
+      const unprocessed = replyMessages.filter((msg) => !!msg.id && !processedSet.has(msg.id));
 
-      // Get the latest reply
-      const latestReply = replyMessages[replyMessages.length - 1];
+      if (unprocessed.length === 0) {
+        log(`[EmailChecker] All ${replyMessages.length} reply(s) for SO ${soNumber} / LS ${lsNumber} already processed — skipping`);
+        continue;
+      }
+
+      log(`[EmailChecker] Found ${unprocessed.length} new reply(s) (of ${replyMessages.length} total) for SO ${soNumber} / LS ${lsNumber}`);
+
+      // Get the latest UNPROCESSED reply
+      const latestReply = unprocessed[unprocessed.length - 1];
       if (!latestReply.id) {
         continue;
       }
@@ -181,6 +215,34 @@ export async function checkForReplies(): Promise<{
         // is resolved; for now we just record the reply.
         log(`[EmailChecker] Reply on PO-level email ${email.id} (no salesOrderId) — replyHtml stored, planner skip`);
         processed++;
+      }
+
+      // Durably mark this Gmail message as processed so a follow-up cron
+      // tick doesn't re-handle it. We also mark every OTHER unprocessed
+      // reply on the same thread that's older than `latestReply` — those
+      // were superseded by `latestReply` and the planner already saw them
+      // in the email-thread render, so they shouldn't trigger their own
+      // plan calls later.
+      for (const msg of unprocessed) {
+        if (!msg.id) continue;
+        try {
+          await prisma.processedEmail.upsert({
+            where: { gmailMessageId: msg.id },
+            create: {
+              gmailMessageId: msg.id,
+              gmailThreadId: email.gmailThreadId,
+              soNumbers: soNumber,
+            },
+            update: {}, // no-op when already there (race-safe)
+          });
+        } catch (dedupErr) {
+          // Non-fatal — if this fails the next cron tick will see the
+          // duplicate and skip via the in-Gmail labels filter. Log + move on.
+          log(
+            `[EmailChecker] ProcessedEmail upsert failed for ${msg.id}: ` +
+              `${dedupErr instanceof Error ? dedupErr.message : String(dedupErr)}`,
+          );
+        }
       }
     } catch (error) {
       const errorMsg = `Error processing email ${email.id} (SO ${soNumber} / LS ${lsNumber}): ${
