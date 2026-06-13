@@ -15,6 +15,7 @@
     "@aws-sdk/s3-request-presigner": "^3.937.0",
     "@azure/arm-compute": "^23.1.0",
     "@azure/identity": "^4.13.0",
+    "@google/genai": "^2.8.0",
     "@prisma/client": "^6.19.0",
     "@radix-ui/react-avatar": "^1.1.10",
     "@radix-ui/react-collapsible": "^1.1.12",

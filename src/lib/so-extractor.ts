@@ -1,5 +1,5 @@
-import OpenAI from 'openai';
 import { z } from 'zod';
+import { getLlmService } from './llm-service';
 
 const ExtractionSchema = z.object({
   customerId: z.string().min(1).nullable(),
@@ -31,11 +31,12 @@ export interface OrderExtraction {
  * the AI call errors.
  */
 export async function extractOrderInfoWithAI(emailBody: string): Promise<OrderExtraction> {
-  const openai = new OpenAI();
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    temperature: 0.1,
-    response_format: { type: 'json_object' },
+  // Goes through the shared LLM wrapper (src/lib/llm-service.ts) so the
+  // provider/model is governed by LLM_PROVIDER / LLM_MODEL env vars, same as
+  // the planner. Temperature is forced low (0.1) because this is structured
+  // extraction, not free-form reasoning.
+  const llm = getLlmService();
+  const result = await llm.chat({
     messages: [
       {
         role: 'system',
@@ -47,12 +48,13 @@ export async function extractOrderInfoWithAI(emailBody: string): Promise<OrderEx
         content: `Extract the customer id, every SO number, and the vehicle tonnage from this email body:\n\n${emailBody}`,
       },
     ],
+    requireJson: true,
+    temperature: 0.1,
   });
 
-  const raw = completion.choices[0]?.message?.content;
-  if (!raw) throw new Error('OpenAI returned empty content for order extraction');
+  if (!result.text) throw new Error('LLM returned empty content for order extraction');
 
-  const parsed = ExtractionSchema.safeParse(JSON.parse(raw));
+  const parsed = ExtractionSchema.safeParse(result.json);
   if (!parsed.success) {
     throw new Error(`Order extraction zod validation failed: ${parsed.error.message}`);
   }

@@ -17,6 +17,17 @@ Next.js dashboard for managing sales orders, loading slips, and dispatch email w
 - `CRON_SECRET` — optional auth token for cron endpoint
 - `AUTO_GUI_HOST` / `AUTO_GUI_PORT` — auto_gui2 backend connection
 
+### LLM provider (planner + new-order extractor)
+Every LLM call goes through `src/lib/llm-service.ts`. Provider + model are picked from env at boot:
+- `LLM_PROVIDER` — one of `openai` | `groq` | `together` | `deepinfra` | `runpod` | `gemini` (default `openai`)
+- `LLM_MODEL` — model id (defaults per provider; e.g. `gpt-4o` for openai, `gemini-2.5-flash` for gemini)
+- `LLM_TEMPERATURE` — default 0.7 (per-call override available)
+- `LLM_MAX_TOKENS` — default 4096 (per-call override available)
+- `LLM_BASE_URL` — optional override for OpenAI-compatible providers (self-hosted vLLM etc.)
+
+API keys (only the one matching the active provider is required):
+- `OPENAI_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `DEEPINFRA_API_KEY`, `RUNPOD_API_KEY`, `GEMINI_API_KEY`
+
 ## Email Monitoring Cron
 
 ### How It Works
