@@ -9,7 +9,11 @@ const nextConfig: NextConfig = {
   // "Cannot find module .../pdf.worker.mjs" from pdfjs-dist (the ZLOAD1
   // PDF parser then falls back to PENDING placeholder rows). Keeping them
   // external lets Node resolve the packages from node_modules normally.
-  serverExternalPackages: ['xlsx', 'pdfjs-dist'],
+  //
+  // @google/genai is ESM-only (`"type": "module"`) with Node/web conditional
+  // exports — webpack's resolver fails to walk those conditions during the
+  // server bundle. Marking it external lets the Node runtime do the resolve.
+  serverExternalPackages: ['xlsx', 'pdfjs-dist', '@google/genai'],
   eslint: {
     ignoreDuringBuilds: true,
   },
