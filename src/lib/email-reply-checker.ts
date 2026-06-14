@@ -108,59 +108,114 @@ export async function checkForReplies(): Promise<{
       // and the plant replies separately to each — every reply lives on the
       // SAME thread but is addressed to a different outbound). We must match
       // each reply to the SPECIFIC outbound it's responding to, not to the
-      // thread as a whole. Use the RFC822 In-Reply-To / References headers
-      // for that — Gmail preserves them and they point at the parent
-      // message's Message-ID.
+      // thread as a whole.
+      //
+      // We do this by walking the In-Reply-To chain UPWARDS until we hit
+      // an OUTBOUND (Gmail label=SENT) message. That's the inbound's
+      // "nearest outbound ancestor" — the specific outbound the reply
+      // belongs to. The reply is for THIS email iff that nearest outbound
+      // is THIS email's gmailMessageId.
+      //
+      // This handles three cases correctly:
+      //   (a) Plant clicks Reply directly on LS 373431's email → reply's
+      //       In-Reply-To points at LS 373431 → nearest outbound ancestor
+      //       is LS 373431 → matches only LS 373431. ✓
+      //   (b) Branch replies to vehicle_details, then replies AGAIN to
+      //       their own prior reply (an inbound) → chain walks: inbound 2
+      //       → inbound 1 → our vehicle_details outbound → nearest
+      //       outbound ancestor is vehicle_details → matches
+      //       vehicle_details. ✓
+      //   (c) Plant replies-to-all by hitting Reply on the latest
+      //       outbound LS 373437 then sending 7 messages → all have
+      //       In-Reply-To = LS 373437 → all match LS 373437 (correct,
+      //       the plant addressed them to that thread root).
+      //
+      // We do NOT match against the `References` header (which contains
+      // the full thread chain), because every reply in the thread would
+      // then look like a reply to every prior outbound — the false-
+      // positive bug we hit before with plant_ls fan-out.
       const ourRfc822Id = await getMessageRfc822Id(email.gmailMessageId);
       if (!ourRfc822Id) {
         log(`[EmailChecker] Could not fetch RFC822 Message-ID for email ${email.id} (gmailMessageId=${email.gmailMessageId}) — skipping thread`);
         continue;
       }
 
-      // Find reply messages (only TRUE INBOUND messages AFTER our dispatch).
-      //
-      // The naive "messages after ours" filter is wrong when our own pipeline
-      // has sent MORE outbound messages on the same thread later (e.g. a
-      // clarification email after the initial dispatch). Those carry the
-      // 'SENT' label; treating them as "replies" feeds OUR own text back to
-      // the planner, which loops forever emitting clarifications about the
-      // last clarification.
-      //
-      // True inbound = Gmail labelled it INBOX *and* not SENT.
-      // True reply-to-this-email = In-Reply-To OR References header
-      // contains OUR outbound's RFC822 Message-ID.
-      const dispatchIdx = messages.findIndex(
-        (msg) => msg.id === email.gmailMessageId
-      );
-      const candidates = dispatchIdx >= 0
-        ? messages.slice(dispatchIdx + 1)
-        : messages.filter((msg) => msg.id !== email.gmailMessageId);
-
-      // Helper: read the In-Reply-To header off a thread message.
-      //
-      // CRITICAL — match on In-Reply-To ONLY, never on References.
-      //   In-Reply-To names the IMMEDIATE parent message (the one the sender
-      //     clicked "Reply" on). This is what we want — it's a 1:1 link
-      //     between an inbound reply and the specific outbound it answers.
-      //   References names the ENTIRE thread chain. Every reply in the
-      //     thread carries every prior Message-ID in its References chain,
-      //     so matching against References would make EVERY reply in the
-      //     thread look like a reply to OUR outbound — which is exactly
-      //     the false-positive bug we hit (LS 373431's scope matched 8/8
-      //     replies, including ones that actually targeted LS 373437).
-      //
-      // Message-IDs are typically wrapped in <...>; substring match is
-      // robust to extra whitespace / missing angle brackets.
-      const isReplyToThisEmail = (msg: typeof candidates[number]): boolean => {
+      // Helper: read a header value off a thread message (case-insensitive).
+      type ThreadMsg = (typeof messages)[number];
+      const readHeader = (msg: ThreadMsg, name: string): string => {
         const headers = (msg.payload?.headers ?? []) as Array<{ name?: string | null; value?: string | null }>;
-        const inReplyTo = headers.find((h) => h.name?.toLowerCase() === 'in-reply-to')?.value ?? '';
-        return inReplyTo.includes(ourRfc822Id);
+        return headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? '';
       };
 
-      const replyMessages = candidates.filter((msg) => {
+      // Build an index of every thread message by its RFC822 Message-ID
+      // so we can resolve In-Reply-To → parent message in one hop.
+      // RFC822 Message-IDs are wrapped in <...>; we store the inner value
+      // for robust substring matching against In-Reply-To (which may or
+      // may not preserve the angle brackets).
+      const byRfc822Id = new Map<string, ThreadMsg>();
+      for (const msg of messages) {
+        const id = readHeader(msg, 'Message-ID') || readHeader(msg, 'Message-Id');
+        if (!id) continue;
+        // Store both the wrapped and unwrapped variants to be tolerant.
+        byRfc822Id.set(id, msg);
+        const unwrapped = id.replace(/^<|>$/g, '');
+        if (unwrapped !== id) byRfc822Id.set(unwrapped, msg);
+        byRfc822Id.set(`<${unwrapped}>`, msg);
+      }
+
+      const isOutbound = (msg: ThreadMsg): boolean => {
         const labels = (msg.labelIds as string[] | undefined) ?? [];
-        const isInbound = labels.includes('INBOX') && !labels.includes('SENT');
-        return isInbound && isReplyToThisEmail(msg);
+        return labels.includes('SENT');
+      };
+      const isInbound = (msg: ThreadMsg): boolean => {
+        const labels = (msg.labelIds as string[] | undefined) ?? [];
+        return labels.includes('INBOX') && !labels.includes('SENT');
+      };
+
+      // Walk In-Reply-To upwards from `msg` until we hit an outbound
+      // message. Returns that outbound's RFC822 Message-ID, or null if
+      // the chain dead-ends without reaching an outbound (e.g. a thread
+      // we didn't originate). Cycle-guarded.
+      const nearestOutboundAncestorRfc822 = (msg: ThreadMsg): string | null => {
+        const seen = new Set<string>();
+        let cur: ThreadMsg | undefined = msg;
+        let safety = 32; // thread-depth cap; threads this deep shouldn't exist
+        while (cur && safety-- > 0) {
+          const inReplyTo = readHeader(cur, 'In-Reply-To').trim();
+          if (!inReplyTo) return null;
+          if (seen.has(inReplyTo)) return null; // cycle
+          seen.add(inReplyTo);
+          // Try exact match first, then unwrapped variants.
+          let parent = byRfc822Id.get(inReplyTo);
+          if (!parent) {
+            const unwrapped = inReplyTo.replace(/^<|>$/g, '');
+            parent = byRfc822Id.get(unwrapped) ?? byRfc822Id.get(`<${unwrapped}>`);
+          }
+          if (!parent) return null; // parent not in this thread
+          if (isOutbound(parent)) {
+            return (
+              readHeader(parent, 'Message-ID') ||
+              readHeader(parent, 'Message-Id') ||
+              null
+            );
+          }
+          cur = parent;
+        }
+        return null;
+      };
+
+      // Find reply messages: true inbounds whose nearest outbound ancestor
+      // is THIS email's RFC822 Message-ID. Skip the dispatch message
+      // itself (it's outbound).
+      const candidates = messages.filter(
+        (msg) => msg.id !== email.gmailMessageId,
+      );
+      const replyMessages = candidates.filter((msg) => {
+        if (!isInbound(msg)) return false;
+        const ancestor = nearestOutboundAncestorRfc822(msg);
+        if (!ancestor) return false;
+        // Substring match handles angle-bracket variance.
+        return ancestor.includes(ourRfc822Id) || ourRfc822Id.includes(ancestor);
       });
 
       if (replyMessages.length === 0) {
