@@ -22,7 +22,7 @@ Every LLM call goes through `src/lib/llm-service.ts`. Provider + model are picke
 - `LLM_PROVIDER` — one of `openai` | `groq` | `together` | `deepinfra` | `runpod` | `gemini` (default `openai`)
 - `LLM_MODEL` — model id (defaults per provider; e.g. `gpt-4o` for openai, `gemini-2.5-flash` for gemini)
 - `LLM_TEMPERATURE` — default 0.7 (per-call override available)
-- `LLM_MAX_TOKENS` — default 4096 (per-call override available)
+- `LLM_MAX_TOKENS` — default 12000 (planner emits long structured JSON; smaller caps truncate the response and break the Zod parse). Per-call override available; the planner itself locks 12000 regardless of env.
 - `LLM_BASE_URL` — optional override for OpenAI-compatible providers (self-hosted vLLM etc.)
 
 API keys (only the one matching the active provider is required):

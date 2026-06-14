@@ -14,7 +14,11 @@
  *                    (default: 'openai')
  *   LLM_MODEL        Model id. Defaults per provider — see DEFAULT_MODELS.
  *   LLM_TEMPERATURE  Float, default 0.7. Override per call via chat({temperature}).
- *   LLM_MAX_TOKENS   Int, default 4096. Override per call via chat({maxTokens}).
+ *   LLM_MAX_TOKENS   Int, default 12000. Override per call via chat({maxTokens}).
+ *                    The planner emits long structured JSON (full step plan
+ *                    + rationale + per-step args); 4096 truncates the JSON
+ *                    response mid-stream and the Zod parse fails. Keep
+ *                    generous unless you know your specific call is small.
  *
  *   API keys (read based on the active provider):
  *     OPENAI_API_KEY      — openai
@@ -167,7 +171,12 @@ function readConfig(): ResolvedConfig {
   }
 
   const mtStr = process.env.LLM_MAX_TOKENS;
-  const defaultMaxTokens = mtStr !== undefined ? Number(mtStr) : 4096;
+  // 12000 is the safe default — the planner's structured JSON output (step
+  // list + rationale + nested per-step args) routinely runs past 4k tokens
+  // on long modify cycles, causing the response to truncate mid-stream and
+  // the Zod parse to fail. Raise via LLM_MAX_TOKENS only if you have a
+  // specific reason to go higher.
+  const defaultMaxTokens = mtStr !== undefined ? Number(mtStr) : 12000;
   if (!Number.isFinite(defaultMaxTokens) || defaultMaxTokens <= 0) {
     throw new Error(
       `[llm-service] LLM_MAX_TOKENS='${mtStr}' must be a positive number.`,

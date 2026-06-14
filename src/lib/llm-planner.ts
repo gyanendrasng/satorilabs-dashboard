@@ -875,6 +875,11 @@ export async function planNextSteps(args: {
         { role: 'user', content: userPrompt },
       ],
       requireJson: true,
+      // Planner output is a structured JSON plan (rationale + steps[] with
+      // nested args, plus per-step rationale strings) and can run long on
+      // multi-step modify cycles. Lock the cap here so a low LLM_MAX_TOKENS
+      // env value can't truncate the JSON mid-stream and fail the Zod parse.
+      maxTokens: 12000,
     });
   } catch (e) {
     return planFailure(`LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
