@@ -103,6 +103,20 @@ export async function checkForReplies(): Promise<{
       // Get all messages in the thread
       const messages = await getThreadMessages(email.gmailThreadId);
 
+      // CRITICAL: multiple of OUR outbound emails can sit on the same Gmail
+      // thread (e.g. when we fan out N plant_ls emails for N loading slips
+      // and the plant replies separately to each — every reply lives on the
+      // SAME thread but is addressed to a different outbound). We must match
+      // each reply to the SPECIFIC outbound it's responding to, not to the
+      // thread as a whole. Use the RFC822 In-Reply-To / References headers
+      // for that — Gmail preserves them and they point at the parent
+      // message's Message-ID.
+      const ourRfc822Id = await getMessageRfc822Id(email.gmailMessageId);
+      if (!ourRfc822Id) {
+        log(`[EmailChecker] Could not fetch RFC822 Message-ID for email ${email.id} (gmailMessageId=${email.gmailMessageId}) — skipping thread`);
+        continue;
+      }
+
       // Find reply messages (only TRUE INBOUND messages AFTER our dispatch).
       //
       // The naive "messages after ours" filter is wrong when our own pipeline
@@ -113,15 +127,32 @@ export async function checkForReplies(): Promise<{
       // last clarification.
       //
       // True inbound = Gmail labelled it INBOX *and* not SENT.
+      // True reply-to-this-email = In-Reply-To OR References header
+      // contains OUR outbound's RFC822 Message-ID.
       const dispatchIdx = messages.findIndex(
         (msg) => msg.id === email.gmailMessageId
       );
       const candidates = dispatchIdx >= 0
         ? messages.slice(dispatchIdx + 1)
         : messages.filter((msg) => msg.id !== email.gmailMessageId);
+
+      // Helper: read the In-Reply-To and References headers off a thread
+      // message. References is a space-separated chain; In-Reply-To is
+      // (typically) one Message-ID. We match if either contains the
+      // outbound's Message-ID — this is what Gmail uses for threading.
+      const isReplyToThisEmail = (msg: typeof candidates[number]): boolean => {
+        const headers = (msg.payload?.headers ?? []) as Array<{ name?: string | null; value?: string | null }>;
+        const inReplyTo = headers.find((h) => h.name?.toLowerCase() === 'in-reply-to')?.value ?? '';
+        const references = headers.find((h) => h.name?.toLowerCase() === 'references')?.value ?? '';
+        // Message-IDs are typically wrapped in <...>; do substring match
+        // for robustness (covers extra whitespace, missing angle brackets).
+        return inReplyTo.includes(ourRfc822Id) || references.includes(ourRfc822Id);
+      };
+
       const replyMessages = candidates.filter((msg) => {
         const labels = (msg.labelIds as string[] | undefined) ?? [];
-        return labels.includes('INBOX') && !labels.includes('SENT');
+        const isInbound = labels.includes('INBOX') && !labels.includes('SENT');
+        return isInbound && isReplyToThisEmail(msg);
       });
 
       if (replyMessages.length === 0) {
@@ -130,10 +161,10 @@ export async function checkForReplies(): Promise<{
       }
 
       // Per-message dedup. ProcessedEmail is keyed by gmailMessageId — any
-      // reply we've already handled (on this email OR another email sharing
-      // the same thread) is in there. Drop those before picking the latest.
-      // Without this, polling status='replied' emails would reprocess the
-      // first reply on every cron tick.
+      // reply we've already handled is in there. Drop those before picking
+      // the latest. The header-scoped filter above means we won't poison
+      // our own poll by marking sibling replies on the same thread as
+      // processed when they belong to a different outbound.
       const replyIds = replyMessages.map((m) => m.id).filter((id): id is string => !!id);
       const alreadyProcessed = await prisma.processedEmail.findMany({
         where: { gmailMessageId: { in: replyIds } },
@@ -217,12 +248,15 @@ export async function checkForReplies(): Promise<{
         processed++;
       }
 
-      // Durably mark this Gmail message as processed so a follow-up cron
-      // tick doesn't re-handle it. We also mark every OTHER unprocessed
-      // reply on the same thread that's older than `latestReply` — those
-      // were superseded by `latestReply` and the planner already saw them
-      // in the email-thread render, so they shouldn't trigger their own
-      // plan calls later.
+      // Durably mark every reply we matched to THIS outbound as processed.
+      // Because the candidates list was already filtered by the In-Reply-To /
+      // References headers above, `unprocessed` only contains messages that
+      // target THIS email's RFC822 Message-ID — sibling replies on the same
+      // Gmail thread that respond to a DIFFERENT outbound are not in here
+      // and will be picked up by their own pending-email iteration.
+      // Older replies under the same parent are superseded by `latestReply`
+      // (the planner already saw them in the thread render), so they
+      // shouldn't trigger their own plan calls later.
       for (const msg of unprocessed) {
         if (!msg.id) continue;
         try {
