@@ -136,17 +136,25 @@ export async function checkForReplies(): Promise<{
         ? messages.slice(dispatchIdx + 1)
         : messages.filter((msg) => msg.id !== email.gmailMessageId);
 
-      // Helper: read the In-Reply-To and References headers off a thread
-      // message. References is a space-separated chain; In-Reply-To is
-      // (typically) one Message-ID. We match if either contains the
-      // outbound's Message-ID — this is what Gmail uses for threading.
+      // Helper: read the In-Reply-To header off a thread message.
+      //
+      // CRITICAL — match on In-Reply-To ONLY, never on References.
+      //   In-Reply-To names the IMMEDIATE parent message (the one the sender
+      //     clicked "Reply" on). This is what we want — it's a 1:1 link
+      //     between an inbound reply and the specific outbound it answers.
+      //   References names the ENTIRE thread chain. Every reply in the
+      //     thread carries every prior Message-ID in its References chain,
+      //     so matching against References would make EVERY reply in the
+      //     thread look like a reply to OUR outbound — which is exactly
+      //     the false-positive bug we hit (LS 373431's scope matched 8/8
+      //     replies, including ones that actually targeted LS 373437).
+      //
+      // Message-IDs are typically wrapped in <...>; substring match is
+      // robust to extra whitespace / missing angle brackets.
       const isReplyToThisEmail = (msg: typeof candidates[number]): boolean => {
         const headers = (msg.payload?.headers ?? []) as Array<{ name?: string | null; value?: string | null }>;
         const inReplyTo = headers.find((h) => h.name?.toLowerCase() === 'in-reply-to')?.value ?? '';
-        const references = headers.find((h) => h.name?.toLowerCase() === 'references')?.value ?? '';
-        // Message-IDs are typically wrapped in <...>; do substring match
-        // for robustness (covers extra whitespace, missing angle brackets).
-        return inReplyTo.includes(ourRfc822Id) || references.includes(ourRfc822Id);
+        return inReplyTo.includes(ourRfc822Id);
       };
 
       const replyMessages = candidates.filter((msg) => {
