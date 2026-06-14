@@ -1597,6 +1597,47 @@ async function fireStep(
       // will see the verdicts in the audit trail and pick the right per-item
       // step path (Rule 11). Mirrors the stock_precheck → substituted re-plan
       // pattern.
+
+      // Loop guard: count recent bundle_capacity_assessment completions for
+      // this SO. If the planner keeps re-emitting the assessment (i.e. it's
+      // ignoring the verdicts in the audit trail — a Gemini/GPT confusion
+      // mode we've seen), fail loudly so an operator can intervene rather
+      // than burning tokens in an infinite loop.
+      const recentAssessments = await prisma.scenarioEvent.count({
+        where: {
+          salesOrderId: progress.salesOrderId,
+          type: 'step_completed',
+          payload: { contains: '"kind":"bundle_capacity_assessment"' },
+        },
+      });
+      const LOOP_THRESHOLD = 3;
+      if (recentAssessments >= LOOP_THRESHOLD) {
+        const errMsg =
+          `bundle_capacity_assessment loop guard tripped: this SO already has ` +
+          `${recentAssessments} prior assessment completions in audit. The planner is ` +
+          `re-emitting the assessment instead of routing per-item per Rule 6e. ` +
+          `Likely cause: the planner is not reading the \`verdicts:\` summary off ` +
+          `the latest step_completed line. Marking scenario failed for supervisor review.`;
+        log(`[ENGINE] ${errMsg}`);
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: { state: 'failed', error: errMsg },
+        });
+        try {
+          const { emitEvent } = await import('./scenario-events');
+          await emitEvent({
+            salesOrderId: progress.salesOrderId,
+            scenarioProgressId: progress.id,
+            type: 'scenario_failed',
+            payload: {
+              error: errMsg,
+              priorAssessmentCount: recentAssessments,
+            },
+          });
+        } catch {}
+        return 'pause';
+      }
+
       const { coerceBundleCapacityArgs } = await import('./planner-step-args');
       const { assessPostLsIncrease } = await import('./bundle-capacity');
       const items = coerceBundleCapacityArgs(_plannedStep);

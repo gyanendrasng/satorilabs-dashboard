@@ -84,7 +84,16 @@ function summarizePayload(type: string, p: Record<string, unknown>): string {
       const sap = type === 'step_completed' && p.sap_output
         ? ' — ' + summariseSapOutput(p.sap_output as Record<string, unknown>)
         : '';
-      return `${kind}${ok}${sap}`;
+      // bundle_capacity_assessment writes its verdicts onto the
+      // step_completed payload (not sap_output, since it's engine-side, not
+      // a SAP txn). Surface them so the planner can route per-item on its
+      // next plan call. Without this the trail just shows the step ran and
+      // the planner has no signal to advance off Rule 6e — it re-emits
+      // bundle_capacity_assessment indefinitely.
+      const verdicts = type === 'step_completed' && kind === 'bundle_capacity_assessment'
+        ? ' — verdicts: ' + summariseBundleVerdicts(p.verdicts)
+        : '';
+      return `${kind}${ok}${sap}${verdicts}`;
     }
     case 'email_sent': {
       const recipient = String(p.recipient ?? p.to ?? '?');
@@ -109,6 +118,36 @@ function summarizePayload(type: string, p: Record<string, unknown>): string {
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return s.slice(0, max - 1) + '…';
+}
+
+/**
+ * One-line summary of bundle_capacity_assessment verdicts. The shape matches
+ * what `assessPostLsIncrease` writes onto the step_completed payload:
+ *   `[{material, verdict, bundleId?, remainingKg?}, ...]`
+ *
+ * The planner uses this to choose the per-item path on its next plan call
+ * (fits_same_bundle → zload2; fits_other_bundle → zload1 append;
+ *  needs_new_so → email_branch_request_new_so). If verdicts are missing
+ * from the rendered audit, the planner re-emits bundle_capacity_assessment
+ * forever — see Rule 6e in llm-planner.ts.
+ */
+function summariseBundleVerdicts(v: unknown): string {
+  if (!Array.isArray(v) || v.length === 0) return '(no verdicts)';
+  const parts: string[] = [];
+  for (const row of v) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as Record<string, unknown>;
+    const material = String(r.material ?? '?');
+    const verdict = String(r.verdict ?? '?');
+    const bundleId = typeof r.bundleId === 'string' ? r.bundleId : null;
+    const remainingKg = typeof r.remainingKg === 'number' ? r.remainingKg : null;
+    const extras: string[] = [];
+    if (bundleId) extras.push(`bundleId=${bundleId}`);
+    if (remainingKg !== null) extras.push(`remainingKg=${remainingKg}`);
+    const tail = extras.length > 0 ? `(${extras.join(', ')})` : '';
+    parts.push(`${material}=${verdict}${tail}`);
+  }
+  return parts.join(', ') || '(no verdicts)';
 }
 
 /**

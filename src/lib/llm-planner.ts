@@ -548,15 +548,30 @@ trigger email type, to decide whose intent this is.
   6e. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL on a plant_ls
       email — i.e. plant_ls has already been sent (CURRENT SO STATE shows
       \`plant_ls email sent: yes\` AND audit trail has \`email_sent plant_ls\`).
-      Bundles are FROZEN: loading slips cannot migrate between bundles. Your
-      FIRST step MUST be bundle_capacity_assessment with one items[] entry
-      per material being increased / added. deltaKg = additional kilograms
-      this material is gaining (read it from the email — branch usually
-      states units; convert via the material's Material.orderWeightKg if
-      shown, otherwise read the email's weight figure directly). STOP after
-      bundle_capacity_assessment; the engine emits step_completed with
-      payload.verdicts = [{material, verdict, bundleId, remainingKg}] and
-      re-enters this planner. On the NEXT plan call:
+      Bundles are FROZEN: loading slips cannot migrate between bundles.
+
+      **CRITICAL — TWO-PHASE RULE. Check the audit trail before emitting:**
+      - PHASE 1 (no prior bundle_capacity_assessment for this modification
+        yet — the audit trail does NOT contain a recent
+        \`step_completed bundle_capacity_assessment\` with verdicts AFTER
+        the latest plant_ls / email_received for this modify request):
+        Your ONLY step is bundle_capacity_assessment with one items[]
+        entry per material being increased / added. deltaKg = additional
+        kilograms this material is gaining (read it from the email —
+        branch usually states units; convert via the material's
+        Material.orderWeightKg if shown, otherwise read the email's
+        weight figure directly). STOP after bundle_capacity_assessment;
+        the engine emits step_completed with verdicts and re-enters this
+        planner.
+      - PHASE 2 (the audit trail DOES contain
+        \`step_completed bundle_capacity_assessment\` with a \`verdicts:\`
+        summary AFTER the latest inbound modification email): the verdicts
+        are already known. DO NOT re-emit bundle_capacity_assessment —
+        doing so triggers an infinite loop. Read the verdicts directly
+        from the audit line (format: \`material=verdict(bundleId=...,
+        remainingKg=...)\`) and emit the per-item path below.
+
+      On the NEXT plan call (Phase 2):
         - For each item with verdict='fits_same_bundle':
           EMIT (per item) stock_precheck → va02 → email_2nd_release →
           zso_visibility → zload2 → email_modified_ls_to_plant.
