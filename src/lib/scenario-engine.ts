@@ -1656,8 +1656,19 @@ async function fireStep(
         return 'pause';
       }
 
+      // Annotate each verdict with the deltaKg the planner asked us to
+      // assess. Surfacing this in the audit trail lets the planner distinguish
+      // "verdict for the prior 209-unit ask" from "verdict for the new
+      // 202-unit ask" — without this the trail just says
+      // `material=needs_new_so` for both rounds and the LLM can't tell which
+      // delta the verdict belongs to.
+      const deltaByMaterial = new Map<string, number>(items.map((i) => [i.material, i.deltaKg]));
+      const verdictsWithDelta = result.verdicts.map((v) => ({
+        ...v,
+        assessedDeltaKg: deltaByMaterial.get(v.material) ?? null,
+      }));
       log(
-        `[ENGINE] bundle_capacity_assessment — verdicts: ${result.verdicts.map((v) => `${v.material}:${v.verdict}${v.bundleId ? `(${v.bundleId})` : ''}`).join(', ')}`,
+        `[ENGINE] bundle_capacity_assessment — verdicts: ${verdictsWithDelta.map((v) => `${v.material}:${v.verdict}${v.assessedDeltaKg !== null ? `@${v.assessedDeltaKg}kg` : ''}${v.bundleId ? `(${v.bundleId})` : ''}`).join(', ')}`,
       );
       try {
         const { emitEvent } = await import('./scenario-events');
@@ -1668,7 +1679,7 @@ async function fireStep(
           payload: {
             kind: 'bundle_capacity_assessment',
             scenario_key: 'planner',
-            verdicts: result.verdicts,
+            verdicts: verdictsWithDelta,
             capacityKg: result.capacityKg,
           },
         });

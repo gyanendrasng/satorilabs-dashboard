@@ -141,7 +141,12 @@ function summariseBundleVerdicts(v: unknown): string {
     const verdict = String(r.verdict ?? '?');
     const bundleId = typeof r.bundleId === 'string' ? r.bundleId : null;
     const remainingKg = typeof r.remainingKg === 'number' ? r.remainingKg : null;
+    // The engine stamps the deltaKg the planner asked the assessment to
+    // evaluate. Surface it so the planner can tell two assessments apart
+    // by quantity (e.g. "verdict for the 209-unit ask vs the 202-unit ask").
+    const assessedDeltaKg = typeof r.assessedDeltaKg === 'number' ? r.assessedDeltaKg : null;
     const extras: string[] = [];
+    if (assessedDeltaKg !== null) extras.push(`assessedDeltaKg=${assessedDeltaKg}`);
     if (bundleId) extras.push(`bundleId=${bundleId}`);
     if (remainingKg !== null) extras.push(`remainingKg=${remainingKg}`);
     const tail = extras.length > 0 ? `(${extras.join(', ')})` : '';
