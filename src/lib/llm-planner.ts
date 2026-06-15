@@ -206,7 +206,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'email_2nd_release',
-    description: 'Ask the PLANT (not branch) to perform the second release after a va02 modification. The plant runs the actual release in SAP. Send AFTER va02, BEFORE re-running zso_visibility. The plant\'s reply lands as sender=plant and triggers rule 8 → zso_visibility.',
+    description: 'Ask the BRANCH (not plant) to perform the second release after a va02 modification. The branch runs the actual release in SAP. Send AFTER va02, BEFORE re-running zso_visibility. The branch\'s reply lands as sender=branch and triggers rule 8 → zso_visibility.',
     argsSchema: '{ materials: [{ code, op: "inc"|"dec"|"del", qty?: <integer> }, ...] }  // for the email body summary',
   },
   {
@@ -460,7 +460,7 @@ Examples of step objects with args (shape per AVAILABLE STEP KINDS argsSchema):
   { "kind": "zload2", "rationale": "decrease M-B to 80 on LS 12345", "args": { "revisions": [{ "lsNumber": "12345", "material": "M-B", "qty": 80 }] } }
   { "kind": "email_to_plant", "rationale": "branch shared truck details", "args": { "vehicles": [{ "vehicleNumber": "MH12AB1234", "driverMobile": "9999999999", "containerNumber": "" }] } }
   { "kind": "process_tonnage_reply", "rationale": "branch shared 35 t", "args": { "tonnage": { "value": 35, "unit": "t" } } }
-  { "kind": "zso_visibility", "rationale": "plant confirmed 2nd release" }  // no args
+  { "kind": "zso_visibility", "rationale": "branch confirmed 2nd release" }  // no args
 
 For the three question-asking step kinds — email_clarify_branch, email_clarify_plant, email_supervisor_question — the step object MUST also include:
 { "kind": "email_clarify_branch", "rationale": "...", "question": "<exact text to send>" }
@@ -519,9 +519,9 @@ trigger email type, to decide whose intent this is.
   - SENDER=plant + reply asks to modify quantities/lines → PLANT-side
     proposal. Emit email_to_branch_notifying_plant_change first (branch
     must approve before we touch SAP).
-  - SENDER=plant + reply is a confirmation/acknowledgment on a 2nd_release
+  - SENDER=branch + reply is a confirmation/acknowledgment on a 2nd_release
     email ("yes", "done", "released", "ok"). This is NOT a modification —
-    it's the plant confirming they performed the requested second release
+    it's the branch confirming they performed the requested second release
     in SAP. Apply rule 8 (emit zso_visibility), NOT zload2 /
     email_modified_ls_to_plant. The presence of an existing LSI does not
     change this: rule 8 wins because the trigger email is 2nd_release.
@@ -538,7 +538,7 @@ trigger email type, to decide whose intent this is.
       Do NOT emit zload2 in this case — pre-plant_ls modifications NEVER
       use zload2. The wipe-and-re-bundle path produces optimal truck
       packing; zload2 leaves the existing bundle composition frozen.
-      Downstream: after the plant acks 2nd_release, Rule 8 fires zso_visibility,
+      Downstream: after the branch acks 2nd_release, Rule 8 fires zso_visibility,
       the visibility callback auto-sends a round-2 ls_dispatch, the branch
       accepts the new material list (Rule 9 case a → email_confirm_bundle_details
       which calls the bundler to wipe + recreate Bundle rows), the branch
@@ -607,9 +607,9 @@ trigger email type, to decide whose intent this is.
         - EMIT lone_zmatana with materials = the SAME substitute codes (one
           entry per substitution). This fetches batch + availableStock for
           the substitute Material rows so downstream steps can ship them.
-        - EMIT email_2nd_release to the plant (existing semantics — plant
-          confirms the swap). Its materials args carry the substitute codes
-          and qty (op="inc"), so the plant sees what they're confirming.
+        - EMIT email_2nd_release to the branch (existing semantics — the
+          branch confirms the swap). Its materials args carry the substitute
+          codes and qty (op="inc"), so the branch sees what they're confirming.
       EMIT order: va02 → lone_zmatana → email_2nd_release. STOP.
       Do NOT re-emit stock_precheck — it has already run and the
       substitutions are recorded in the audit trail; re-emitting it would
@@ -618,16 +618,15 @@ trigger email type, to decide whose intent this is.
   7. INBOUND: branch MODIFY-DECREASE or MODIFY-DELETE on ls_dispatch (pre-LS).
      EMIT: email_confirm_bundle_details. STOP.
 
-  8. INBOUND: PLANT confirms the 2nd release ("yes", "done", "released", etc.)
-     on a 2nd_release email. (SENDER=plant. Audit trail shows va02 ✓ +
+  8. INBOUND: BRANCH confirms the 2nd release ("yes", "done", "released", etc.)
+     on a 2nd_release email. (SENDER=branch. Audit trail shows va02 ✓ +
      email_2nd_release already sent.) NOTE: the 2nd_release email is sent
-     to the PLANT — they perform the second release — so the reply comes
-     from sender=plant, NOT branch. Do not skip this rule because the
-     sender is plant; it is the only correct path for a 2nd_release reply.
+     to the BRANCH — they perform the second release — so the reply comes
+     from sender=branch. This is the only correct path for a 2nd_release reply.
      EMIT: zso_visibility. STOP.
      The /visibility-data callback auto-sends round-2 ls_dispatch.
      Do NOT chain to email_confirm_bundle_details here.
-     Do NOT emit zload2 / email_modified_ls_to_plant — the plant
+     Do NOT emit zload2 / email_modified_ls_to_plant — the branch
      confirmation is a green-light for re-visibility, not a request to
      modify loading slips (rule 11 covers branch-requested LS modifications
      on a plant_ls thread, which is a different scenario).
@@ -669,7 +668,7 @@ trigger email type, to decide whose intent this is.
              stock_precheck → va02 → email_2nd_release.
            - For a DECREASE / DELETE: zloading_close (args.all=true) →
              email_2nd_release (the materials args summarise the
-             decrease/delete so the plant can still do 2nd release on
+             decrease/delete so the branch can still do 2nd release on
              the unchanged lines; no va02 because decreases don't
              change the SO).
          The cycle will eventually return to this Rule 9 on the next

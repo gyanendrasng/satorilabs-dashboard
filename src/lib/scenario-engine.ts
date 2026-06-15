@@ -109,12 +109,14 @@ async function maybeInjectMissingPlantEmail(args: {
   const hasModStep = plannedSteps.some((s) => modKinds.has(s.kind));
   if (!hasModStep) return false;
 
-  // Did this plan ALSO already include a plant-bound email step?
-  // email_2nd_release counts here: the new pre-plant_ls modify cycle fires
-  // zloading_close (all) → va02 → email_2nd_release in one plan, then pauses
-  // for the plant's 2nd-release ack. The plant is informed of the wipe by
-  // virtue of receiving the 2nd-release request — no separate
-  // email_modified_ls_to_plant is needed in that intermediate state.
+  // Did this plan ALSO already include a step that terminates the modify
+  // cycle cleanly? `email_2nd_release` is branch-bound (the branch performs
+  // the 2nd release in SAP) — but it still counts here, because emitting it
+  // is the planner's legitimate stop point in the pre-plant_ls modify cycle:
+  // zloading_close (all) → va02 → email_2nd_release [pause for branch ack].
+  // If we excluded it, the safety net would spuriously inject email_to_plant
+  // in this intermediate state — but there are no LSs yet (we just wiped
+  // them), so that injection would have nothing to talk about.
   const plantEmailKinds = new Set<string>([
     'email_to_plant',
     'email_modified_ls_to_plant',
@@ -334,8 +336,8 @@ export async function sendSecondReleaseEmail(args: {
 }): Promise<{ messageId: string; threadId: string } | null> {
   const { salesOrderId, modifications, log } = args;
 
-  if (!PLANT_EMAIL) {
-    log('[2ndRelease] PLANT_EMAIL not configured — skipping');
+  if (!BRANCH_EMAIL) {
+    log('[2ndRelease] BRANCH_EMAIL not configured — skipping');
     return null;
   }
 
@@ -435,38 +437,38 @@ export async function sendSecondReleaseEmail(args: {
     `Revised dispatch plan (full):`,
     ...(planLines.length > 0 ? planLines : ['  (no materials on this SO)']),
     ``,
-    `Please do the second release with the revised plan above and confirm.`,
+    `Please perform the second release in SAP with the revised plan above and confirm.`,
     ``,
     `Thanks.`,
   ].join('\n');
 
   const subject = `2nd Release Confirmation - SO ${so.soNumber}`;
 
-  // Anchor on the per-PO plant thread. First-ever plant outbound for this PO
-  // opens a fresh thread; the resulting thread+message-id are captured below
-  // so every subsequent plant email lands in the same conversation.
+  // Anchor on the per-PO branch thread. 2nd_release is now branch-bound — the
+  // branch performs the 2nd release in SAP — so this email rides the branch
+  // conversation, not the plant one.
   const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
   const anchor = so.purchaseOrderId
-    ? await resolvePoThreadAnchor(so.purchaseOrderId, 'plant')
+    ? await resolvePoThreadAnchor(so.purchaseOrderId, 'branch')
     : null;
 
   let sent: { messageId: string; threadId: string };
   try {
     if (anchor) {
-      sent = await sendReplyEmail(PLANT_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(PLANT_EMAIL, subject, body);
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
     }
   } catch (err) {
     log(`[2ndRelease] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
-    sent = await sendPlainEmail(PLANT_EMAIL, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
   }
 
-  // Capture the plant anchor on first send (no-op if already set).
+  // Capture the branch anchor on first send (no-op if already set).
   if (so.purchaseOrderId && !anchor) {
     const rfc822 = await getMessageRfc822Id(sent.messageId);
     if (rfc822) {
-      await capturePoThreadAnchor(so.purchaseOrderId, 'plant', sent.threadId, rfc822);
+      await capturePoThreadAnchor(so.purchaseOrderId, 'branch', sent.threadId, rfc822);
     }
   }
 
@@ -491,7 +493,7 @@ export async function sendSecondReleaseEmail(args: {
       purchaseOrderId: so.purchaseOrderId,
       gmailMessageId: sent.messageId,
       gmailThreadId: sent.threadId,
-      recipientEmail: PLANT_EMAIL,
+      recipientEmail: BRANCH_EMAIL,
       subject,
       status: 'sent',
       emailType: '2nd_release',
@@ -510,7 +512,7 @@ export async function sendSecondReleaseEmail(args: {
       type: 'email_sent',
       payload: {
         emailType: '2nd_release',
-        recipient: PLANT_EMAIL,
+        recipient: BRANCH_EMAIL,
         subject,
         body_excerpt: body.slice(0, 200),
         gmailMessageId: sent.messageId,
@@ -886,9 +888,9 @@ export async function handleSecondReleaseReply(
     emailId,
     replyHtml,
     originalEmailHtml: '',
-    // 2nd_release is plant-addressed since the email routing refactor —
-    // the reply on that thread comes from the plant.
-    sourceEmailType: 'plant',
+    // 2nd_release is branch-bound — the branch performs the 2nd release in
+    // SAP — so the reply on that thread comes from the branch.
+    sourceEmailType: 'branch',
   });
   return { success: r.success, logs: r.logs };
 }
@@ -903,6 +905,12 @@ export async function handleSecondReleaseReply(
 // 4. Creates a new ScenarioProgress and walks the step list up to the next
 //    outbound email. Aborts any prior in-flight scenario for this SO.
 // 5. Emits ScenarioEvent at every transition.
+//
+// ⚠️  BEFORE EDITING handleReplyV2 — read docs/email-reply-detection.md.
+// The replyHtml-overwrite invariant (§6 of that doc) is load-bearing for
+// follow-up reply detection; flipping it back to "preserve prior reply"
+// silently breaks the cron's ability to surface a 2nd reply on the same
+// thread. Update the doc's change log if you change behavior here.
 // -----------------------------------------------------------------------------
 
 export async function handleReplyV2(args: {
