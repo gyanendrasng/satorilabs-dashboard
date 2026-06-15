@@ -1,3 +1,10 @@
+// ⚠️  BEFORE EDITING THIS FILE — read docs/email-reply-detection.md.
+// Reply detection has been broken & re-fixed several times when the matcher,
+// the poll filter, the ProcessedEmail dedup, and handleReplyV2's replyHtml
+// invariant were changed independently. The doc captures the invariants, the
+// failure modes that motivated each change, and the anti-patterns to avoid.
+// If you change anything in this file, also update that doc's change log.
+
 import { prisma } from './prisma';
 import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject, markMessagesAsRead } from './gmail';
 import {

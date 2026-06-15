@@ -30,6 +30,9 @@ API keys (only the one matching the active provider is required):
 
 ## Email Monitoring Cron
 
+> **Before editing anything in this area — read [docs/email-reply-detection.md](docs/email-reply-detection.md).**
+> The reply detection has been broken & re-fixed several times when the matcher, the poll filter, the `ProcessedEmail` dedup, and `handleReplyV2`'s `replyHtml` invariant were changed independently. The doc captures the invariants, failure modes, and anti-patterns. If you change `src/lib/email-reply-checker.ts` or `handleReplyV2` in `src/lib/scenario-engine.ts`, update that doc's change log.
+
 ### How It Works
 The cron is defined in `vercel.json` and hits `GET /backend/cron/check-emails` every minute.
 
