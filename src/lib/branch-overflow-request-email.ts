@@ -1,0 +1,151 @@
+/**
+ * Sent by the engine when `bundle_capacity_assessment` returns
+ * `partial_overflow` (or `needs_new_so`) for at least one material AND the
+ * planner has decided to ask the branch to opt in to the partial dispatch
+ * BEFORE touching SAP. The email shows the placed vs overflow split per
+ * material and asks the branch to either confirm we proceed with the
+ * partial qty (in which case a new SO is needed for the overflow) or to
+ * revise their ask.
+ *
+ * Mirrors the structure of `branch-new-so-email.ts` so the look-and-feel is
+ * familiar (same in-thread anchoring, same Email row shape). Distinct
+ * emailType `overflow_request` so the planner / cron can tell the two
+ * branch-facing prompts apart.
+ *
+ * Engine handler is `case 'email_branch_overflow_request':` in
+ * scenario-engine.ts. Branch reply comes back as a normal Email row with
+ * status='replied' and lands in handleReplyV2 → planner Rule 6e Phase 1.6.
+ */
+
+import { prisma } from './prisma';
+import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from './gmail';
+import { resolvePoThreadAnchor, capturePoThreadAnchor } from './po-thread';
+
+const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
+
+export interface BranchOverflowItem {
+  material: string;
+  placedKg: number;
+  overflowKg: number;
+}
+
+export async function sendBranchOverflowRequestEmail(args: {
+  salesOrderId: string;
+  items: BranchOverflowItem[];
+  log: (msg: string) => void;
+}): Promise<{ messageId: string; threadId: string } | null> {
+  const { salesOrderId, items, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log('[BranchOverflow] BRANCH_EMAIL not configured — skipping');
+    return null;
+  }
+  if (items.length === 0) {
+    log('[BranchOverflow] No overflow items — skipping (planner should not have emitted this step)');
+    return null;
+  }
+
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: salesOrderId },
+    select: {
+      soNumber: true,
+      purchaseOrderId: true,
+      purchaseOrder: { select: { poNumber: true } },
+      materials: { select: { material: true, materialDescription: true } },
+    },
+  });
+  if (!so) {
+    log(`[BranchOverflow] SO ${salesOrderId} not found`);
+    return null;
+  }
+
+  // Material description lookup so the body reads in human terms, not codes.
+  const descByCode = new Map<string, string | null>();
+  for (const m of so.materials) descByCode.set(m.material, m.materialDescription ?? null);
+
+  const lines = items.map((it) => {
+    const desc = descByCode.get(it.material) || it.material;
+    const placed = Math.round(it.placedKg);
+    const overflow = Math.round(it.overflowKg);
+    return `  - ${desc} — can accommodate ${placed} kg in this dispatch; ${overflow} kg overflow`;
+  });
+
+  const body = [
+    `Hi,`,
+    ``,
+    `Thank you for the increase request on SO ${so.soNumber}.`,
+    ``,
+    `Based on the bundles already shared with the plant, we can only partially accommodate your request:`,
+    ``,
+    ...lines,
+    ``,
+    `For the overflow above, please raise a fresh Sales Order — those units cannot fit into the current dispatch's bundles.`,
+    ``,
+    `If you'd like us to proceed with the partial quantities listed above (matching what fits in the current bundles) while you raise the new SO separately, please reply "confirm" or "proceed".`,
+    ``,
+    `If you'd like to revise the requested quantity instead, just reply with the new number and we'll re-check.`,
+    ``,
+    `Thanks.`,
+  ].join('\n');
+
+  const subject = `Action required — partial dispatch for SO ${so.soNumber}`;
+
+  const anchor = so.purchaseOrderId
+    ? await resolvePoThreadAnchor(so.purchaseOrderId, 'branch')
+    : null;
+
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    }
+  } catch (err) {
+    log(`[BranchOverflow] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+  }
+
+  if (so.purchaseOrderId && !anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) {
+      await capturePoThreadAnchor(so.purchaseOrderId, 'branch', sent.threadId, rfc822);
+    }
+  }
+
+  await prisma.email.create({
+    data: {
+      salesOrderId,
+      purchaseOrderId: so.purchaseOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'overflow_request',
+      sentBody: body,
+      relatedMaterials: JSON.stringify({ version: 'overflow-request-v1', items }),
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    await emitEvent({
+      salesOrderId,
+      type: 'email_sent',
+      payload: {
+        emailType: 'overflow_request',
+        recipient: BRANCH_EMAIL,
+        subject,
+        body_excerpt: body.slice(0, 200),
+        gmailMessageId: sent.messageId,
+        items,
+      },
+    });
+  } catch {
+    // Event emission must never break the primary flow.
+  }
+
+  log(`[BranchOverflow] Sent to branch for SO ${so.soNumber} (${items.length} overflow item(s))`);
+  return sent;
+}

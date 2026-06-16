@@ -165,6 +165,34 @@ export function coerceBranchNewSoArgs(step: PlannedStep | undefined): BranchNewS
   });
 }
 
+// ─── email_branch_overflow_request ─────────────────────────────────────────
+
+export interface BranchOverflowItem {
+  material: string;
+  placedKg: number;
+  overflowKg: number;
+}
+
+export function coerceBranchOverflowArgs(step: PlannedStep | undefined): BranchOverflowItem[] {
+  const args = requireArgs(step, 'email_branch_overflow_request');
+  const items = requireArray(args.items, 'items', 'email_branch_overflow_request');
+  return items.map((raw, i) => {
+    const it = raw as Record<string, unknown>;
+    const material = asString(it.material, `items[${i}].material`, 'email_branch_overflow_request');
+    if (typeof it.placedKg !== 'number' || !Number.isFinite(it.placedKg) || it.placedKg < 0) {
+      throw new PlannerArgsError(
+        `email_branch_overflow_request.args.items[${i}].placedKg must be a non-negative finite number, got ${JSON.stringify(it.placedKg)}`,
+      );
+    }
+    if (typeof it.overflowKg !== 'number' || !Number.isFinite(it.overflowKg) || it.overflowKg <= 0) {
+      throw new PlannerArgsError(
+        `email_branch_overflow_request.args.items[${i}].overflowKg must be a positive finite number, got ${JSON.stringify(it.overflowKg)}`,
+      );
+    }
+    return { material, placedKg: it.placedKg, overflowKg: it.overflowKg };
+  });
+}
+
 // ─── lone_zmatana ──────────────────────────────────────────────────────────
 
 /**

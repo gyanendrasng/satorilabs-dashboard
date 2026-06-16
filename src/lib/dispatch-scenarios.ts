@@ -87,6 +87,10 @@ export type StepKind =
   | 'email_clarify_branch'            // Ask BRANCH to clarify an ambiguous / incomplete reply
   | 'email_clarify_plant'             // Ask PLANT to clarify an ambiguous / incomplete reply
   | 'email_supervisor_question'       // Ask the SUPERVISOR which option to pursue when stuck
+  // Rule 6e Phase 1.5 — bundle_capacity_assessment returned overflow; ask the
+  // branch to opt in to a partial dispatch + raise a new SO for the spill
+  // BEFORE we touch SAP. Non-terminal: the branch's reply re-enters Phase 1.6.
+  | 'email_branch_overflow_request'
   // Tells the branch their post-plant increase cannot be accommodated within
   // the existing bundle plan and asks them to raise a new SO for the
   // overflow. Terminal (the new SO arrives as a fresh NEW ORDER email).

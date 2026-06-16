@@ -270,8 +270,13 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
     argsSchema: null,
   },
   {
+    kind: 'email_branch_overflow_request',
+    description: 'Send the branch a "partial dispatch, please confirm" email when a bundle_capacity_assessment returned `partial_overflow` (some kg placed, some overflow) or `needs_new_so` (nothing placed) AND we want the branch to acknowledge the partial plan + raise a fresh SO for the overflow BEFORE we touch SAP. Use as the FIRST step after bundle_capacity_assessment whenever overflowKgTotal > 0 (Rule 6e Phase 1.5). The args carry the placed vs overflow split per material so the email body can show both. After the branch replies confirming, Rule 6e Phase 2 fires (stock_precheck → va02 → email_2nd_release for the placed portion).',
+    argsSchema: '{ items: [{ material: "<code>", placedKg: <number>, overflowKg: <number> }, ...] }',
+  },
+  {
     kind: 'email_branch_request_new_so',
-    description: 'Send the branch a final-step email telling them their requested increase cannot be accommodated within the existing dispatch plan (every bundle on the PO is full and already intimated to the plant) and asking them to raise a fresh SO for the additional units. Use ONLY when a prior bundle_capacity_assessment returned `needs_new_so` for at least one item. Terminal — the new SO arrives as a normal NEW ORDER email and re-enters the pipeline.',
+    description: 'Send the branch a final-step email telling them their requested increase cannot be accommodated within the existing dispatch plan (every bundle on the PO is full and already intimated to the plant) and asking them to raise a fresh SO for the additional units. Use ONLY when a prior bundle_capacity_assessment returned `needs_new_so` for at least one item AND the partial path is not being run. Terminal — the new SO arrives as a normal NEW ORDER email and re-enters the pipeline.',
     argsSchema: '{ items: [{ material: "<code>", deltaKg: <number, the overflow weight that cannot be accommodated> }, ...] }',
   },
   {
@@ -572,9 +577,40 @@ trigger email type, to decide whose intent this is.
         The engine emits step_completed with verdicts and re-enters this
         planner.
 
-      - PHASE 2 — \`step_completed bundle_capacity_assessment\` exists with
-        verdicts, but NO \`step_completed va02\` exists AFTER that
-        assessment.
+      - PHASE 1.5 — OVERFLOW GATE. \`step_completed bundle_capacity_assessment\`
+        exists with overflowKgTotal > 0 (any material has overflowKg > 0)
+        AND NO \`email_sent overflow_request\` exists AFTER that
+        assessment. The branch must opt in to the partial dispatch
+        BEFORE we touch SAP. Emit ONLY email_branch_overflow_request
+        with args.items = [{material, placedKg, overflowKg}, ...] for
+        every material that had a partial_overflow OR needs_new_so
+        verdict (placedKg = sum of that material's allocations.kg from
+        the verdict; overflowKg = the verdict's overflowKg). STOP.
+        Wait for the branch to reply.
+
+      - PHASE 1.6 — \`email_sent overflow_request\` exists AND a new
+        \`email_received\` AFTER it (the branch's reply to the overflow
+        prompt). Decide based on the reply body:
+          (a) PLAIN CONFIRMATION ("confirm", "proceed", "yes", "go
+              ahead") → branch opts in to the partial dispatch. Fall
+              through to PHASE 2 (treat the existing verdict as
+              authoritative; do NOT re-emit bundle_capacity_assessment).
+          (b) REVISED QUANTITY (branch asks for a different qty) → this
+              is a NEW modify request. The new email_received resets
+              the Phase 1 gate, so re-emit bundle_capacity_assessment
+              with the new deltaKg per material.
+          (c) REJECTION / "skip this material" / "drop it" → emit
+              email_branch_request_new_so with args.items =
+              [{material, deltaKg: overflowKg}, ...] to formally close
+              the overflow ask, and STOP. Do NOT proceed with VA02 for
+              the partial.
+          (d) UNCLEAR / AMBIGUOUS → email_clarify_branch.
+
+      - PHASE 2 — EITHER overflowKgTotal == 0 (no overflow gate needed)
+        OR Phase 1.6 (a) "PLAIN CONFIRMATION" applies (branch acked the
+        partial dispatch). AND \`step_completed bundle_capacity_assessment\`
+        exists with verdicts, AND NO \`step_completed va02\` exists
+        AFTER that assessment.
         Read the verdicts off the latest assessment line. Each verdict has
         the form
           \`material=fully_allocated|partial_overflow|needs_new_so(assessedDeltaKg=N; alloc=[same_bundle:Akg + other_bundle:Bkg + ...]; overflowKg=O)\`
@@ -594,9 +630,11 @@ trigger email type, to decide whose intent this is.
             (3) email_2nd_release  (branch acks the placed-qty increase).
           STOP. Wait for the branch to confirm 2nd_release.
         - If placedKgTotal == 0 for ALL materials (every verdict is
-          needs_new_so), SKIP straight to emitting
-          email_branch_request_new_so with args.items = [{material,
-          deltaKg: overflowKg}, ...] for every overflow leg. STOP.
+          needs_new_so), Phase 1.5 has already routed: the overflow
+          gate's email IS the new-SO request in that degenerate case,
+          and Phase 1.6 (c) closes the loop with email_branch_request_new_so
+          if the branch confirms. Phase 2 should not fire when there is
+          nothing to place.
 
       - PHASE 2.5 — \`step_completed bundle_capacity_assessment\`,
         \`step_completed va02\`, AND \`email_sent 2nd_release\` all exist
