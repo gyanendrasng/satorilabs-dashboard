@@ -44,6 +44,13 @@
  *   // result.usage → { inputTokens, outputTokens, totalTokens }
  */
 import OpenAI from 'openai';
+// Node built-ins used to bootstrap the Gemini SDK at runtime. Static imports
+// are critical here: `await import('node:path')` inside the GeminiClient was
+// being interop-wrapped by Next.js' server bundle so `path.join` resolved to
+// `undefined`, surfacing as the cryptic "a is not a function" at boot.
+import { createRequire } from 'node:module';
+import * as nodePath from 'node:path';
+import * as nodeFs from 'node:fs';
 
 // `@google/genai` is loaded LAZILY in the Gemini provider constructor below
 // (dynamic import). It is ESM-only and ships with conditional Node/web
@@ -268,14 +275,15 @@ class GeminiClient implements ProviderClient {
     //     PM2/systemd from a different cwd.
     //   - require('@google/genai/dist/node/index.cjs') is blocked by the
     //     package's `exports` field (deep paths aren't whitelisted).
+    //   - `await import('node:path')` / `await import('node:fs')` inside a
+    //     Next.js server chunk gets interop-wrapped so the named exports land
+    //     as undefined (the canonical "a is not a function" boot crash). Use
+    //     static top-level imports for the Node built-ins instead.
     //
     // Workaround: find the package's installed location by walking up from
     // this source file looking for `node_modules/@google/genai`, then load
     // its CJS entry FILE directly (bypassing the `exports` map, which only
     // affects bare-specifier resolution, not absolute file paths).
-    const { createRequire } = await import('node:module');
-    const path = await import('node:path');
-    const fs = await import('node:fs');
 
     // __dirname is unreliable in Next.js bundled chunks. Walk up from
     // process.cwd() AND from a few well-known prod roots until we find the
@@ -289,8 +297,8 @@ class GeminiClient implements ProviderClient {
       for (let i = 0; i < 8; i++) {
         if (seen.has(dir)) break;
         seen.add(dir);
-        candidates.push(path.join(dir, 'node_modules/@google/genai/dist/node/index.cjs'));
-        const parent = path.dirname(dir);
+        candidates.push(nodePath.join(dir, 'node_modules/@google/genai/dist/node/index.cjs'));
+        const parent = nodePath.dirname(dir);
         if (parent === dir) break;
         dir = parent;
       }
@@ -302,7 +310,7 @@ class GeminiClient implements ProviderClient {
 
     const cjsEntry = candidates.find((p) => {
       try {
-        return fs.statSync(p).isFile();
+        return nodeFs.statSync(p).isFile();
       } catch {
         return false;
       }
