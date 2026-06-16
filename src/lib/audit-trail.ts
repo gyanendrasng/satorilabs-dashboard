@@ -123,13 +123,14 @@ function truncate(s: string, max: number): string {
 /**
  * One-line summary of bundle_capacity_assessment verdicts. The shape matches
  * what `assessPostLsIncrease` writes onto the step_completed payload:
- *   `[{material, verdict, bundleId?, remainingKg?}, ...]`
+ *   `[{material, verdict, allocations: [{kind, bundleId, kg}, ...], overflowKg, assessedDeltaKg?}, ...]`
  *
- * The planner uses this to choose the per-item path on its next plan call
- * (fits_same_bundle → zload2; fits_other_bundle → zload1 append;
- *  needs_new_so → email_branch_request_new_so). If verdicts are missing
- * from the rendered audit, the planner re-emits bundle_capacity_assessment
- * forever — see Rule 6e in llm-planner.ts.
+ * The planner uses this to choose the per-item step path on its next plan
+ * call (Rule 6e Phase 2): one zload2 per same_bundle allocation, one
+ * zload1-append per other_bundle allocation, email_modified_ls_to_plant,
+ * and email_branch_request_new_so when overflowKg > 0. If verdicts are
+ * missing from the rendered audit, the planner re-emits
+ * bundle_capacity_assessment forever — see Rule 6e in llm-planner.ts.
  */
 function summariseBundleVerdicts(v: unknown): string {
   if (!Array.isArray(v) || v.length === 0) return '(no verdicts)';
@@ -139,17 +140,28 @@ function summariseBundleVerdicts(v: unknown): string {
     const r = row as Record<string, unknown>;
     const material = String(r.material ?? '?');
     const verdict = String(r.verdict ?? '?');
-    const bundleId = typeof r.bundleId === 'string' ? r.bundleId : null;
-    const remainingKg = typeof r.remainingKg === 'number' ? r.remainingKg : null;
     // The engine stamps the deltaKg the planner asked the assessment to
     // evaluate. Surface it so the planner can tell two assessments apart
     // by quantity (e.g. "verdict for the 209-unit ask vs the 202-unit ask").
     const assessedDeltaKg = typeof r.assessedDeltaKg === 'number' ? r.assessedDeltaKg : null;
+    const overflowKg = typeof r.overflowKg === 'number' ? r.overflowKg : null;
+    const allocations = Array.isArray(r.allocations) ? r.allocations : [];
+
+    const allocParts: string[] = [];
+    for (const a of allocations) {
+      if (!a || typeof a !== 'object') continue;
+      const al = a as Record<string, unknown>;
+      const kind = String(al.kind ?? '?');
+      const bundleId = typeof al.bundleId === 'string' ? al.bundleId : '?';
+      const kg = typeof al.kg === 'number' ? al.kg : 0;
+      allocParts.push(`${kind}(bundleId=${bundleId}, kg=${Math.round(kg)})`);
+    }
+
     const extras: string[] = [];
     if (assessedDeltaKg !== null) extras.push(`assessedDeltaKg=${assessedDeltaKg}`);
-    if (bundleId) extras.push(`bundleId=${bundleId}`);
-    if (remainingKg !== null) extras.push(`remainingKg=${remainingKg}`);
-    const tail = extras.length > 0 ? `(${extras.join(', ')})` : '';
+    if (allocParts.length > 0) extras.push(`alloc=[${allocParts.join(' + ')}]`);
+    if (overflowKg !== null && overflowKg > 0) extras.push(`overflowKg=${Math.round(overflowKg)}`);
+    const tail = extras.length > 0 ? `(${extras.join('; ')})` : '';
     parts.push(`${material}=${verdict}${tail}`);
   }
   return parts.join(', ') || '(no verdicts)';

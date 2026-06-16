@@ -1086,7 +1086,7 @@ const CASES: TestCase[] = [
   // 10 — Post-LS modify: increase (after plant_ls sent)
   {
     id: 'modify_increase_post_ls',
-    description: 'Branch asks to increase M-B 100→150 AFTER plant_ls. Expect VA02 + 2nd_release + ZLOAD2.',
+    description: 'Branch asks to increase M-B 100→150 AFTER plant_ls. Expect bundle_capacity_assessment → VA02 + 2nd_release → LONE_ZMATANA → ls_dispatch → dispatch_confirmation → ZLOAD2 (per Rule 6e Phase 1–3).',
     soNumber: '3290110',
     customerId: 'TEST-CUST-POST-INC',
     newOrderBody: NEW_ORDER_BODY('3290110', 'TEST-CUST-POST-INC'),
@@ -1123,11 +1123,30 @@ const CASES: TestCase[] = [
       { targetEmailType: 'plant_ls', sender: 'plant', replyText: 'Invoice 7682614529 OBD 5070000132 attached.' },
     ],
     expect: {
-      sapTransactions: ['ZSO-VISIBILITY', 'ZLOAD1', 'VA02', 'ZSO-VISIBILITY', 'ZLOAD2', 'ZLOAD3-B1', 'VTO1N-B'],
+      sapTransactions: ['ZSO-VISIBILITY', 'ZLOAD1', 'VA02', 'ZMATANA_LONE', 'ZLOAD2', 'ZLOAD3-B1', 'VTO1N-B'],
       finalSoStatus: 'completed',
       sentEmailTypes: ['ls_dispatch', 'dispatch_confirmation', 'vehicle_details', 'plant_ls', '2nd_release'],
     },
   },
+
+  // TODO — additional partial-allocation scenarios (Rule 6e Phase 1–3):
+  //   modify_increase_post_ls_partial_overflow:
+  //     verdict = partial_overflow → both ZLOAD2 (same_bundle leg) AND
+  //     ZLOAD1 in append mode (other_bundle leg) + email_branch_request_new_so
+  //     for the overflow. Expected subsequence inserts ZLOAD1 between
+  //     ZMATANA_LONE and ZLOAD2 (or vice versa — order between the two slicing
+  //     legs is not significant).
+  //   modify_increase_post_ls_fully_placed_split:
+  //     verdict = fully_allocated with one same_bundle + one other_bundle leg,
+  //     no overflow. Expected: ZLOAD2 + ZLOAD1-APPEND + email_modified_ls_to_plant.
+  //   modify_increase_post_ls_full_overflow:
+  //     verdict = needs_new_so for every material. Phase 2 skips VA02; only
+  //     email_branch_request_new_so goes out. Expected: NO ZMATANA_LONE / ZLOAD2 /
+  //     ZLOAD1 in this leg of the lifecycle.
+  // Adding these requires test-fixture bundles whose remaining capacity matches
+  // the desired verdict (1000 kg free for partial; 0 kg free across the PO for
+  // full overflow). The existing modify_increase_post_ls above exercises Phase 1–3
+  // for the fully_allocated single-leg same_bundle case end-to-end.
 
   // 11 — Post-ZLOAD1 / pre-plant_ls modify: increase (mirrors SO 3260649 incident)
   {

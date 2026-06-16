@@ -1137,6 +1137,273 @@ export async function sendDispatchConfirmationEmail(args: {
 }
 
 /**
+ * Post-plant_ls modify-increase variant of `sendDispatchConfirmationEmail`.
+ *
+ * Renders a dispatch_confirmation email that describes the EXISTING bundle plan
+ * (loading slips already with the plant) annotated with the UPCOMING ZLOAD2 /
+ * ZLOAD1-append changes resolved from a `bundle_capacity_assessment` verdict.
+ * Reused upcoming-changes shape: `Allocation` from `bundle-capacity.ts`, tagged
+ * with the material the allocation belongs to.
+ *
+ * NEVER calls the bundler (`computeBundlesForPo` / `previewBundlesForPo`) — both
+ * throw `BundlesFrozenError` once any LS is `sent_to_plant`. Existing rows are
+ * the source of truth.
+ *
+ * Reuses (carefully):
+ *   - `renderDispatchConfirmationBody` with its existing `diff` parameter to
+ *     surface the upcoming changes as a "Changes since last plan" block. The
+ *     diff lines synthesise from allocations (no bundler involvement).
+ *   - The per-PO branch thread anchor (`resolvePoThreadAnchor(po, 'branch')`).
+ *   - The standard Email row write + audit-trail emission so the planner and
+ *     the dashboard timeline see this email exactly like a normal
+ *     dispatch_confirmation.
+ *
+ * Does NOT touch `Material.dispatchQuantity` or any other DB write outside the
+ * Email row + audit event — Phase 3's ZLOAD2 / ZLOAD1-append callbacks write
+ * LSI rows themselves.
+ */
+export async function sendDispatchConfirmationWithUpcomingChanges(args: {
+  purchaseOrderId: string;
+  salesOrderId: string;
+  /**
+   * One row per (material, allocation leg) from the latest
+   * bundle_capacity_assessment verdict. Same shape as `Allocation` but tagged
+   * with the material code, since the verdict groups by material.
+   */
+  allocations: Array<{
+    material: string;
+    kind: 'same_bundle' | 'other_bundle';
+    bundleId: string;
+    kg: number;
+  }>;
+  /** Per-material overflow legs that will be sent to a new SO. Optional. */
+  overflowItems?: Array<{ material: string; overflowKg: number }>;
+  log: (msg: string) => void;
+}): Promise<void> {
+  const { purchaseOrderId, salesOrderId, allocations, overflowItems, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log('[DispatchConfirm:upcoming] BRANCH_EMAIL not configured');
+    return;
+  }
+  if (allocations.length === 0) {
+    log('[DispatchConfirm:upcoming] no allocations — nothing to confirm; caller should have routed to email_branch_request_new_so');
+    return;
+  }
+
+  const po = await prisma.purchaseOrder.findUnique({
+    where: { id: purchaseOrderId },
+    include: { customer: true },
+  });
+  if (!po) {
+    log(`[DispatchConfirm:upcoming] PO ${purchaseOrderId} not found`);
+    return;
+  }
+
+  // Load the existing bundle plan EXACTLY as `sendDispatchConfirmationEmail`
+  // loads it for the renderer — same shape, same select set, same ordering.
+  // No bundler call.
+  const bundlesForEmail = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    orderBy: { bundleNumber: 'asc' },
+    include: {
+      materials: {
+        where: { dispatchQuantity: { gt: 0 } },
+        include: { salesOrder: { select: { soNumber: true, plant: true } } },
+        orderBy: [{ material: 'asc' }],
+      },
+    },
+  });
+
+  // Look up Material rows for the placed-portion materials so we can convert
+  // each allocation's kg into a unit count (qty) for the diff row. lone_zmatana
+  // populates `orderWeightKg` on the relevant Material rows in Phase 2.5 — by
+  // the time we render here, those rows are fresh.
+  const materialCodes = [...new Set(allocations.map((a) => a.material))];
+  const materialRows = await prisma.material.findMany({
+    where: { salesOrderId, material: { in: materialCodes } },
+    select: { material: true, batch: true, orderQuantity: true, orderWeightKg: true },
+  });
+  const materialByCode = new Map<string, { batch: string; kgPerUnit: number }>();
+  for (const m of materialRows) {
+    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    const ordered = m.orderQuantity || 0;
+    const kgPerUnit = ordered > 0 && fullWeight > 0 ? fullWeight / ordered : 0;
+    materialByCode.set(m.material, { batch: m.batch ?? '', kgPerUnit });
+  }
+
+  // Bundle number lookup keyed by id, so the diff block can name bundles by
+  // their human-readable number ("Bundle 2") rather than cuid.
+  const bundleNumberById = new Map<string, number>();
+  for (const b of bundlesForEmail) {
+    bundleNumberById.set(b.id, b.bundleNumber);
+  }
+
+  // Build the diff: one row per allocation. Reuses BundleDiffLine shape so we
+  // can hand it straight to renderDispatchConfirmationBody — that function
+  // already knows how to format these.
+  type BundleDiffLine = import('./bundler').BundleDiffLine;
+  const diff: BundleDiffLine[] = [];
+  for (const a of allocations) {
+    const md = materialByCode.get(a.material);
+    const batch = md?.batch ?? '';
+    const kgPerUnit = md?.kgPerUnit ?? 0;
+    const addedUnits = kgPerUnit > 0 ? Math.round(a.kg / kgPerUnit) : 0;
+    const targetBundleNumber = bundleNumberById.get(a.bundleId) ?? 0;
+
+    if (a.kind === 'same_bundle') {
+      // The existing LS on this bundle (which already carries `material`) will
+      // be ZLOAD2'd to a new total. Render the diff as a qty bump on the same
+      // bundle.
+      const existingForMaterial = bundlesForEmail
+        .find((b) => b.id === a.bundleId)?.materials
+        .find((m) => m.material === a.material);
+      const currentQty = existingForMaterial?.dispatchQuantity ?? 0;
+      diff.push({
+        material: a.material,
+        batch,
+        currentQty,
+        proposedQty: currentQty + addedUnits,
+        currentBundleNumber: targetBundleNumber,
+        proposedBundleNumber: targetBundleNumber,
+      });
+    } else {
+      // ZLOAD1-append: a NEW LS will be created on `bundleId` carrying
+      // `addedUnits` of `material`. Render as a NEW LINE landing on the target
+      // bundle.
+      diff.push({
+        material: a.material,
+        batch,
+        currentQty: 0,
+        proposedQty: addedUnits,
+        currentBundleNumber: null,
+        proposedBundleNumber: targetBundleNumber,
+      });
+    }
+  }
+
+  // Totals for the email intro line. Same formula `sendDispatchConfirmationEmail`
+  // uses: sum of per-material itemKg derived from dispatchQuantity / orderQty
+  // * orderWeightKg, across every bundle's materials.
+  let totalKg = 0;
+  for (const b of bundlesForEmail) {
+    for (const m of b.materials) {
+      const dispatchQty = m.dispatchQuantity ?? 0;
+      const orderedQty = m.orderQuantity || 0;
+      const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+      if (orderedQty > 0 && dispatchQty > 0 && fullWeight > 0) {
+        totalKg += (dispatchQty / orderedQty) * fullWeight;
+      }
+    }
+  }
+  // Plus the upcoming additions — these aren't on Material.dispatchQuantity yet
+  // (Phase 3 will set that via the ZLOAD callbacks), so add them in for the
+  // header total.
+  for (const a of allocations) totalKg += a.kg;
+
+  const totalTonnes = totalKg / 1000;
+  const capacityTonnes = po.weightage ? Number(po.weightage) : 0;
+  const twoVehicles = bundlesForEmail.length > 1;
+
+  // pureQtyChange = every allocation stays on the bundle the material already
+  // belongs to. When any leg is `other_bundle`, a new LS lands on a different
+  // bundle → composition shift → false. Mirrors the preview-bundler convention.
+  const pureQtyChange = allocations.every((a) => a.kind === 'same_bundle');
+
+  const body = renderDispatchConfirmationBody({
+    poNumber: po.poNumber,
+    customerName: po.customer?.name ?? po.customerName,
+    twoVehicles,
+    totalTonnes,
+    capacityTonnes,
+    bundles: bundlesForEmail,
+    diff,
+    pureQtyChange,
+  });
+
+  // Optional overflow footer — branch sees the placed plan AND knows a new SO
+  // request is coming separately for the spill. Doesn't replace
+  // email_branch_request_new_so; just heads off "wait, where's the rest?"
+  // confusion in this email.
+  const overflowFooter = overflowItems && overflowItems.length > 0
+    ? '\n\nNote: ' + overflowItems
+        .map((o) => `${o.material} has an additional ${Math.round(o.overflowKg)} kg that cannot be accommodated in the current vehicle plan; a separate request for a new SO will follow.`)
+        .join(' ')
+    : '';
+  const finalBody = body + overflowFooter;
+
+  const subject = `Dispatch Confirmation - PO ${po.poNumber}`;
+
+  // Send in the per-PO branch thread (same anchoring rules as the original
+  // function).
+  const { resolvePoThreadAnchor, capturePoThreadAnchor } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, finalBody, anchor.threadId, anchor.rfc822MessageId);
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, finalBody);
+    }
+  } catch (err) {
+    log(`[DispatchConfirm:upcoming] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, finalBody);
+  }
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', sent.threadId, rfc822);
+  }
+
+  // Email row + audit event identical to the original function's, including
+  // dispatchRound stamping so reply-detection / round guards work the same way.
+  await prisma.email.create({
+    data: {
+      purchaseOrderId,
+      salesOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'dispatch_confirmation',
+      workflowState: 'awaiting_dispatch_confirmation',
+      sentBody: finalBody,
+      relatedMaterials: JSON.stringify({
+        version: 'dispatch-upcoming-v1',
+        allocations,
+        overflowItems: overflowItems ?? [],
+      }),
+      dispatchRound: po.dispatchRound,
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    await emitEvent({
+      salesOrderId,
+      type: 'email_sent',
+      payload: {
+        emailType: 'dispatch_confirmation',
+        recipient: BRANCH_EMAIL,
+        subject,
+        body_excerpt: finalBody.slice(0, 200),
+        gmailMessageId: sent.messageId,
+        dispatchRound: po.dispatchRound,
+        total_tonnes: totalTonnes,
+        flow: 'upcoming_changes',
+      },
+    });
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
+
+  log(
+    `[DispatchConfirm:upcoming] Sent to ${BRANCH_EMAIL} for PO ${po.poNumber} ` +
+      `(${allocations.length} allocation(s), overflow=${overflowItems?.length ?? 0}, total ${totalTonnes.toFixed(2)} t)`,
+  );
+}
+
+/**
  * Follow-up update to an existing dispatch_confirmation for the same round.
  * When the round guard would have skipped a re-send but the plan has actually
  * changed (e.g. quantity revision after the original confirmation went out),

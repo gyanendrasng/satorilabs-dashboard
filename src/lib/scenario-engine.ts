@@ -1676,7 +1676,14 @@ async function fireStep(
         assessedDeltaKg: deltaByMaterial.get(v.material) ?? null,
       }));
       log(
-        `[ENGINE] bundle_capacity_assessment — verdicts: ${verdictsWithDelta.map((v) => `${v.material}:${v.verdict}${v.assessedDeltaKg !== null ? `@${v.assessedDeltaKg}kg` : ''}${v.bundleId ? `(${v.bundleId})` : ''}`).join(', ')}`,
+        `[ENGINE] bundle_capacity_assessment — verdicts: ${verdictsWithDelta.map((v) => {
+          const allocSummary = v.allocations.length > 0
+            ? ' alloc=[' + v.allocations.map((a) => `${a.kind}:${Math.round(a.kg)}kg`).join('+') + ']'
+            : '';
+          const overflowSummary = v.overflowKg > 0 ? ` overflow=${Math.round(v.overflowKg)}kg` : '';
+          const deltaSummary = v.assessedDeltaKg !== null ? `@${v.assessedDeltaKg}kg` : '';
+          return `${v.material}:${v.verdict}${deltaSummary}${allocSummary}${overflowSummary}`;
+        }).join(', ')}`,
       );
       try {
         const { emitEvent } = await import('./scenario-events');
@@ -2134,12 +2141,46 @@ async function fireStep(
     // Each outbound email step marks the scenario `completed` and stops;
     // the next inbound email triggers a fresh planner call.
     case 'email_confirm_product_details': {
-      // The ls_dispatch email is auto-sent by the zso_visibility callback;
-      // this step is just the "wait for branch reply" sentinel. The planner
-      // controls when this step is emitted (rule 5: don't repeat completed
-      // steps), so the engine no longer second-guesses with a round-scoped
-      // advance_now check — just wait.
-      log(`[ENGINE] email_confirm_product_details — waiting for branch reply on ls_dispatch`);
+      // Normal path (post-zso_visibility): the ls_dispatch email was already
+      // auto-sent by visibility-data → assembleAndSendCombinedEmail. Nothing
+      // to send here; just wait.
+      //
+      // Post-plant_ls partial-allocation path (Rule 6e Phase 2.75): we skipped
+      // zso_visibility, so visibility-data never fired and no ls_dispatch went
+      // out at the current dispatchRound. Detect that case and call
+      // assembleAndSendCombinedEmail ourselves. The function's round-scoped
+      // idempotency guard ensures this is a no-op when an ls_dispatch is
+      // already on file for the current round — keeping behaviour identical
+      // for the normal path.
+      const so = await prisma.salesOrder.findUnique({
+        where: { id: progress.salesOrderId },
+        select: { purchaseOrderId: true, purchaseOrder: { select: { dispatchRound: true } } },
+      });
+      if (so?.purchaseOrderId) {
+        const currentRound = so.purchaseOrder?.dispatchRound ?? 1;
+        const existing = await prisma.email.findFirst({
+          where: {
+            purchaseOrderId: so.purchaseOrderId,
+            emailType: 'ls_dispatch',
+            status: { in: ['sent', 'replied'] },
+            dispatchRound: currentRound,
+          },
+          select: { id: true },
+        });
+        if (!existing) {
+          log(
+            `[ENGINE] email_confirm_product_details — no ls_dispatch at dispatchRound=${currentRound}; ` +
+              `actively sending one (post-plant_ls partial-allocation flow)`,
+          );
+          const { assembleAndSendCombinedEmail } = await import('./auto-gui-trigger');
+          const r = await assembleAndSendCombinedEmail(so.purchaseOrderId);
+          for (const line of r.logs) log(line);
+        } else {
+          log(`[ENGINE] email_confirm_product_details — ls_dispatch already on file for round ${currentRound}; waiting for branch reply`);
+        }
+      } else {
+        log(`[ENGINE] email_confirm_product_details — SO has no PO; waiting for branch reply`);
+      }
       return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';
@@ -2162,6 +2203,98 @@ async function fireStep(
         return 'complete_segment';
         await markAwaitingReply(progress.id);
         return 'pause';
+      }
+
+      // Post-plant_ls partial-allocation branch (Rule 6e Phase 2.875).
+      //
+      // When the audit trail has a `step_completed bundle_capacity_assessment`
+      // newer than the latest `email_received` AND any LS for this SO is
+      // already `sent_to_plant`, we are in the slicing flow: the bundler is
+      // frozen and there are upcoming ZLOAD2 / ZLOAD1-append legs to confirm.
+      // Route to the sibling renderer that reads the existing bundle plan
+      // straight from DB and annotates the upcoming changes (no bundler call).
+      //
+      // Existing callers fall through to the original path below unchanged —
+      // this branch fires ONLY when the markers explicitly match.
+      const latestAssessment = await prisma.scenarioEvent.findFirst({
+        where: {
+          salesOrderId: progress.salesOrderId,
+          type: 'step_completed',
+          payload: { contains: '"kind":"bundle_capacity_assessment"' },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true, payload: true },
+      });
+      const latestEmailReceived = await prisma.scenarioEvent.findFirst({
+        where: {
+          salesOrderId: progress.salesOrderId,
+          type: 'email_received',
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      });
+      const assessmentNewerThanInbound =
+        latestAssessment !== null &&
+        (latestEmailReceived === null || latestAssessment.createdAt >= latestEmailReceived.createdAt);
+      if (assessmentNewerThanInbound) {
+        const anyLsAtPlant = await prisma.loadingSlip.findFirst({
+          where: {
+            salesOrderId: progress.salesOrderId,
+            status: { in: ['sent_to_plant', 'invoiced', 'completed'] },
+          },
+          select: { id: true },
+        });
+        if (anyLsAtPlant) {
+          // Decode the verdict's allocations + overflow off the audit payload.
+          // The shape was written by `case 'bundle_capacity_assessment':` and
+          // mirrors `CapacityVerdict[]` from bundle-capacity.ts.
+          type StoredVerdict = {
+            material: string;
+            verdict: 'fully_allocated' | 'partial_overflow' | 'needs_new_so';
+            allocations?: Array<{ kind: 'same_bundle' | 'other_bundle'; bundleId: string; kg: number }>;
+            overflowKg?: number;
+          };
+          let verdicts: StoredVerdict[] = [];
+          try {
+            const parsed = latestAssessment ? JSON.parse(latestAssessment.payload) : null;
+            verdicts = Array.isArray(parsed?.verdicts) ? parsed.verdicts : [];
+          } catch {
+            verdicts = [];
+          }
+
+          const allocations = verdicts.flatMap((v) =>
+            (v.allocations ?? []).map((a) => ({
+              material: v.material,
+              kind: a.kind,
+              bundleId: a.bundleId,
+              kg: a.kg,
+            })),
+          );
+          const overflowItems = verdicts
+            .filter((v) => typeof v.overflowKg === 'number' && v.overflowKg > 0)
+            .map((v) => ({ material: v.material, overflowKg: v.overflowKg as number }));
+
+          if (allocations.length === 0) {
+            log(
+              '[ENGINE] email_confirm_bundle_details — post-plant_ls assessment present but allocations empty; ' +
+                'segment-completing (planner should have routed to email_branch_request_new_so instead)',
+            );
+            return 'complete_segment';
+          }
+
+          const { sendDispatchConfirmationWithUpcomingChanges } = await import('./auto-gui-trigger');
+          await sendDispatchConfirmationWithUpcomingChanges({
+            purchaseOrderId: so.purchaseOrderId,
+            salesOrderId: progress.salesOrderId,
+            allocations,
+            overflowItems,
+            log,
+          });
+          log(
+            `[ENGINE] email_confirm_bundle_details — sent post-plant_ls dispatch_confirmation (${allocations.length} allocation(s), overflow=${overflowItems.length})`,
+          );
+          return 'complete_segment';
+        }
       }
 
       // Recompute the per-material dispatch quantity from scratch on every

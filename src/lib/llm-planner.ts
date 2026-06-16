@@ -166,7 +166,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'bundle_capacity_assessment',
-    description: 'Post-plant-intimation capacity check. Use AS THE VERY FIRST STEP (before stock_precheck) whenever plant_ls has been sent AND the branch is asking to INCREASE or ADD a material. The engine computes, per material delta in kg, whether the increase fits in the bundle that already carries the material, a different bundle on the same PO, or no bundle at all. The verdict appears in the audit trail as step_completed bundle_capacity_assessment with payload.verdicts = [{material, verdict, bundleId, remainingKg}]. Read those verdicts on your NEXT plan call (this step terminates the current plan) and emit the per-item path per Rule 11. No SAP transaction; one engine-side step only.',
+    description: 'Post-plant-intimation capacity check. Use AS THE FIRST STEP whenever plant_ls has been sent AND the branch is asking to INCREASE or ADD a material — this fires AFTER the upstream modify cycle (stock_precheck → va02 → email_2nd_release → branch ack → zso_visibility) has already raised the SO line ceiling. The engine greedily splits each material\'s deltaKg across bundles: first pack the bundle that already carries the material, then spill onto sibling bundles best-fit, then anything that doesn\'t fit becomes overflow. The verdict appears in the audit trail as step_completed bundle_capacity_assessment with payload.verdicts = [{material, verdict, allocations: [{kind: "same_bundle"|"other_bundle", bundleId, kg}, ...], overflowKg}]. Read those verdicts on your NEXT plan call (this step terminates the current plan) and emit the per-allocation step path per Rule 6e Phase 2. No SAP transaction; one engine-side step only.',
     argsSchema: '{ items: [{ material: "<code>", deltaKg: <number, positive — the additional weight in kg this material is gaining> }, ...] }',
   },
   {
@@ -191,7 +191,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'zload1',
-    description: 'Create loading slips (LSs). Two modes: (1) initial — no args; fans out per-bundle from the SO\'s computed bundles. (2) APPEND mode — pass args.appendToBundleId + args.materials to issue a SINGLE new LS attached to an existing bundle. Use mode (2) ONLY after a bundle_capacity_assessment verdict of `fits_other_bundle` post-plant-intimation; the materials list is the just-VA02\'d new SO line(s) going onto the target bundle.',
+    description: 'Create loading slips (LSs). Two modes: (1) initial — no args; fans out per-bundle from the SO\'s computed bundles. (2) APPEND mode — pass args.appendToBundleId + args.materials to issue a SINGLE new LS attached to an existing bundle. Use mode (2) per Rule 6e Phase 2 for every `other_bundle` allocation returned by bundle_capacity_assessment; the materials list is the new material code + units corresponding to that allocation\'s kg leg.',
     argsSchema: '(optional, append mode only): { appendToBundleId: "<bundle cuid from audit>", materials: [{ code: "<material code>", batch: "<batch if known>", qty: <int> }, ...] }',
   },
   {
@@ -550,48 +550,147 @@ trigger email type, to decide whose intent this is.
       \`plant_ls email sent: yes\` AND audit trail has \`email_sent plant_ls\`).
       Bundles are FROZEN: loading slips cannot migrate between bundles.
 
-      **CRITICAL — TWO-PHASE RULE. Check the audit trail before emitting:**
-      - PHASE 1 (no prior bundle_capacity_assessment for this modification
-        yet — the audit trail does NOT contain a recent
-        \`step_completed bundle_capacity_assessment\` with verdicts AFTER
-        the latest plant_ls / email_received for this modify request):
-        Your ONLY step is bundle_capacity_assessment with one items[]
-        entry per material being increased / added. deltaKg = additional
-        kilograms this material is gaining (read it from the email —
-        branch usually states units; convert via the material's
-        Material.orderWeightKg if shown, otherwise read the email's
-        weight figure directly). STOP after bundle_capacity_assessment;
-        the engine emits step_completed with verdicts and re-enters this
-        planner.
-      - PHASE 2 (the audit trail DOES contain
-        \`step_completed bundle_capacity_assessment\` with a \`verdicts:\`
-        summary AFTER the latest inbound modification email): the verdicts
-        are already known. DO NOT re-emit bundle_capacity_assessment —
-        doing so triggers an infinite loop. Read the verdicts directly
-        from the audit line (format: \`material=verdict(bundleId=...,
-        remainingKg=...)\`) and emit the per-item path below.
+      **CRITICAL — MULTI-PHASE RULE. Check the audit trail before
+      emitting.** The state of the modify cycle is read off the audit
+      trail by looking for these markers, scanning from the LATEST
+      \`email_received\` (the inbound that triggered this plan call)
+      forward.
 
-      On the NEXT plan call (Phase 2):
-        - For each item with verdict='fits_same_bundle':
-          EMIT (per item) stock_precheck → va02 → email_2nd_release →
-          zso_visibility → zload2 → email_modified_ls_to_plant.
-        - For each item with verdict='fits_other_bundle':
-          EMIT (per item) stock_precheck → va02 → email_2nd_release →
-          zso_visibility → zload1 (APPEND mode — pass args.appendToBundleId
-          and args.materials carrying the new material code + qty) →
-          email_to_plant. The zload1 step here MUST include args; without
-          them the engine treats it as initial-mode which would re-bundle
-          and fail with BundlesFrozenError.
-        - If ANY item has verdict='needs_new_so':
-          EMIT email_branch_request_new_so with args.items =
-          [{material, deltaKg}] for the overflow items. STOP. Do NOT
-          emit va02 for those items. Items that DID fit (same or other
-          bundle) can be progressed on the same plan call; only the
-          overflow items are deferred to the new-SO request.
-      Multiple items in one reply MAY mix verdicts; emit per-item paths
-      in order (fits-bundle items first, overflow last).
+      Definitions used below:
+        placedAllocations = the union of every \`same_bundle\` and
+          \`other_bundle\` leg across every verdict.
+        placedKgTotal = sum of allocations.kg across all materials.
+        overflowKgTotal = sum of verdicts.overflowKg across all materials.
+
+      - PHASE 1 — NO \`step_completed bundle_capacity_assessment\` exists
+        after the latest \`email_received\`.
+        Emit ONLY bundle_capacity_assessment with one items[] entry per
+        material being increased / added. deltaKg = additional kilograms
+        this material is gaining (read it from the email — branch usually
+        states units; convert via the material's Material.orderWeightKg if
+        shown, otherwise read the email's weight figure directly). STOP.
+        The engine emits step_completed with verdicts and re-enters this
+        planner.
+
+      - PHASE 2 — \`step_completed bundle_capacity_assessment\` exists with
+        verdicts, but NO \`step_completed va02\` exists AFTER that
+        assessment.
+        Read the verdicts off the latest assessment line. Each verdict has
+        the form
+          \`material=fully_allocated|partial_overflow|needs_new_so(assessedDeltaKg=N; alloc=[same_bundle:Akg + other_bundle:Bkg + ...]; overflowKg=O)\`
+        Compute placedKgTotal across all verdicts.
+        - If placedKgTotal > 0, emit IN ORDER:
+            (1) stock_precheck for the placed portion of each material
+                (materials = the verdicts whose allocations are non-empty;
+                qty = the placed-kg portion converted to units using
+                Material.orderWeightKg).
+            (2) va02 with materials = the placed portion only. Target qty
+                for each material = current SO qty + (sum of that
+                material's allocation kg, converted to units). DO NOT add
+                the overflowKg to the VA02 target — the overflow goes to
+                a new SO, not this SO's line. The SO line ceiling stays
+                at "current + placed", which exactly matches what we
+                will dispatch from this SO.
+            (3) email_2nd_release  (branch acks the placed-qty increase).
+          STOP. Wait for the branch to confirm 2nd_release.
+        - If placedKgTotal == 0 for ALL materials (every verdict is
+          needs_new_so), SKIP straight to emitting
+          email_branch_request_new_so with args.items = [{material,
+          deltaKg: overflowKg}, ...] for every overflow leg. STOP.
+
+      - PHASE 2.5 — \`step_completed bundle_capacity_assessment\`,
+        \`step_completed va02\`, AND \`email_sent 2nd_release\` all exist
+        AFTER the latest inbound modification email_received. The branch
+        just replied on the 2nd_release email confirming. (Rule 8 routes
+        a post-plant_ls 2nd_release ack to here.) DO NOT emit
+        zso_visibility — its visibility-data callback would fan out into
+        an unwanted ls_dispatch email. Instead emit:
+            lone_zmatana with materials = [{ code }, ...] for the
+            placed-portion material list from the bundle_capacity_assessment
+            verdicts (the same list VA02 just bumped).
+        STOP. zmatana-data writes batch + availableStock onto Material
+        rows for those codes, emits step_completed lone_zmatana, and
+        re-enters this planner.
+
+      - PHASE 2.75 — \`step_completed lone_zmatana\` exists AFTER the
+        latest inbound modification email_received, AND NO
+        \`email_sent ls_dispatch\` exists at the current PO dispatchRound.
+        The branch needs to re-confirm the material list (now post-VA02 +
+        post-zmatana batches). Emit:
+            email_confirm_product_details
+        STOP. The engine handler will detect that no ls_dispatch is on
+        file for this round and actively send one
+        (assembleAndSendCombinedEmail). The branch reads the updated
+        material list and replies confirming.
+
+      - PHASE 2.875 — \`email_sent ls_dispatch\` exists at the current
+        dispatchRound AFTER the lone_zmatana, AND the branch has replied
+        on the ls_dispatch with a plain confirmation (\"yes\" / \"ok\" /
+        \"confirm\"), AND NO \`email_sent dispatch_confirmation\` exists
+        at the current dispatchRound. Branch acked the material list;
+        time to send them the bundle plan. Emit:
+            email_confirm_bundle_details
+        STOP. The engine handler detects the post-plant_ls assessment
+        marker + sent_to_plant LS and routes to the upcoming-changes
+        renderer (no bundler call). The branch reads the bundle plan
+        with the upcoming ZLOAD2 / ZLOAD1-append annotations and replies
+        confirming.
+        (If the branch reply on the round-N ls_dispatch is NOT a plain
+        confirmation — e.g. they ask for further changes — this is
+        Rule 9 territory: route per Rule 9's branches.)
+
+      - PHASE 3 — \`email_sent dispatch_confirmation\` exists at the
+        current dispatchRound AFTER the bundle_capacity_assessment, AND
+        the branch has replied on the dispatch_confirmation with a plain
+        confirmation. All prior milestones are visible:
+        bundle_capacity_assessment ✓, va02 ✓, email_sent 2nd_release,
+        lone_zmatana ✓, email_sent ls_dispatch (round=R), email_sent
+        dispatch_confirmation (round=R), email_received from branch on
+        the dispatch_confirmation.
+        Emit the SLICING plan IN ORDER:
+          (1) For each \`same_bundle\` allocation across all materials:
+              EMIT zload2 with revisions=[{lsNumber, material, batch,
+              qty}] where qty = the LS's NEW TOTAL dispatch quantity for
+              that material (existing LSI qty for this material on this
+              LS + the allocation-kg portion converted to units; NOT a
+              delta). batch comes from the Material row written by
+              lone_zmatana. Group multiple revisions on the same LS into
+              one zload2 call when possible.
+          (2) For each \`other_bundle\` allocation across all materials:
+              EMIT zload1 in APPEND mode with
+              args.appendToBundleId = the allocation's bundleId and
+              args.materials = [{code: material, batch, qty: allocation-kg
+              in units}]. ONE zload1 per allocation (one new LS per leg).
+              batch comes from the Material row written by lone_zmatana.
+              The zload1 step MUST include args; without them the engine
+              treats it as initial-mode which would re-bundle and fail
+              with BundlesFrozenError.
+          (3) email_modified_ls_to_plant. The plant is told about the
+              ZLOAD2 modifications AND the new LSs created via
+              zload1-append in one consolidated email.
+          (4) If overflowKgTotal > 0:
+              EMIT email_branch_request_new_so with args.items =
+              [{material, deltaKg: overflowKg}, ...] for ONLY the
+              overflow legs. Items that were fully allocated do not
+              appear in this list. STOP after this email.
+
+      Multiple materials in one reply share the same Phase 2 / Phase 3
+      plans — collect every material's allocations into one va02 call,
+      one or more zload2 calls (grouped by LS), one or more zload1-append
+      calls (one per other_bundle leg), and ONE consolidated
+      email_modified_ls_to_plant.
+
       Do NOT skip bundle_capacity_assessment when plant_ls has been sent —
       Rule 6 / 6b apply only BEFORE plant_ls.
+      Do NOT re-fire a SECOND va02 in Phase 3 to "correct" the SO line
+      down. The SO line ceiling set in Phase 2 already matches the placed
+      qty; the overflow lives on a separate (new) SO and the branch
+      raises that themselves.
+      Do NOT emit zso_visibility in this entire flow — its visibility-data
+      callback sends an unwanted round-N ls_dispatch. lone_zmatana
+      replaces it (Phase 2.5); Phase 2.75 emits ls_dispatch itself via
+      email_confirm_product_details so the branch sees the post-VA02
+      material list at the proper moment, without an automatic fan-out.
 
   6c. RE-PLAN AFTER CROSS-PLANT SUBSTITUTION. If the audit trail shows a
       step_completed for stock_precheck with a \`substitutions\` payload like
@@ -623,13 +722,30 @@ trigger email type, to decide whose intent this is.
      email_2nd_release already sent.) NOTE: the 2nd_release email is sent
      to the BRANCH — they perform the second release — so the reply comes
      from sender=branch. This is the only correct path for a 2nd_release reply.
-     EMIT: zso_visibility. STOP.
-     The /visibility-data callback auto-sends round-2 ls_dispatch.
+
+     Branch on what KIND of modify cycle this 2nd_release belongs to:
+
+     (a) POST-PLANT_LS PARTIAL-ALLOCATION CYCLE — audit trail also shows
+         \`step_completed bundle_capacity_assessment\` AFTER the latest
+         \`email_received\` (the va02 was Phase 2 of Rule 6e, sized to the
+         placed portion). EMIT lone_zmatana with args.materials =
+         [{ code: "<placed-portion code>" }, ...] for every material the
+         bundle_capacity_assessment placed allocations on (see Rule 6e
+         Phase 2.5). STOP. Do NOT emit zso_visibility — its callback
+         would send an unwanted ls_dispatch.
+
+     (b) NORMAL MODIFY CYCLE (pre-plant_ls modify, or post-plant_ls modify
+         without a bundle_capacity_assessment in the trail — including the
+         cross-plant substitution Rule 6c flow). EMIT zso_visibility.
+         STOP. The /visibility-data callback auto-sends round-2
+         ls_dispatch.
+
+     For BOTH branches:
      Do NOT chain to email_confirm_bundle_details here.
      Do NOT emit zload2 / email_modified_ls_to_plant — the branch
-     confirmation is a green-light for re-visibility, not a request to
-     modify loading slips (rule 11 covers branch-requested LS modifications
-     on a plant_ls thread, which is a different scenario).
+     confirmation is a green-light for the next step in the cycle, not a
+     request to modify loading slips (rule 11 covers branch-requested LS
+     modifications on a plant_ls thread, which is a different scenario).
 
   9. INBOUND: branch reply on a round-2-or-later ls_dispatch (modification
      cycle in progress — material list re-confirmation stage).
@@ -651,6 +767,11 @@ trigger email type, to decide whose intent this is.
          "release as available", "looks good") → the branch has accepted
          the updated material list. EMIT email_confirm_bundle_details to
          move on to bundle re-approval. STOP.
+         (The engine renders this differently in the post-plant_ls
+         partial-allocation cycle — Rule 6e Phase 2.875 — by reading
+         the existing Bundle/LS rows and annotating the upcoming changes.
+         The planner just emits the same step kind; the engine routes
+         based on audit markers.)
 
      (b) REPLY CARRIES VEHICLE DETAILS (truck no, driver, container) but
          is NOT a further modification → treat as PLAIN CONFIRMATION on
@@ -699,10 +820,24 @@ trigger email type, to decide whose intent this is.
 
  10. INBOUND: branch reply on a round-2-or-later dispatch_confirmation
      (modification cycle in progress — bundle plan re-confirmation stage).
-     (Audit trail shows va02 ✓ + zso_visibility ✓ ≥ 2 + ls_dispatch ✓ ≥ 2 + dispatch_confirmation ✓ ≥ 2.)
+     (Audit trail shows va02 ✓ + zso_visibility ✓ ≥ 2 + ls_dispatch ✓ ≥ 2 + dispatch_confirmation ✓ ≥ 2,
+     OR — post-plant_ls partial-allocation cycle — bundle_capacity_assessment ✓ + va02 ✓ +
+     email_sent 2nd_release + lone_zmatana ✓ + ls_dispatch ✓ + dispatch_confirmation ✓.)
 
      **The branch has already accepted the new material list (Rule 9 case
      a/b fired). Now they're reacting to the bundle / truck plan.**
+
+     **POST-PLANT_LS PARTIAL-ALLOCATION FORK.** If the audit trail also
+     shows \`step_completed bundle_capacity_assessment\` AFTER the latest
+     \`email_received\` for the original modify request AND any LS is
+     \`sent_to_plant\`, this is Rule 6e Phase 3 — emit the slicing plan
+     defined there (zload2 per same_bundle leg + zload1-append per
+     other_bundle leg + email_modified_ls_to_plant + email_branch_request_new_so
+     if overflow). Do NOT emit zload1 initial-mode here — that would
+     re-bundle and fail with BundlesFrozenError.
+
+     Otherwise (pre-plant_ls modify or non-assessment post-plant_ls), the
+     normal Rule 10 branches below apply:
 
      Decide by reading the branch's reply body:
 

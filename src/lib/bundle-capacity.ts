@@ -3,36 +3,58 @@
  *
  * Once `LoadingSlip.status='sent_to_plant'`, bundles are FROZEN — composition
  * must not change. When the branch asks to increase or add a material, we
- * have three deterministic outcomes:
+ * split the requested delta across the bundles greedily:
  *
- *   - fits_same_bundle  → the bundle that already carries this material has
- *                         enough headroom; just modify the existing LS via
- *                         ZLOAD2 (no LSI migration).
- *   - fits_other_bundle → no headroom in the current bundle, but a sibling
- *                         bundle on the same PO has space; issue a NEW LS
- *                         onto that bundle via ZLOAD1 (append mode).
- *   - needs_new_so      → every bundle is full; tell the branch to raise a
- *                         fresh SO for the overflow.
+ *   1. Pack the bundle that already carries the material to its remaining
+ *      capacity (`same_bundle` allocation → ZLOAD2 on the existing LS).
+ *   2. Spill whatever doesn't fit onto sibling bundles, best-fit by smallest
+ *      sufficient remaining (`other_bundle` allocation → ZLOAD1 in append
+ *      mode, creating a new LS on the target bundle).
+ *   3. Whatever still can't be placed is overflow — branch is asked to raise
+ *      a fresh SO for those kg.
+ *
+ * Each material's outcome is one of:
+ *   - fully_allocated  → every kg of the delta was placed (allocations[]).
+ *   - partial_overflow → some kg placed, some kg overflow (allocations[] + overflowKg > 0).
+ *   - needs_new_so     → nothing placed; everything is overflow.
  *
  * The decision is pure arithmetic. The LLM planner consumes the per-item
  * verdict from the audit trail and emits the corresponding step path (see
- * `Rule 11` in `llm-planner.ts`).
+ * Rule 6e Phase 2 in `llm-planner.ts`): one ZLOAD2 per same_bundle
+ * allocation, one ZLOAD1-append per other_bundle allocation, one
+ * email_modified_ls_to_plant, and one email_branch_request_new_so when
+ * overflow > 0.
  *
  * `Bundle.totalWeightKg` is the source of truth here. It is live-maintained
  * by every LSI write site that changes weight (see `zload2-data/route.ts`).
  * As a belt-and-braces measure this helper also self-heals stale bundles
  * before returning a verdict — see `backfillStaleBundleWeights`.
+ *
+ * MIN_ALLOCATION_KG below filters out operationally-useless tiny slivers
+ * (e.g. "place 30 kg on bundle X, the rest on bundle Y") — anything below
+ * the threshold is treated as if that bundle had no headroom for this item.
  */
 
 import { prisma } from './prisma';
 
+/**
+ * One leg of an allocation for a single material. The same material can have
+ * multiple legs (one same_bundle + one other_bundle, or two other_bundles)
+ * when the delta is split across bundles.
+ */
+export type Allocation =
+  /** ZLOAD2 on the LS that already carries this material. */
+  | { kind: 'same_bundle'; bundleId: string; kg: number }
+  /** ZLOAD1-append: new LS on a sibling bundle that had headroom. */
+  | { kind: 'other_bundle'; bundleId: string; kg: number };
+
 export type CapacityVerdict =
-  /** The bundle that already carries `material` has remainingKg ≥ deltaKg. */
-  | { material: string; verdict: 'fits_same_bundle'; bundleId: string; remainingKg: number }
-  /** A different bundle on the same PO can absorb the delta. */
-  | { material: string; verdict: 'fits_other_bundle'; bundleId: string; remainingKg: number }
-  /** No bundle has room — branch must raise a new SO. */
-  | { material: string; verdict: 'needs_new_so'; bundleId: null; remainingKg: 0 };
+  /** Every kg of the requested delta was placed. */
+  | { material: string; verdict: 'fully_allocated'; allocations: Allocation[]; overflowKg: 0 }
+  /** Some kg placed, some kg overflow — branch raises a new SO for the overflow. */
+  | { material: string; verdict: 'partial_overflow'; allocations: Allocation[]; overflowKg: number }
+  /** Nothing fit — branch raises a new SO for the whole delta. */
+  | { material: string; verdict: 'needs_new_so'; allocations: []; overflowKg: number };
 
 export interface AssessPostLsIncreaseArgs {
   salesOrderId: string;
@@ -46,6 +68,13 @@ export interface AssessPostLsIncreaseResult {
   /** Truck capacity (kg) read from `PurchaseOrder.weightage * 1000`. */
   capacityKg: number;
 }
+
+/**
+ * Smallest kg an individual allocation leg can represent. Anything below
+ * this is operationally useless (a near-empty ZLOAD2 modification or a new
+ * LS with a few kg on it) and is treated as if the bundle has no headroom.
+ */
+const MIN_ALLOCATION_KG = 100;
 
 /**
  * Assess whether each requested delta fits within an existing bundle on the
@@ -117,50 +146,76 @@ export async function assessPostLsIncrease(
       return Math.max(0, capacityKg - used);
     };
 
-    // Case a — current bundle has room.
-    if (currentBundleId && remainingFor(currentBundleId) >= item.deltaKg) {
-      tentativeWeightKg.set(
-        currentBundleId,
-        (tentativeWeightKg.get(currentBundleId) ?? 0) + item.deltaKg,
-      );
-      verdicts.push({
-        material: item.material,
-        verdict: 'fits_same_bundle',
-        bundleId: currentBundleId,
-        remainingKg: remainingFor(currentBundleId),
-      });
-      continue;
+    const debit = (bundleId: string, kg: number) => {
+      tentativeWeightKg.set(bundleId, (tentativeWeightKg.get(bundleId) ?? 0) + kg);
+    };
+
+    const allocations: Allocation[] = [];
+    let remaining = item.deltaKg;
+
+    // Step 1 — pack the current bundle to its remaining capacity first. The
+    // existing LS stays on the same bundle (no LSI migration); the extra
+    // weight rides the same LS via a ZLOAD2 quantity bump.
+    if (currentBundleId) {
+      const headroom = remainingFor(currentBundleId);
+      const take = Math.min(remaining, headroom);
+      if (take >= MIN_ALLOCATION_KG) {
+        allocations.push({ kind: 'same_bundle', bundleId: currentBundleId, kg: take });
+        debit(currentBundleId, take);
+        remaining -= take;
+      }
     }
 
-    // Case b — best-fit among other non-dispatched bundles. Mirror
-    // stock_precheck's tie-breaker: smallest sufficient remaining first.
-    const candidates = bundles
-      .filter((b) => b.id !== currentBundleId && !dispatchedIds.has(b.id))
-      .map((b) => ({ id: b.id, remainingKg: remainingFor(b.id) }))
-      .filter((c) => c.remainingKg >= item.deltaKg)
-      .sort((a, b) => a.remainingKg - b.remainingKg);
-    if (candidates.length > 0) {
-      const pick = candidates[0];
-      tentativeWeightKg.set(
-        pick.id,
-        (tentativeWeightKg.get(pick.id) ?? 0) + item.deltaKg,
-      );
-      verdicts.push({
-        material: item.material,
-        verdict: 'fits_other_bundle',
-        bundleId: pick.id,
-        remainingKg: pick.remainingKg - item.deltaKg,
-      });
-      continue;
+    // Step 2 — spill the residual onto sibling bundles. Best-fit by smallest
+    // sufficient remaining, so we leave roomier bundles open for bigger
+    // future asks. When no single bundle can absorb the whole residual, take
+    // from the LARGEST available (pack the spill in the chunkiest leg first
+    // — fewer fragmented LSs).
+    while (remaining >= MIN_ALLOCATION_KG) {
+      const candidates = bundles
+        .filter((b) => b.id !== currentBundleId && !dispatchedIds.has(b.id))
+        .map((b) => ({ id: b.id, remainingKg: remainingFor(b.id) }))
+        .filter((c) => c.remainingKg >= MIN_ALLOCATION_KG);
+      if (candidates.length === 0) break;
+
+      // Prefer a bundle that can take the entire residual (smallest such).
+      // Fall back to the bundle with the largest headroom otherwise.
+      const sufficient = candidates
+        .filter((c) => c.remainingKg >= remaining)
+        .sort((a, b) => a.remainingKg - b.remainingKg);
+      const pick = sufficient.length > 0
+        ? sufficient[0]
+        : candidates.sort((a, b) => b.remainingKg - a.remainingKg)[0];
+
+      const take = Math.min(remaining, pick.remainingKg);
+      allocations.push({ kind: 'other_bundle', bundleId: pick.id, kg: take });
+      debit(pick.id, take);
+      remaining -= take;
     }
 
-    // Case c — no bundle can take it.
-    verdicts.push({
-      material: item.material,
-      verdict: 'needs_new_so',
-      bundleId: null,
-      remainingKg: 0,
-    });
+    // Classify the outcome for this material.
+    if (allocations.length === 0) {
+      verdicts.push({
+        material: item.material,
+        verdict: 'needs_new_so',
+        allocations: [],
+        overflowKg: item.deltaKg,
+      });
+    } else if (remaining > 0) {
+      verdicts.push({
+        material: item.material,
+        verdict: 'partial_overflow',
+        allocations,
+        overflowKg: remaining,
+      });
+    } else {
+      verdicts.push({
+        material: item.material,
+        verdict: 'fully_allocated',
+        allocations,
+        overflowKg: 0,
+      });
+    }
   }
 
   return {
