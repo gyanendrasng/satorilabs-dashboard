@@ -332,9 +332,18 @@ export function isScenarioEngineEnabled(): boolean {
 export async function sendSecondReleaseEmail(args: {
   salesOrderId: string;
   modifications: EmailMaterialMod[];
+  /**
+   * Optional list of (material, overflowKg) pairs surfaced from a
+   * bundle_capacity_assessment partial_overflow verdict. When present, the
+   * email gains a clearly-labelled overflow paragraph asking the branch to
+   * raise a fresh SO for the spill. Callers in the post-plant_ls modify
+   * cycle pass this; pre-plant_ls and other modify paths omit it (in which
+   * case the email body is identical to before this parameter existed).
+   */
+  overflowItems?: Array<{ material: string; overflowKg: number }>;
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
-  const { salesOrderId, modifications, log } = args;
+  const { salesOrderId, modifications, overflowItems, log } = args;
 
   if (!BRANCH_EMAIL) {
     log('[2ndRelease] BRANCH_EMAIL not configured — skipping');
@@ -426,6 +435,25 @@ export async function sendSecondReleaseEmail(args: {
     }
   }
 
+  // Overflow block — when a bundle_capacity_assessment partial_overflow
+  // verdict drove this 2nd_release, the requested-but-unplaced kg per
+  // material is surfaced here so the branch knows to raise a new SO for
+  // the spill. Without this paragraph the branch only sees the placed
+  // numbers (e.g. "Increase to 208") and assumes their full ask landed.
+  const overflowLines: string[] = [];
+  if (overflowItems && overflowItems.length > 0) {
+    overflowLines.push(`Overflow — could not be accommodated in the current dispatch plan:`);
+    for (const o of overflowItems) {
+      const desc = soMaterials.find((m) => m.material === o.material)?.materialDescription || o.material;
+      overflowLines.push(`  - ${desc}: ${Math.round(o.overflowKg)} kg overflow`);
+    }
+    overflowLines.push(``);
+    overflowLines.push(
+      `The bundles already shared with the plant are FULL — these overflow units cannot ride this dispatch. ` +
+        `Please raise a fresh Sales Order for the overflow quantities above so they can be dispatched separately.`,
+    );
+  }
+
   const body = [
     `Hi,`,
     ``,
@@ -437,6 +465,7 @@ export async function sendSecondReleaseEmail(args: {
     `Revised dispatch plan (full):`,
     ...(planLines.length > 0 ? planLines : ['  (no materials on this SO)']),
     ``,
+    ...(overflowLines.length > 0 ? [...overflowLines, ``] : []),
     `Please perform the second release in SAP with the revised plan above and confirm.`,
     ``,
     `Thanks.`,
@@ -2698,8 +2727,9 @@ async function fireStep(
     }
 
     case 'email_2nd_release': {
-      // Ask the PLANT to confirm the post-VA02 plan. The planner emits the
-      // modification list as step args (read from the email thread).
+      // Ask the BRANCH to perform the second release after the post-VA02
+      // plan. The planner emits the modification list as step args (read
+      // from the email thread).
       const { coerceEmailMaterialsArgs } = await import('./planner-step-args');
       const summary = coerceEmailMaterialsArgs(_plannedStep, 'email_2nd_release');
       // sendSecondReleaseEmail expects EmailMaterialMod[] shape:
@@ -2710,9 +2740,54 @@ async function fireStep(
         operation: m.operation === 'inc' ? 'increase' : m.operation === 'dec' ? 'decrease' : 'delete',
         quantity: m.quantity,
       }));
+
+      // Post-plant_ls partial-allocation flow: when the planner emits
+      // email_2nd_release in Rule 6e Phase 2, the bundle_capacity_assessment
+      // verdict for this modify request is in the audit. Surface any
+      // overflow (per-material kg that couldn't be placed) on the email so
+      // the branch knows to raise a fresh SO for the spill. Without this,
+      // the branch only sees the placed numbers and assumes their full
+      // ask landed. We use the same audit markers the
+      // email_confirm_bundle_details handler uses for routing (latest
+      // assessment newer than latest email_received).
+      let overflowItems: Array<{ material: string; overflowKg: number }> | undefined;
+      const latestAssessmentEv = await prisma.scenarioEvent.findFirst({
+        where: {
+          salesOrderId: progress.salesOrderId,
+          type: 'step_completed',
+          payload: { contains: '"kind":"bundle_capacity_assessment"' },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true, payload: true },
+      });
+      const latestEmailReceivedEv = await prisma.scenarioEvent.findFirst({
+        where: { salesOrderId: progress.salesOrderId, type: 'email_received' },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      });
+      if (
+        latestAssessmentEv &&
+        (latestEmailReceivedEv === null ||
+          latestAssessmentEv.createdAt >= latestEmailReceivedEv.createdAt)
+      ) {
+        try {
+          const parsed = JSON.parse(latestAssessmentEv.payload) as {
+            verdicts?: Array<{ material: string; overflowKg?: number }>;
+          };
+          const verdicts = Array.isArray(parsed?.verdicts) ? parsed.verdicts : [];
+          const collected = verdicts
+            .filter((v) => typeof v.overflowKg === 'number' && (v.overflowKg as number) > 0)
+            .map((v) => ({ material: v.material, overflowKg: v.overflowKg as number }));
+          if (collected.length > 0) overflowItems = collected;
+        } catch {
+          // Bad payload — fall through with no overflow block.
+        }
+      }
+
       await sendSecondReleaseEmail({
         salesOrderId: progress.salesOrderId,
         modifications,
+        overflowItems,
         log,
       });
       return 'complete_segment';
