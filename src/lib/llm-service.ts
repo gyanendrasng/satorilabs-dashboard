@@ -44,13 +44,17 @@
  *   // result.usage → { inputTokens, outputTokens, totalTokens }
  */
 import OpenAI from 'openai';
-// Node built-ins used to bootstrap the Gemini SDK at runtime. Static imports
-// are critical here: `await import('node:path')` inside the GeminiClient was
-// being interop-wrapped by Next.js' server bundle so `path.join` resolved to
-// `undefined`, surfacing as the cryptic "a is not a function" at boot.
-import { createRequire } from 'node:module';
-import * as nodePath from 'node:path';
-import * as nodeFs from 'node:fs';
+// Node built-ins used to bootstrap the Gemini SDK at runtime. We deliberately
+// AVOID both static `import 'node:path'` and `await import('node:path')` here:
+// Next.js' server bundler interop-wraps these so named exports land as
+// `undefined` (the cryptic "a is not a function" / "(void 0) is not a function"
+// boot crashes we hit earlier). Going through `eval('require')` returns the
+// real runtime `require` function, bypassing webpack's static analysis and
+// keeping the Node built-ins intact.
+const nodeRequire: NodeRequire = (0, eval)('require');
+const createRequire: typeof import('module').createRequire = nodeRequire('module').createRequire;
+const nodePath: typeof import('path') = nodeRequire('path');
+const nodeFs: typeof import('fs') = nodeRequire('fs');
 
 // `@google/genai` is loaded LAZILY in the Gemini provider constructor below
 // (dynamic import). It is ESM-only and ships with conditional Node/web
