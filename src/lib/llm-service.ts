@@ -14,11 +14,12 @@
  *                    (default: 'openai')
  *   LLM_MODEL        Model id. Defaults per provider — see DEFAULT_MODELS.
  *   LLM_TEMPERATURE  Float, default 0.7. Override per call via chat({temperature}).
- *   LLM_MAX_TOKENS   Int, default 12000. Override per call via chat({maxTokens}).
+ *   LLM_MAX_TOKENS   Int, default 16000. Override per call via chat({maxTokens}).
  *                    The planner emits long structured JSON (full step plan
- *                    + rationale + per-step args); 4096 truncates the JSON
- *                    response mid-stream and the Zod parse fails. Keep
- *                    generous unless you know your specific call is small.
+ *                    + rationale + per-step args); anything under ~12000
+ *                    truncates the JSON response mid-stream on multi-step
+ *                    modify cycles and the Zod parse fails. Keep generous
+ *                    unless you know your specific call is small.
  *
  *   API keys (read based on the active provider):
  *     OPENAI_API_KEY      — openai
@@ -106,7 +107,7 @@ export interface ChatArgs {
   requireJson?: boolean;
   /** Per-call override; falls back to LLM_TEMPERATURE env / 0.7. */
   temperature?: number;
-  /** Per-call override; falls back to LLM_MAX_TOKENS env / 4096. */
+  /** Per-call override; falls back to LLM_MAX_TOKENS env / 16000. */
   maxTokens?: number;
   /** Per-call model override (rare). Falls back to the configured LLM_MODEL. */
   modelOverride?: string;
@@ -171,12 +172,12 @@ function readConfig(): ResolvedConfig {
   }
 
   const mtStr = process.env.LLM_MAX_TOKENS;
-  // 12000 is the safe default — the planner's structured JSON output (step
+  // 16000 is the safe default — the planner's structured JSON output (step
   // list + rationale + nested per-step args) routinely runs past 4k tokens
-  // on long modify cycles, causing the response to truncate mid-stream and
-  // the Zod parse to fail. Raise via LLM_MAX_TOKENS only if you have a
-  // specific reason to go higher.
-  const defaultMaxTokens = mtStr !== undefined ? Number(mtStr) : 12000;
+  // on long modify cycles, and 12000 has truncated mid-stream on the more
+  // verbose post-plant_ls assessment flows. Raise via LLM_MAX_TOKENS only if
+  // you have a specific reason to go higher.
+  const defaultMaxTokens = mtStr !== undefined ? Number(mtStr) : 16000;
   if (!Number.isFinite(defaultMaxTokens) || defaultMaxTokens <= 0) {
     throw new Error(
       `[llm-service] LLM_MAX_TOKENS='${mtStr}' must be a positive number.`,

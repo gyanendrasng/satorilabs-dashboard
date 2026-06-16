@@ -881,38 +881,91 @@ export async function planNextSteps(args: {
   // the provider/model from env vars (LLM_PROVIDER / LLM_MODEL / *_API_KEY).
   // See src/lib/llm-service.ts for the full env contract.
   const llm = getLlmService();
-  let result;
-  try {
-    result = await llm.chat({
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      requireJson: true,
-      // Planner output is a structured JSON plan (rationale + steps[] with
-      // nested args, plus per-step rationale strings) and can run long on
-      // multi-step modify cycles. Lock the cap here so a low LLM_MAX_TOKENS
-      // env value can't truncate the JSON mid-stream and fail the Zod parse.
-      maxTokens: 12000,
-    });
-  } catch (e) {
-    return planFailure(`LLM call failed: ${e instanceof Error ? e.message : String(e)}`);
+
+  // Retry the LLM call + parse + Zod-validate up to PLANNER_LLM_ATTEMPTS times.
+  // Transient failure modes that warrant a retry:
+  //   - llm.chat() throws (network blip, provider 5xx, JSON parse failure
+  //     inside parseJsonStrict because the model emitted truncated /
+  //     malformed output)
+  //   - empty text (provider returned a 200 with no body — has happened with
+  //     Gemini under load)
+  //   - Zod validation fails (the model produced syntactically valid JSON
+  //     that doesn't match PlanResultSchema — usually a missing required
+  //     field on a step the model improvised)
+  // We do NOT retry on planFailure(...) for application-logic reasons: only
+  // on actual parse/validation/network failures.
+  const PLANNER_LLM_ATTEMPTS = 3;
+  let result: Awaited<ReturnType<typeof llm.chat>> | null = null;
+  let validated: ReturnType<typeof PlanResultSchema.safeParse> | null = null;
+  let lastErr: unknown = null;
+
+  for (let attempt = 1; attempt <= PLANNER_LLM_ATTEMPTS; attempt++) {
+    try {
+      result = await llm.chat({
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        requireJson: true,
+        // Planner output is a structured JSON plan (rationale + steps[] with
+        // nested args, plus per-step rationale strings) and can run long on
+        // multi-step modify cycles. Lock the cap here so a low LLM_MAX_TOKENS
+        // env value can't truncate the JSON mid-stream and fail the Zod parse.
+        maxTokens: 16000,
+      });
+
+      if (!result.text) {
+        lastErr = new Error(
+          `LLM returned empty content (provider=${result.provider} model=${result.model})`,
+        );
+        result = null;
+        console.warn(
+          `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} reason=empty-content`,
+        );
+        continue;
+      }
+
+      // llm.chat() with requireJson=true already parsed JSON; if the model
+      // emitted something unparseable, chat() would have thrown above and
+      // we'd already be in the catch block.
+      validated = PlanResultSchema.safeParse(result.json);
+      if (validated.success) {
+        break;
+      }
+
+      // Zod failed — log and retry. Keep the raw response in the warn line
+      // for offline debugging.
+      const raw = result.text;
+      const preview = raw.length > 600 ? raw.slice(0, 600) + '…' : raw;
+      console.warn(
+        `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} reason=zod-fail ` +
+          `errors=${JSON.stringify(validated.error.issues)} raw=${preview}`,
+      );
+      lastErr = new Error(`Zod validation failed: ${validated.error.message}`);
+      result = null;
+      validated = null;
+    } catch (e) {
+      lastErr = e;
+      console.warn(
+        `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} reason=throw ` +
+          `error=${e instanceof Error ? e.message : String(e)}`,
+      );
+      result = null;
+      validated = null;
+    }
+
+    // Backoff before the next attempt (skip after the last attempt).
+    if (attempt < PLANNER_LLM_ATTEMPTS) {
+      const backoffMs = 300 * attempt;
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
   }
 
-  if (!result.text) {
-    return planFailure(`LLM returned empty content (provider=${result.provider} model=${result.model})`);
-  }
-
-  // llm.chat() with requireJson=true already parsed JSON; if the model emitted
-  // something unparseable, chat() would have thrown above.
-  const validated = PlanResultSchema.safeParse(result.json);
-  if (!validated.success) {
-    const raw = result.text;
-    const preview = raw.length > 600 ? raw.slice(0, 600) + '…' : raw;
-    console.warn(
-      `[PLANNER_ZOD_FAIL] soId=${args.salesOrderId} emailId=${args.triggerEmailId} raw=${preview} errors=${JSON.stringify(validated.error.issues)}`,
+  if (!result || !validated || !validated.success) {
+    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr ?? 'unknown');
+    return planFailure(
+      `Planner LLM call failed after ${PLANNER_LLM_ATTEMPTS} attempts: ${msg}`,
     );
-    return planFailure(`Zod validation failed: ${validated.error.message}`);
   }
 
   const v = validated.data;
