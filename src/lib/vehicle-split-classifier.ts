@@ -33,6 +33,13 @@ export type VehicleSplitIntent = z.infer<typeof ClassificationSchema>;
  * The model is told the available material codes for this PO so it never
  * fabricates new ones, and is told to ignore quoted/forwarded content
  * below the branch's actual reply.
+ *
+ * @deprecated Phase 4 rollout (UNIFIED_CLASSIFIER_ENABLED): the unified
+ * `classifyReply` in src/lib/reply-classifier.ts now returns
+ * action='vehicle_split_decision' with the same split/cancel/amend semantics.
+ * This function is kept as the flag-off fallback inside
+ * `handleVehicleSplitConfirmation`. Remove once the unified flag is the
+ * default everywhere.
  */
 export async function classifyVehicleSplitReply(args: {
   replyHtml: string;

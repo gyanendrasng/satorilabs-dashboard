@@ -114,14 +114,41 @@ export async function checkForReplies(): Promise<{
       // Get reply HTML body for workflow classification
       const replyBodyHtml = await getMessageBody(latestReply.id);
 
-      // Store replyHtml on the email record
+      // Store replyHtml + repliedAt on the email record. Both fields are
+      // required by `renderEmailThreadForSO` to include the reply in the
+      // rendered thread the classifier sees — without repliedAt the inbound
+      // entry is silently dropped, and the LLM ends up classifying the
+      // outbound dispatch email instead.
       await prisma.email.update({
         where: { id: email.id },
-        data: { replyHtml: replyBodyHtml },
+        data: { replyHtml: replyBodyHtml, repliedAt: new Date() },
       });
 
       // Route based on emailType
       const emailType = (email as any).emailType as string | null;
+
+      // ─── Unified classifier (Phase 3) ──────────────────────────────────
+      // When UNIFIED_CLASSIFIER_ENABLED=true, route ALL replies through
+      // handleReplyV2. The dispatcher inside scenario-engine maps the LLM's
+      // classification (scenario / dispatch_confirmation_decision / etc.) to
+      // the appropriate refactored handler with pre-classified fields.
+      // Per-type branches below stay as the flag-off fallback.
+      const unifiedFlag = (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
+      if (unifiedFlag && email.salesOrderId) {
+        log(`[EmailChecker] Unified classifier → handleReplyV2 for emailType=${emailType ?? 'null'} SO ${soNumber}`);
+        const sender: 'branch' | 'plant' = emailType === 'plant_ls' ? 'plant' : 'branch';
+        const { handleReplyV2 } = await import('./scenario-engine');
+        const originalEmailHtml = await getMessageBody(email.gmailMessageId);
+        const r = await handleReplyV2({
+          emailId: email.id,
+          replyHtml: replyBodyHtml || '',
+          originalEmailHtml,
+          sourceEmailType: sender,
+        });
+        logs.push(...r.logs);
+        processed++;
+        continue;
+      }
 
       if (emailType === 'vehicle_split_inquiry') {
         log(`[EmailChecker] Routing to handleVehicleSplitConfirmation for PO email ${email.id}`);
@@ -166,6 +193,16 @@ export async function checkForReplies(): Promise<{
         continue;
       }
 
+      if (emailType === '2nd_release') {
+        // Branch replied to a 2nd-release confirmation email — scenario engine advances on 'yes'
+        log(`[EmailChecker] Routing to handleSecondReleaseReply for SO ${soNumber}`);
+        const { handleSecondReleaseReply } = await import('./scenario-engine');
+        const srResult = await handleSecondReleaseReply(email.id, replyBodyHtml || '');
+        logs.push(...srResult.logs);
+        processed++;
+        continue;
+      }
+
       if (emailType === 'plant_ls') {
         // Plant replied to LS email — only care about PDF attachment (invoice)
         log(`[EmailChecker] Plant reply for SO ${soNumber} / LS ${lsNumber}`);
@@ -204,6 +241,33 @@ export async function checkForReplies(): Promise<{
             repliedAt: new Date(),
           },
         });
+
+        // Plant-modification fork: a plant_ls reply with text but no invoice
+        // PDF means the plant is asking for an LS modification (qty change /
+        // shortage / line removal). Route to the scenario engine when the
+        // flag is on. If the engine matches a scenario, skip the legacy
+        // BatchSender call below.
+        if (
+          emailType === 'plant_ls' &&
+          replyBodyHtml &&
+          email.salesOrderId &&
+          (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
+        ) {
+          const { handleReplyV2 } = await import('./scenario-engine');
+          const originalEmailHtml = await getMessageBody(email.gmailMessageId);
+          const r = await handleReplyV2({
+            emailId: email.id,
+            replyHtml: replyBodyHtml,
+            originalEmailHtml,
+            sourceEmailType: 'plant',
+          });
+          logs.push(...r.logs);
+          if (r.matched) {
+            processed++;
+            continue;
+          }
+          // Fall through to legacy BatchSender if the engine didn't match.
+        }
 
         // Check if all emails for this (Bundle, SO) pair now have replies.
         // bundleId comes from the LSI the email is tied to; null = legacy
@@ -450,21 +514,53 @@ export async function checkForNewEmails(): Promise<{
 
         const stripped = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        // Extract customer_id + SO numbers via AI; fall back to regex on failure.
+        // Extract customer_id + SO numbers. When the unified classifier flag
+        // is on, route through `classifyReply` (action='new_order'). The
+        // legacy path (`extractOrderInfoWithAI` + regex fallback) stays
+        // available for flag-off behavior.
         let customerId: string | null = null;
         let soNumbers: string[] = [];
-        try {
-          const extracted = await extractOrderInfoWithAI(stripped);
-          customerId = extracted.customerId;
-          soNumbers = extracted.soNumbers;
-          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
-        } catch (aiErr) {
-          log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
-          const fb = extractOrderInfoFallback(stripped);
-          customerId = fb.customerId;
-          soNumbers = fb.soNumbers;
-          if (soNumbers.length > 0) {
-            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+        const unifiedFlag = (process.env.UNIFIED_CLASSIFIER_ENABLED ?? 'false').toLowerCase() === 'true';
+        if (unifiedFlag) {
+          try {
+            const { classifyReply } = await import('./reply-classifier');
+            const cls = await classifyReply({
+              soNumber: null,
+              sender: null,
+              stage: null,
+              emailThread: stripped,
+              materials: [],
+              validKeys: [],
+              triggerEmailType: null,
+              gmailMessageId: msg.id,
+            });
+            if (cls.action === 'new_order') {
+              customerId = cls.customer_id;
+              soNumbers = cls.so_numbers;
+              log(`[NewEmail] unified classifier extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+            } else {
+              log(`[NewEmail] unified classifier returned action="${cls.action}" — no SO numbers extracted`);
+            }
+          } catch (clsErr) {
+            log(`[NewEmail] classifyReply failed (${clsErr instanceof Error ? clsErr.message : String(clsErr)}), falling back to regex`);
+            const fb = extractOrderInfoFallback(stripped);
+            customerId = fb.customerId;
+            soNumbers = fb.soNumbers;
+          }
+        } else {
+          try {
+            const extracted = await extractOrderInfoWithAI(stripped);
+            customerId = extracted.customerId;
+            soNumbers = extracted.soNumbers;
+            log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+          } catch (aiErr) {
+            log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
+            const fb = extractOrderInfoFallback(stripped);
+            customerId = fb.customerId;
+            soNumbers = fb.soNumbers;
+            if (soNumbers.length > 0) {
+              log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+            }
           }
         }
 
@@ -540,6 +636,35 @@ export async function checkForNewEmails(): Promise<{
           createdSoNumbers.push(soNumber);
         }
         log(`[NewEmail] PO ${poNumber}: ${createdSoNumbers.length} new SO(s), ${soNumbers.length - createdSoNumbers.length} already existed (total ${soNumbers.length})`);
+
+        // Persist the classifier decision as a `classifier_decision` event
+        // per SO, mirroring what handleReplyV2 does for replies. Lets the
+        // dashboard / audit queries surface the classifier output uniformly
+        // across all email types.
+        if (unifiedFlag && soNumbers.length > 0) {
+          try {
+            const { emitEvent } = await import('./scenario-events');
+            const allSos = await prisma.salesOrder.findMany({
+              where: { purchaseOrderId: purchaseOrder.id, soNumber: { in: soNumbers } },
+              select: { id: true, soNumber: true },
+            });
+            for (const so of allSos) {
+              await emitEvent({
+                salesOrderId: so.id,
+                type: 'classifier_decision',
+                payload: {
+                  action: 'new_order',
+                  customer_id: customerId,
+                  so_numbers: soNumbers,
+                  gmail_message_id: msg.id,
+                  via: 'checkForNewEmails',
+                },
+              });
+            }
+          } catch (evErr) {
+            log(`[NewEmail] classifier_decision event emit warning: ${evErr instanceof Error ? evErr.message : evErr}`);
+          }
+        }
 
         // Enqueue ZSO-VISIBILITY for every queued SO of this PO. The global
         // WorkQueue ensures only one fires at a time across the whole system,

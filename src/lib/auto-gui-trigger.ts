@@ -169,6 +169,16 @@ export async function checkAndSendBatchToAman(
     await pumpQueue();
 
     log(`[BatchSender] Enqueued ZLOAD3-B1 for ${scopeLabel} with ${attachments.length} attachment(s)`);
+
+    // Advance any active scenario past 'await_plant_invoice'. Safe no-op when
+    // engine is disabled or no scenario is in flight.
+    try {
+      const { maybeAdvanceScenario } = await import('./scenario-engine');
+      await maybeAdvanceScenario(salesOrderId, 'zload3b1');
+    } catch (advErr) {
+      log(`[BatchSender] maybeAdvanceScenario warning: ${advErr instanceof Error ? advErr.message : advErr}`);
+    }
+
     return { success: true, logs };
   } catch (error) {
     log(
@@ -566,7 +576,17 @@ async function sendVehicleSplitInquiry(args: {
  */
 export async function handleVehicleSplitConfirmation(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the upstream dispatcher has already
+   * classified the reply via `classifyReply`, it passes the decision (and
+   * amendments) here. Skips the internal `classifyVehicleSplitReply` call.
+   * Falls back to the in-handler classifier when omitted.
+   */
+  preClassified?: {
+    decision: 'split' | 'cancel' | 'amend' | 'ambiguous';
+    amendments?: Array<{ material_code: string; operation?: string; quantity: number }>;
+  }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (msg: string) => {
@@ -609,22 +629,35 @@ export async function handleVehicleSplitConfirmation(
     let intent: 'split' | 'cancel' | 'amend' | 'ambiguous';
     let removeCodes: string[] = [];
     let adjustItems: { material_code: string; quantity: number }[] = [];
-    try {
-      const ai = await classifyVehicleSplitReply({ replyHtml, knownMaterialCodes });
-      intent = ai.intent;
-      if (ai.intent === 'amend') {
-        removeCodes = ai.remove;
-        adjustItems = ai.adjust;
+    if (preClassified) {
+      intent = preClassified.decision;
+      if (intent === 'amend' && preClassified.amendments) {
+        removeCodes = preClassified.amendments
+          .filter((a) => a.operation === 'delete' || a.quantity === 0)
+          .map((a) => a.material_code);
+        adjustItems = preClassified.amendments
+          .filter((a) => a.operation !== 'delete' && a.quantity > 0)
+          .map((a) => ({ material_code: a.material_code, quantity: a.quantity }));
       }
-      log(`[VehicleSplit] AI intent=${intent}${ai.intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''} reason="${ai.reason}"`);
-    } catch (aiErr) {
-      // Fall back to the legacy regex if the local classifier errors. Same
-      // capabilities as before (yes/no), no amend support.
-      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(replyText);
-      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
-      intent = isYes && !isNo ? 'split' : isNo ? 'cancel' : 'ambiguous';
-      log(`[VehicleSplit] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+      log(`[VehicleSplit] using pre-classified decision=${intent}${intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''}`);
+    } else {
+      try {
+        const ai = await classifyVehicleSplitReply({ replyHtml, knownMaterialCodes });
+        intent = ai.intent;
+        if (ai.intent === 'amend') {
+          removeCodes = ai.remove;
+          adjustItems = ai.adjust;
+        }
+        log(`[VehicleSplit] AI intent=${intent}${ai.intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''} reason="${ai.reason}"`);
+      } catch (aiErr) {
+        // Fall back to the legacy regex if the local classifier errors. Same
+        // capabilities as before (yes/no), no amend support.
+        const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(replyText);
+        const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
+        intent = isYes && !isNo ? 'split' : isNo ? 'cancel' : 'ambiguous';
+        log(`[VehicleSplit] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+      }
     }
 
     if (intent === 'split') {
@@ -1276,6 +1309,80 @@ export async function sendDispatchConfirmationEmail(args: {
 }
 
 /**
+ * Compute bundles for a PO (idempotent) and fire ZLOAD1 once per (Bundle, SO)
+ * pair using each Material's saved dispatchQuantity. Flips touched SOs to
+ * `stock_approved`. Two callers: handleDispatchConfirmation when the branch
+ * confirms the dispatch plan, and the scenario engine when its `zload1` step
+ * is reached on a modification scenario.
+ */
+export async function fanOutZload1ForPo(
+  purchaseOrderId: string,
+  log: (msg: string) => void,
+): Promise<{ fired: number; bundleCount: number }> {
+  const bundleResult = await computeBundlesForPo(purchaseOrderId);
+  log(`[ZLOAD1-Fanout] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
+
+  // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that SO
+  // that live in that bundle. An SO that spans bundles gets multiple fires;
+  // a bundle that holds multiple SOs also gets multiple fires. The global
+  // WorkQueue serializes everything; we just control enqueue order:
+  // bundleNumber asc, then SO createdAt asc within a bundle.
+  const bundlesWithMaterials = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    orderBy: { bundleNumber: 'asc' },
+    include: {
+      materials: {
+        where: { dispatchQuantity: { gt: 0 } },
+        include: {
+          salesOrder: { select: { id: true, soNumber: true, createdAt: true } },
+        },
+      },
+    },
+  });
+
+  let fired = 0;
+  const stockApprovedSoIds = new Set<string>();
+
+  for (const bundle of bundlesWithMaterials) {
+    type Slot = { soNumber: string; salesOrderId: string; createdAt: Date; items: MaterialItemPayload[] };
+    const bySo = new Map<string, Slot>();
+    for (const m of bundle.materials) {
+      const slot = bySo.get(m.salesOrderId) ?? {
+        soNumber: m.salesOrder.soNumber,
+        salesOrderId: m.salesOrderId,
+        createdAt: m.salesOrder.createdAt,
+        items: [],
+      };
+      slot.items.push({
+        material_code: m.material,
+        batch: m.batch,
+        quantity: m.dispatchQuantity!,
+      });
+      bySo.set(m.salesOrderId, slot);
+    }
+
+    const slots = Array.from(bySo.values()).sort(
+      (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
+    );
+
+    for (const slot of slots) {
+      if (!stockApprovedSoIds.has(slot.salesOrderId)) {
+        await prisma.salesOrder.update({
+          where: { id: slot.salesOrderId },
+          data: { status: 'stock_approved', releasePlan: null },
+        });
+        stockApprovedSoIds.add(slot.salesOrderId);
+      }
+      await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
+      fired++;
+      log(`[ZLOAD1-Fanout] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
+    }
+  }
+
+  return { fired, bundleCount: bundleResult.bundleCount };
+}
+
+/**
  * Branch replied to the dispatch confirmation email.
  * Light parsing: 'yes/confirm/proceed' → fire ZLOAD1 per SO from the saved
  * Material.dispatchQuantity values. Anything else (changes, 'no') is left
@@ -1283,7 +1390,15 @@ export async function sendDispatchConfirmationEmail(args: {
  */
 export async function handleDispatchConfirmation(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the upstream dispatcher has already
+   * classified the reply, it passes the decision here. Skips the internal
+   * LLM call. Falls back to `classifyDispatchConfirmation` when omitted
+   * (legacy callers, e.g. the email-reply-checker switch with the unified
+   * flag off).
+   */
+  preClassified?: { decision: 'yes' | 'no' | 'ambiguous' }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (m: string) => {
@@ -1300,93 +1415,40 @@ export async function handleDispatchConfirmation(
     }
 
     let intent: 'yes' | 'no' | 'ambiguous';
-    try {
-      const ai = await classifyDispatchConfirmation(replyHtml);
-      intent = ai.intent;
-      log(`[DispatchConfirm] AI intent=${intent} reason="${ai.reason}"`);
-    } catch (aiErr) {
-      // Fallback to regex if AI is unreachable / errors. Quoted-text bug
-      // remains here, but at least we keep the system moving.
-      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
-      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
-      intent = isYes && !isNo ? 'yes' : isNo ? 'no' : 'ambiguous';
-      log(`[DispatchConfirm] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+    if (preClassified) {
+      intent = preClassified.decision;
+      log(`[DispatchConfirm] using pre-classified decision=${intent}`);
+    } else {
+      try {
+        const ai = await classifyDispatchConfirmation(replyHtml);
+        intent = ai.intent;
+        log(`[DispatchConfirm] AI intent=${intent} reason="${ai.reason}"`);
+      } catch (aiErr) {
+        // Fallback to regex if AI is unreachable / errors. Quoted-text bug
+        // remains here, but at least we keep the system moving.
+        const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
+        const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
+        intent = isYes && !isNo ? 'yes' : isNo ? 'no' : 'ambiguous';
+        log(`[DispatchConfirm] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
+      }
     }
 
     if (intent === 'yes') {
       // Confirmed — branch finalised the dispatch plan.
-      // Order: 1) compute bundles from Material rows so the truck count is
-      // locked in; 2) fire ZLOAD1 per (Bundle, SO) pair to create LSs in SAP.
-      // Vehicle-details email is sent later by checkAndSendCombinedVehicleEmailForPo
-      // once every ZLOAD1 work row for the PO is `done` — that runs from the
-      // /zload1-data callback. LSIs created later inherit bundleId from Material.
-      const bundleResult = await computeBundlesForPo(email.purchaseOrderId);
-      log(`[DispatchConfirm] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
-
-      // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that
-      // SO that live in that bundle. An SO that spans bundles gets multiple
-      // fires; a bundle that holds multiple SOs also gets multiple fires.
-      // The global WorkQueue serializes everything; we just control enqueue
-      // order: bundleNumber asc, then SO createdAt asc within a bundle.
-      const bundlesWithMaterials = await prisma.bundle.findMany({
-        where: { purchaseOrderId: email.purchaseOrderId },
-        orderBy: { bundleNumber: 'asc' },
-        include: {
-          materials: {
-            where: { dispatchQuantity: { gt: 0 } },
-            include: {
-              salesOrder: { select: { id: true, soNumber: true, createdAt: true } },
-            },
-          },
-        },
-      });
-
-      let fired = 0;
-      const stockApprovedSoIds = new Set<string>();
-
-      for (const bundle of bundlesWithMaterials) {
-        // Group this bundle's materials by SO.
-        type Slot = { soNumber: string; salesOrderId: string; createdAt: Date; items: MaterialItemPayload[] };
-        const bySo = new Map<string, Slot>();
-        for (const m of bundle.materials) {
-          const slot = bySo.get(m.salesOrderId) ?? {
-            soNumber: m.salesOrder.soNumber,
-            salesOrderId: m.salesOrderId,
-            createdAt: m.salesOrder.createdAt,
-            items: [],
-          };
-          slot.items.push({
-            material_code: m.material,
-            batch: m.batch,
-            quantity: m.dispatchQuantity!,
-          });
-          bySo.set(m.salesOrderId, slot);
-        }
-
-        const slots = Array.from(bySo.values()).sort(
-          (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
-        );
-
-        for (const slot of slots) {
-          if (!stockApprovedSoIds.has(slot.salesOrderId)) {
-            await prisma.salesOrder.update({
-              where: { id: slot.salesOrderId },
-              data: { status: 'stock_approved', releasePlan: null },
-            });
-            stockApprovedSoIds.add(slot.salesOrderId);
-          }
-          await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
-          fired++;
-          log(`[DispatchConfirm] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
-        }
-      }
+      // Bundle + per-(Bundle, SO) ZLOAD1 fan-out is in fanOutZload1ForPo so
+      // the scenario engine can drive the same code path for modification
+      // scenarios. Vehicle-details email is sent later by
+      // checkAndSendCombinedVehicleEmailForPo once every ZLOAD1 work row for
+      // the PO is `done` — that runs from the /zload1-data callback. LSIs
+      // created later inherit bundleId from Material.
+      const fanOut = await fanOutZload1ForPo(email.purchaseOrderId, log);
 
       await prisma.email.update({
         where: { id: emailId },
         data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
       });
-      log(`[DispatchConfirm] Confirmed ${fired} SO(s) for PO ${email.purchaseOrderId}`);
+      log(`[DispatchConfirm] Confirmed ${fanOut.fired} SO(s) for PO ${email.purchaseOrderId}`);
       return { success: true, logs };
     }
 
@@ -1409,6 +1471,25 @@ export async function handleBranchReply(
   originalEmailHtml: string,
   _salesOrderId: string
 ): Promise<{ success: boolean; logs: string[] }> {
+  // Scenario engine (feature-flag gated). When the engine matches a scenario,
+  // it returns success+matched and we short-circuit. When it can't match
+  // (e.g. SCENARIOS lookup misses), we fall through to the legacy body below.
+  if (
+    (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
+  ) {
+    // Dynamic import keeps the legacy hot path free of the engine module when
+    // the flag is off (no extra parsing on flag-off requests).
+    const { handleReplyV2 } = await import('./scenario-engine');
+    const r = await handleReplyV2({
+      emailId,
+      replyHtml,
+      originalEmailHtml,
+      sourceEmailType: 'branch',
+    });
+    if (r.matched) return { success: r.success, logs: r.logs };
+    // No matching scenario — fall through to the legacy classifier path.
+  }
+
   const logs: string[] = [];
   const log = (msg: string) => {
     const logMsg = `[${new Date().toISOString()}] ${msg}`;
@@ -1590,7 +1671,14 @@ export async function handleBranchReply(
  */
 export async function handleProductionReply(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the dispatcher has already parsed
+   * the days via `classifyReply` (action='production_timeline'), it passes
+   * the number here. Skips the auto_gui2 `/email/production-reply` round
+   * trip. Falls back to that endpoint when omitted.
+   */
+  preClassified?: { days: number }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (msg: string) => {
@@ -1624,29 +1712,36 @@ export async function handleProductionReply(
 
     log(`[ProductionReply] Parsing production reply for SO ${soNumber}`);
 
-    const response = await fetch(
-      `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-reply`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          production_reply_html: replyHtml,
-          sales_order: soNumber,
-          materials: materialCodes,
-        }),
+    let days: number;
+    if (preClassified) {
+      days = preClassified.days;
+      log(`[ProductionReply] using pre-classified days=${days}`);
+    } else {
+      const response = await fetch(
+        `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-reply`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            production_reply_html: replyHtml,
+            sales_order: soNumber,
+            materials: materialCodes,
+          }),
+        }
+      );
+
+      const result = await response.json();
+      log(`[ProductionReply] Extracted days: ${result.days}`);
+
+      if (!result.success || result.days <= 0) {
+        log(`[ProductionReply] Failed to extract days: ${result.error}`);
+        return { success: false, logs };
       }
-    );
-
-    const result = await response.json();
-    log(`[ProductionReply] Extracted days: ${result.days}`);
-
-    if (!result.success || result.days <= 0) {
-      log(`[ProductionReply] Failed to extract days: ${result.error}`);
-      return { success: false, logs };
+      days = result.days;
     }
 
     // Set wait timer
-    const waitUntil = new Date(Date.now() + result.days * 86400000);
+    const waitUntil = new Date(Date.now() + days * 86400000);
     await prisma.email.update({
       where: { id: emailId },
       data: {
@@ -1659,7 +1754,7 @@ export async function handleProductionReply(
     });
 
     log(
-      `[ProductionReply] Timer set: wait until ${waitUntil.toISOString()} (${result.days} days)`
+      `[ProductionReply] Timer set: wait until ${waitUntil.toISOString()} (${days} days)`
     );
     return { success: true, logs };
   } catch (error) {
@@ -1675,7 +1770,14 @@ export async function handleProductionReply(
  */
 export async function handleProductionConfirmation(
   emailId: string,
-  replyHtml: string
+  replyHtml: string,
+  /**
+   * Phase 2 (unified classifier): when the dispatcher has already classified
+   * via `classifyReply` (action='production_confirmation'), it passes the
+   * decision (+ optional additionalDays) here. Skips the auto_gui2
+   * `/email/production-confirmation` round trip.
+   */
+  preClassified?: { decision: 'ready' | 'wait_more'; additionalDays?: number }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (msg: string) => {
@@ -1709,29 +1811,39 @@ export async function handleProductionConfirmation(
 
     log(`[ProductionConfirmation] Classifying confirmation for SO ${soNumber}`);
 
-    const response = await fetch(
-      `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-confirmation`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          reply_html: replyHtml,
-          sales_order: soNumber,
-          materials: materialCodes,
-          context: 'production_confirmation',
-        }),
+    let status: 'ready' | 'wait_more';
+    let additionalDaysRaw: number | undefined;
+    if (preClassified) {
+      status = preClassified.decision;
+      additionalDaysRaw = preClassified.additionalDays;
+      log(`[ProductionConfirmation] using pre-classified status=${status}`);
+    } else {
+      const response = await fetch(
+        `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-confirmation`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            reply_html: replyHtml,
+            sales_order: soNumber,
+            materials: materialCodes,
+            context: 'production_confirmation',
+          }),
+        }
+      );
+
+      const result = await response.json();
+      log(`[ProductionConfirmation] Status: ${result.status}`);
+
+      if (!result.success) {
+        log(`[ProductionConfirmation] Classification failed: ${result.error}`);
+        return { success: false, logs };
       }
-    );
-
-    const result = await response.json();
-    log(`[ProductionConfirmation] Status: ${result.status}`);
-
-    if (!result.success) {
-      log(`[ProductionConfirmation] Classification failed: ${result.error}`);
-      return { success: false, logs };
+      status = result.status;
+      additionalDaysRaw = result.additional_days;
     }
 
-    if (result.status === 'ready') {
+    if (status === 'ready') {
       // Re-trigger ZSO-VISIBILITY to get fresh batch/material data
       // Pipeline: ZSO-VISIBILITY → Zmatana → Policy Run → Email to Branch → Branch decides
       await triggerZsoVisibility(soNumber);
@@ -1747,8 +1859,8 @@ export async function handleProductionConfirmation(
       });
 
       log(`[ProductionConfirmation] Materials ready, ZSO-VISIBILITY re-triggered for SO ${soNumber}`);
-    } else if (result.status === 'wait_more') {
-      const additionalDays = result.additional_days || 3;
+    } else if (status === 'wait_more') {
+      const additionalDays = additionalDaysRaw && additionalDaysRaw > 0 ? additionalDaysRaw : 3;
       const waitUntil = new Date(Date.now() + additionalDays * 86400000);
 
       await prisma.email.update({
@@ -1803,6 +1915,243 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
   });
   await pumpQueue();
   console.log(`[ZSO-VISIBILITY] Enqueued for SO ${soNumber}`);
+}
+
+/**
+ * Trigger ZLOADING_CLOSE for one or more materials on a sales order.
+ *
+ * Builds an instruction of the form:
+ *   "VPN is connected and SAP is logged in. Just go ahead and run the SAP
+ *    Transaction ZLOADING_CLOSE for Sales Order number <soNumber>.
+ *    Close material X, Close material Y."
+ *
+ * Idempotent: dedups on (soNumber + sorted materials) by scanning WorkQueue
+ * for an existing zloading_close row in queued/firing/done state with the
+ * same materials_key in the payload.
+ */
+export async function triggerZloadingClose(
+  soNumber: string,
+  materials: string[]
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[ZLOADING_CLOSE] No materials provided for SO ${soNumber} — skipping`);
+    return;
+  }
+
+  const normalized = Array.from(new Set(materials)).sort();
+  const materialsKey = JSON.stringify(normalized);
+
+  // JSON substring match is robust to key ordering because we search for the
+  // canonical materials_key value, which is itself a stable JSON string.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zloading_close',
+      state: { in: ['queued', 'firing', 'done'] },
+      payload: { contains: `"materials_key":${JSON.stringify(materialsKey)}` },
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOADING_CLOSE] Already exists for SO ${soNumber} materials=${materialsKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const closeClauses = normalized.map((m) => `Close material ${m}`).join(', ');
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction ZLOADING_CLOSE for Sales Order number ${soNumber}. ${closeClauses}.`;
+
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'zloading_close',
+    payload: {
+      instruction,
+      transaction_code: 'ZLOADING_CLOSE',
+      so_number: soNumber,
+      meta: {
+        so_number: soNumber,
+        materials: normalized,
+        materials_key: materialsKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(
+    `[ZLOADING_CLOSE] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${normalized.join(', ')})`
+  );
+}
+
+/**
+ * Trigger VA02 to set order quantities on one or more materials of a sales order.
+ *
+ * Builds an instruction like:
+ *   "...VA02 for Sales Order number <soNumber>. For material X set the order
+ *    quantity to N, for material Y set the order quantity to M"
+ *
+ * Idempotent on the full payload: dedups against existing queued/firing/done
+ * va02 rows with the exact same SO + sorted material→quantity map. A later
+ * call with different quantities fires normally — supports legitimate
+ * sequential edits.
+ */
+export async function triggerVa02(
+  soNumber: string,
+  materials: Array<{ material: string; orderQuantity: number }>
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[VA02] No materials provided for SO ${soNumber} — skipping`);
+    return;
+  }
+
+  const byMaterial = new Map<string, number>();
+  for (const m of materials) byMaterial.set(m.material, m.orderQuantity);
+  const normalized = Array.from(byMaterial.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([material, orderQuantity]) => ({ material, orderQuantity }));
+  const payloadKey = JSON.stringify({ soNumber, materials: normalized });
+
+  // Dedup is scoped to VA02 via both `step` and a payload substring match on
+  // `"transaction_code":"VA02"` — prevents any cross-transaction collision.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'va02',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"VA02"` } },
+        { payload: { contains: `"payload_key":${JSON.stringify(payloadKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[VA02] Already exists for SO ${soNumber} payload_key=${payloadKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const clauses = normalized
+    .map((m) => `for material ${m.material} set the order quantity to ${m.orderQuantity}`)
+    .join(', ');
+  const clausesSentence = clauses.charAt(0).toUpperCase() + clauses.slice(1);
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction VA02 for Sales Order number ${soNumber}. ${clausesSentence}`;
+
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'va02',
+    payload: {
+      instruction,
+      transaction_code: 'VA02',
+      so_number: soNumber,
+      meta: {
+        so_number: soNumber,
+        materials: normalized,
+        payload_key: payloadKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(`[VA02] Enqueued for SO ${soNumber} (${normalized.length} material(s))`);
+}
+
+/**
+ * Trigger ZLOAD2 for a loading slip with per-material batch + quantity.
+ *
+ * Builds an instruction like:
+ *   "...ZLOAD2 for Loading Slip number <lsNumber>. For material X batch <B>
+ *    order quantity is N, for material Y batch <B2> order quantity is M"
+ *
+ * Resolves salesOrderId from a LoadingSlipItem with the given lsNumber so the
+ * WorkQueue row is linked to the SO.
+ *
+ * Idempotent on the full payload: dedups against existing queued/firing/done
+ * zload2 rows with the exact same LS + sorted (material, batch, quantity).
+ */
+export async function triggerZload2(
+  lsNumber: string,
+  materials: Array<{ material: string; batch: string; orderQuantity: number }>
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[ZLOAD2] No materials provided for LS ${lsNumber} — skipping`);
+    return;
+  }
+
+  const missingBatch = materials.find((m) => !m.batch);
+  if (missingBatch) {
+    throw new Error(
+      `[ZLOAD2] Material ${missingBatch.material} has no batch — batch is required for ZLOAD2`
+    );
+  }
+
+  const byKey = new Map<string, { material: string; batch: string; orderQuantity: number }>();
+  for (const m of materials) byKey.set(`${m.material}|${m.batch}`, { ...m });
+  const normalized = Array.from(byKey.values()).sort((a, b) =>
+    a.material === b.material ? a.batch.localeCompare(b.batch) : a.material.localeCompare(b.material)
+  );
+  const payloadKey = JSON.stringify({ lsNumber, materials: normalized });
+
+  // Dedup is scoped to ZLOAD2 via both `step` and a payload substring match on
+  // `"transaction_code":"ZLOAD2"` — prevents any cross-transaction collision.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zload2',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"ZLOAD2"` } },
+        { payload: { contains: `"payload_key":${JSON.stringify(payloadKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOAD2] Already exists for LS ${lsNumber} payload_key=${payloadKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const clauses = normalized
+    .map((m) => `for material ${m.material} batch ${m.batch} order quantity is ${m.orderQuantity}`)
+    .join(', ');
+  const clausesSentence = clauses.charAt(0).toUpperCase() + clauses.slice(1);
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction ZLOAD2 for Loading Slip number ${lsNumber}. ${clausesSentence}`;
+
+  // Any item for this lsNumber works — all items of a single LS share the same SO.
+  const lsi = await prisma.loadingSlipItem.findFirst({
+    where: { lsNumber },
+    select: { salesOrderId: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: lsi?.salesOrderId ?? null,
+    step: 'zload2',
+    payload: {
+      instruction,
+      transaction_code: 'ZLOAD2',
+      meta: {
+        ls_number: lsNumber,
+        materials: normalized,
+        payload_key: payloadKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(`[ZLOAD2] Enqueued for LS ${lsNumber} (${normalized.length} material(s))`);
 }
 
 /**
@@ -2056,6 +2405,15 @@ export async function triggerVto1n(shipmentId: string): Promise<void> {
     });
     await pumpQueue();
     console.log(`[VTO1N-B] Enqueued for Shipment ${shipmentId} (SO ${so.soNumber}, Bundle ${bundle.bundleNumber})`);
+
+    // Advance any active scenario past 'await_vt01n'. Safe no-op when engine
+    // is disabled or no scenario is in flight.
+    try {
+      const { maybeAdvanceScenario } = await import('./scenario-engine');
+      await maybeAdvanceScenario(so.id, 'vto1n');
+    } catch (advErr) {
+      console.error('[VTO1N-B] maybeAdvanceScenario warning:', advErr);
+    }
   } catch (error) {
     console.error(`[VTO1N-B] Enqueue failed for Shipment ${shipmentId}:`, error);
     await prisma.shipment.updateMany({
@@ -2168,7 +2526,21 @@ async function triggerZload1(
 export async function handleVehicleDetailsReply(
   emailId: string,
   replyHtml: string,
-  salesOrderId: string
+  salesOrderId: string,
+  /**
+   * Phase 2 (unified classifier): when the upstream dispatcher has already
+   * extracted vehicles via `classifyReply` (action='vehicle_details_extraction'),
+   * it passes the array here. Skips the engine-modification intercept AND
+   * the internal OpenAI extraction. Falls back to both when omitted.
+   */
+  preExtracted?: {
+    vehicles: Array<{
+      bundleNumber?: number;
+      vehicleNumber: string;
+      driverMobile: string;
+      containerNumber: string;
+    }>;
+  }
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (message: string) => {
@@ -2192,6 +2564,47 @@ export async function handleVehicleDetailsReply(
   }
 
   const soNumber = email.salesOrder!.soNumber;
+
+  // Phase 2: when the unified dispatcher has already extracted vehicle data,
+  // skip the legacy modification-intercept + OpenAI extraction below and jump
+  // straight to the per-vehicle save logic.
+  if (preExtracted) {
+    log(`[VehicleDetails] using pre-extracted vehicles (${preExtracted.vehicles.length} set(s))`);
+  }
+
+  // Scenario-engine intercept: branch may piggyback a modification request on
+  // a vehicle-details reply ("vehicle is GJ12X, but please reduce X to 50").
+  // When the flag is on, classify intent first. If 'modify', hand off to the
+  // engine and bail out of vehicle-extraction entirely. The engine drives the
+  // appropriate post-LS modification scenario.
+  // Skipped when pre-extracted (dispatcher already classified as
+  // vehicle_details_extraction — if it were a modification, dispatcher would
+  // have routed to action='scenario' instead).
+  if (
+    !preExtracted &&
+    (process.env.SCENARIO_ENGINE_ENABLED ?? 'false').toLowerCase() === 'true'
+  ) {
+    try {
+      const { handleReplyV2 } = await import('./scenario-engine');
+      const r = await handleReplyV2({
+        emailId,
+        replyHtml,
+        originalEmailHtml: email.sentBody ?? '',
+        sourceEmailType: 'branch',
+      });
+      if (r.matched) {
+        log(`[VehicleDetails] Reply was a modification request — handed off to scenario engine for SO ${soNumber}`);
+        logs.push(...r.logs);
+        return { success: r.success, logs };
+      }
+      // Engine returned matched=false (intent wasn't 'modify' or no scenario
+      // matched). Fall through to the existing vehicle-extraction path.
+    } catch (engineErr) {
+      log(`[VehicleDetails] Engine pre-classifier warning: ${engineErr instanceof Error ? engineErr.message : engineErr}`);
+      // Fall through on engine error — never block vehicle extraction.
+    }
+  }
+
   log(`[VehicleDetails] Extracting vehicle details from reply for SO ${soNumber}`);
 
   // Strip HTML tags for cleaner text
@@ -2223,44 +2636,53 @@ export async function handleVehicleDetailsReply(
     : '';
 
   try {
-    const openai = new OpenAI();
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You extract vehicle/transport details from email replies. The reply may cover ONE truck or MULTIPLE trucks (when the dispatch is split into bundles). Return strict JSON of the form {"vehicles": [{"bundleNumber": <int or null>, "vehicleNumber": "<reg no>", "driverMobile": "<10-digit>", "containerNumber": "<container>"}, ...]}. ' +
-            'For each vehicle/truck mentioned, output one entry. ' +
-            'If the reply explicitly references "Bundle 1", "Bundle 2", "truck 1", "vehicle 1" etc., set bundleNumber to that integer. ' +
-            'If only one set of details is given without a bundle reference, set bundleNumber=null. ' +
-            'If a field is not mentioned, set it to an empty string "".',
-        },
-        {
-          role: 'user',
-          content: `Extract vehicle details from this email reply.${bundleContext}\n\n${replyText}`,
-        },
-      ],
-    });
-
-    const rawJson = completion.choices[0]?.message?.content;
     let extractedSets: Array<{ bundleNumber?: number | null; vehicleNumber: string; driverMobile: string; containerNumber: string }> = [];
 
-    if (rawJson) {
-      try {
-        const parsed = ExtractionSchema.safeParse(JSON.parse(rawJson));
-        if (parsed.success) {
-          extractedSets = parsed.data.vehicles;
-        } else {
-          log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
-        }
-      } catch (parseErr) {
-        log(`[VehicleDetails] JSON parse failed: ${parseErr instanceof Error ? parseErr.message : parseErr}`);
-      }
+    if (preExtracted) {
+      extractedSets = preExtracted.vehicles.map((v) => ({
+        bundleNumber: v.bundleNumber ?? null,
+        vehicleNumber: v.vehicleNumber,
+        driverMobile: v.driverMobile,
+        containerNumber: v.containerNumber,
+      }));
     } else {
-      log(`[VehicleDetails] OpenAI returned empty response`);
+      const openai = new OpenAI();
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You extract vehicle/transport details from email replies. The reply may cover ONE truck or MULTIPLE trucks (when the dispatch is split into bundles). Return strict JSON of the form {"vehicles": [{"bundleNumber": <int or null>, "vehicleNumber": "<reg no>", "driverMobile": "<10-digit>", "containerNumber": "<container>"}, ...]}. ' +
+              'For each vehicle/truck mentioned, output one entry. ' +
+              'If the reply explicitly references "Bundle 1", "Bundle 2", "truck 1", "vehicle 1" etc., set bundleNumber to that integer. ' +
+              'If only one set of details is given without a bundle reference, set bundleNumber=null. ' +
+              'If a field is not mentioned, set it to an empty string "".',
+          },
+          {
+            role: 'user',
+            content: `Extract vehicle details from this email reply.${bundleContext}\n\n${replyText}`,
+          },
+        ],
+      });
+
+      const rawJson = completion.choices[0]?.message?.content;
+      if (rawJson) {
+        try {
+          const parsed = ExtractionSchema.safeParse(JSON.parse(rawJson));
+          if (parsed.success) {
+            extractedSets = parsed.data.vehicles;
+          } else {
+            log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
+          }
+        } catch (parseErr) {
+          log(`[VehicleDetails] JSON parse failed: ${parseErr instanceof Error ? parseErr.message : parseErr}`);
+        }
+      } else {
+        log(`[VehicleDetails] OpenAI returned empty response`);
+      }
     }
     log(`[VehicleDetails] Extracted ${extractedSets.length} vehicle set(s) for PO ${email.purchaseOrderId ?? '(legacy)'}`);
 

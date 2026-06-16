@@ -224,19 +224,80 @@ model SalesOrder {
   // For 'wait' branch reply intents: re-fire ZSO-VISIBILITY when this passes.
   waitUntil           DateTime?
   waitRechecks        Int       @default(0)
+  // Denormalised latest scenarioKey from ScenarioProgress for fast dashboard reads.
+  intentLabel         String?
+  // SAP plant code (e.g. "7581"). Used to scope inventory pre-checks. Null →
+  // fall back to SAP_DEFAULT_PLANT env var.
+  plant               String?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
-  purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  items         LoadingSlipItem[]
-  emails        Email[]
-  invoice       Invoice?
-  materials     Material[]
-  workItems     WorkQueue[]
-  shipments     Shipment[]
-  shortages     MaterialShortage[]
+  purchaseOrder      PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  items              LoadingSlipItem[]
+  emails             Email[]
+  invoice            Invoice?
+  materials          Material[]
+  workItems          WorkQueue[]
+  shipments          Shipment[]
+  shortages          MaterialShortage[]
+  scenarioProgresses ScenarioProgress[]
+  scenarioEvents     ScenarioEvent[]
 
   @@map("sales_order")
+}
+
+// One row per scenario RUN per SalesOrder. The unique constraint on
+// salesOrderId was dropped in Phase E to support mid-flow re-entry: when a
+// new reply supersedes an active scenario, we mark the old row 'aborted' and
+// create a fresh row. The dashboard reads every row to show full audit
+// history. The engine reads the most recent non-terminal row to find the
+// "active" scenario.
+model ScenarioProgress {
+  id               String   @id @default(cuid())
+  salesOrderId     String
+  scenarioKey      String              // e.g. "branch|before_ls|modify|increase"
+  currentStepIndex Int      @default(0)
+  // 'ready' | 'awaiting_callback' | 'awaiting_reply'
+  // | 'awaiting_plant_invoice' | 'awaiting_vt01n'
+  // | 'completed' | 'aborted' | 'failed'
+  state            String   @default("ready")
+  classifierOutput String              // JSON of ScenarioSelection (or legacy BranchReplyClassification)
+  triggerEmailId   String?
+  lastWorkId       String?
+  lastEmailId      String?
+  error            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  salesOrder       SalesOrder       @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  events           ScenarioEvent[]
+
+  @@index([salesOrderId, state])
+  @@index([state, updatedAt])
+  @@map("scenario_progress")
+}
+
+// Append-only chronological log of everything that happens to a SO inside
+// the scenario engine. Used by:
+//   - the dashboard to render a timeline
+//   - the classifier to give the LLM mid-flow context (recent events)
+// Types: email_received | classifier_decision | scenario_started | step_fired |
+//        step_completed | email_sent | scenario_completed | scenario_aborted |
+//        scenario_failed.
+// `payload` is JSON whose shape depends on `type`.
+model ScenarioEvent {
+  id                 String   @id @default(cuid())
+  salesOrderId       String
+  scenarioProgressId String?
+  type               String
+  payload            String
+  createdAt          DateTime @default(now())
+
+  salesOrder         SalesOrder        @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  scenarioProgress   ScenarioProgress? @relation(fields: [scenarioProgressId], references: [id], onDelete: SetNull)
+
+  @@index([salesOrderId, createdAt])
+  @@map("scenario_event")
 }
 
 // Global FIFO work queue. One row per pending /chat fire to auto_gui2.
@@ -366,6 +427,14 @@ model Email {
   sentBody          String?   // Plain text body of the sent email
   replyHtml         String?   // Reply body HTML (for forwarding to auto_gui2)
 
+  // Supervisor-escalation tracking. When the unified classifier returns
+  // action='other', the engine sends a `supervisor_inquiry` email and sets
+  // `awaitingSupervisor=true` on the original trigger Email. `supervisorHops`
+  // counts how many times this thread has bounced through supervisor review;
+  // hard cap at 3 to prevent infinite loops on broken threads.
+  awaitingSupervisor Boolean @default(false)
+  supervisorHops     Int     @default(0)
+
   salesOrder      SalesOrder?      @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   loadingSlipItem LoadingSlipItem? @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
   purchaseOrder   PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
@@ -462,4 +531,31 @@ model Invoice {
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
 
   @@map("invoice")
+}
+
+// Free-stock snapshot synced from SAP every ~2 hours via auto_gui2. Upserted
+// by (material, plant). Drives the stock pre-check that gates VA02 for
+// increase-shaped modifications (replaces the old "Zmatana" SAP transaction).
+model InventorySnapshot {
+  id                  String   @id @default(cuid())
+  material            String
+  materialDescription String?
+  vertical            String?
+  plant               String
+  freeStock           Int
+  syncedAt            DateTime @default(now())
+
+  @@unique([material, plant])
+  @@index([material])
+  @@map("inventory_snapshot")
+}
+
+// Singleton row tracking which CSV file label was last ingested, so we don't
+// re-ingest the same file on every poll.
+model InventorySyncState {
+  id            String   @id @default("singleton")
+  lastFileLabel String?
+  lastSyncedAt  DateTime @updatedAt
+
+  @@map("inventory_sync_state")
 }

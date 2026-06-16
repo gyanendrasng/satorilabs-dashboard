@@ -17,6 +17,14 @@ export interface OrderExtraction {
  * customer_id is the upstream system's identifier for the dispatch customer
  * (e.g. "CUST-1234" or "42"). When absent, returns null and the caller may
  * skip Customer linking (the PO will be created without a customer).
+ *
+ * @deprecated Phase 4 rollout (UNIFIED_CLASSIFIER_ENABLED): the unified
+ * `classifyReply` in src/lib/reply-classifier.ts now returns
+ * action='new_order' with the same {customer_id, so_numbers} shape. This
+ * function is kept as the flag-off fallback inside `checkForNewEmails`.
+ * `extractOrderInfoFallback` (regex) below stays — it's the last-resort
+ * fallback for both paths. Remove the AI variant once the unified flag is
+ * the default everywhere.
  */
 export async function extractOrderInfoWithAI(emailBody: string): Promise<OrderExtraction> {
   const openai = new OpenAI();
