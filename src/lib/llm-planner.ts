@@ -1083,7 +1083,8 @@ export async function planNextSteps(args: {
       lastErr = e;
       console.warn(
         `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} reason=throw ` +
-          `error=${e instanceof Error ? e.message : String(e)}`,
+          `error=${e instanceof Error ? e.message : String(e)}\n` +
+          `stack=${e instanceof Error && e.stack ? e.stack : '(no stack)'}`,
       );
       result = null;
       validated = null;
