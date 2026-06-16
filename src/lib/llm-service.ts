@@ -279,17 +279,19 @@ class GeminiClient implements ProviderClient {
     //     boot crashes we hit earlier).
     //   - A top-level `(0, eval)('require')` evaluates during `next build`'s
     //     page-data collection, when `require` isn't defined globally yet.
+    //   - Even a LAZY `(0, eval)('require')` inside this function fails under
+    //     Turbopack (next dev/build --turbopack), which evaluates server code
+    //     in a context where the `require` global isn't bound. The eval throws
+    //     `ReferenceError: require is not defined`.
     //
-    // The reliable path: go through `(0, eval)('require')` LAZILY inside this
-    // function — at runtime `require` exists, webpack can't see through the
-    // eval, and the Node built-ins come back intact. Then walk up from
-    // process.cwd() to find @google/genai's CJS entry by absolute path
-    // (bypassing the package's `exports` map, which only gates bare-specifier
-    // resolution).
-    const nodeRequire: NodeRequire = (0, eval)('require');
-    const { createRequire } = nodeRequire('module') as typeof import('module');
-    const nodePath = nodeRequire('path') as typeof import('path');
-    const nodeFs = nodeRequire('fs') as typeof import('fs');
+    // The reliable path: `process.getBuiltinModule(...)`, a Node ≥22.12 API
+    // designed exactly for this — it returns Node's real built-in modules
+    // bypassing any bundler / loader / require shim. Since it's a method on
+    // the `process` global, bundlers can't strip it.
+    const nodeModule = process.getBuiltinModule('module') as typeof import('module');
+    const { createRequire } = nodeModule;
+    const nodePath = process.getBuiltinModule('path') as typeof import('path');
+    const nodeFs = process.getBuiltinModule('fs') as typeof import('fs');
 
     // __dirname is unreliable in Next.js bundled chunks. Walk up from
     // process.cwd() AND from a few well-known prod roots until we find the
