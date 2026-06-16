@@ -44,17 +44,11 @@
  *   // result.usage → { inputTokens, outputTokens, totalTokens }
  */
 import OpenAI from 'openai';
-// Node built-ins used to bootstrap the Gemini SDK at runtime. We deliberately
-// AVOID both static `import 'node:path'` and `await import('node:path')` here:
-// Next.js' server bundler interop-wraps these so named exports land as
-// `undefined` (the cryptic "a is not a function" / "(void 0) is not a function"
-// boot crashes we hit earlier). Going through `eval('require')` returns the
-// real runtime `require` function, bypassing webpack's static analysis and
-// keeping the Node built-ins intact.
-const nodeRequire: NodeRequire = (0, eval)('require');
-const createRequire: typeof import('module').createRequire = nodeRequire('module').createRequire;
-const nodePath: typeof import('path') = nodeRequire('path');
-const nodeFs: typeof import('fs') = nodeRequire('fs');
+// Node built-ins are loaded lazily via `(0, eval)('require')` inside the
+// Gemini provider's `getClient()` — see the comment block in there. Doing
+// this at module top-level breaks `next build`'s page-data collection
+// step, which evaluates the route module in an environment where `require`
+// is not yet defined globally.
 
 // `@google/genai` is loaded LAZILY in the Gemini provider constructor below
 // (dynamic import). It is ESM-only and ships with conditional Node/web
@@ -281,13 +275,21 @@ class GeminiClient implements ProviderClient {
     //     package's `exports` field (deep paths aren't whitelisted).
     //   - `await import('node:path')` / `await import('node:fs')` inside a
     //     Next.js server chunk gets interop-wrapped so the named exports land
-    //     as undefined (the canonical "a is not a function" boot crash). Use
-    //     static top-level imports for the Node built-ins instead.
+    //     as undefined ("a is not a function" / "(void 0) is not a function"
+    //     boot crashes we hit earlier).
+    //   - A top-level `(0, eval)('require')` evaluates during `next build`'s
+    //     page-data collection, when `require` isn't defined globally yet.
     //
-    // Workaround: find the package's installed location by walking up from
-    // this source file looking for `node_modules/@google/genai`, then load
-    // its CJS entry FILE directly (bypassing the `exports` map, which only
-    // affects bare-specifier resolution, not absolute file paths).
+    // The reliable path: go through `(0, eval)('require')` LAZILY inside this
+    // function — at runtime `require` exists, webpack can't see through the
+    // eval, and the Node built-ins come back intact. Then walk up from
+    // process.cwd() to find @google/genai's CJS entry by absolute path
+    // (bypassing the package's `exports` map, which only gates bare-specifier
+    // resolution).
+    const nodeRequire: NodeRequire = (0, eval)('require');
+    const { createRequire } = nodeRequire('module') as typeof import('module');
+    const nodePath = nodeRequire('path') as typeof import('path');
+    const nodeFs = nodeRequire('fs') as typeof import('fs');
 
     // __dirname is unreliable in Next.js bundled chunks. Walk up from
     // process.cwd() AND from a few well-known prod roots until we find the
