@@ -1,5 +1,6 @@
 import { prisma } from './prisma';
 import { findEquivalents } from './product-db';
+import type { MaterialOpSummary } from './planner-step-args';
 
 export type StockShortage = {
   material: string;
@@ -26,9 +27,17 @@ export type StockPrecheckResult =
   | { outcome: 'short'; shortages: StockShortage[]; plant: string; substitutions?: Substitution[] }
   | { outcome: 'plant_unknown' };
 
+/**
+ * Shape of one planner-emitted material entry on a stock_precheck step.
+ * `operation` is the short-code union the coercer in planner-step-args.ts
+ * produces — keeping the type strict here surfaces any future
+ * filter-string mismatches at compile time (the verbose-vs-short bug
+ * that silently bypassed the inventory lookup was hidden by an
+ * `operation: string` type here).
+ */
 type ClassifiedMaterial = {
   material_code: string;
-  operation: string;
+  operation: MaterialOpSummary;
   quantity: number;
 };
 
@@ -102,8 +111,15 @@ export async function runStockPrecheck(args: {
   const plant = await resolveSalesOrderPlant(args.salesOrderId);
   if (!plant) return { outcome: 'plant_unknown' };
 
+  // Operation codes come in as the planner-step-args short form
+  // ('inc' | 'dec' | 'del'). Filter on the matching short code; an earlier
+  // version of this filter checked `'increase'` (verbose), matched zero
+  // rows on every call, and silently returned `sufficient` without ever
+  // touching InventorySnapshot. The `MaterialOpSummary`-typed
+  // `ClassifiedMaterial` above now catches any future mismatch at compile
+  // time.
   const increases = (args.classification.materials ?? []).filter(
-    (m) => m.operation === 'increase',
+    (m) => m.operation === 'inc',
   );
   if (increases.length === 0) return { outcome: 'sufficient' };
 
