@@ -35,6 +35,7 @@ import {
 import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, Bundle, groupItemsByLsNumber } from '@/components/orders/types';
 import { BundleVehicleEditor } from '@/components/orders/BundleVehicleEditor';
 import { AGENT_SCREENS } from '@/lib/agent-screens';
+import { SatoriWordmark } from '@/components/work/SatoriBrand';
 
 interface ChatMessage {
   id: string;
@@ -762,10 +763,10 @@ export default function WorkV2Page() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
+      <div className="satori-v2 min-h-screen flex items-center justify-center" style={{ background: 'var(--s-bg)' }}>
         <div className="flex flex-col items-center gap-4">
-          <Loader2 className="h-8 w-8 animate-spin text-cyan-400" />
-          <p className="text-slate-400">Loading work station...</p>
+          <Loader2 className="h-8 w-8 animate-spin" style={{ color: 'var(--s-amber)' }} />
+          <p style={{ color: 'var(--s-muted)' }}>Loading work station…</p>
         </div>
       </div>
     );
@@ -773,118 +774,154 @@ export default function WorkV2Page() {
 
   if (error) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 flex items-center justify-center">
-        <div className="text-red-400 text-xl font-semibold">Error: {error}</div>
+      <div className="satori-v2 min-h-screen flex items-center justify-center" style={{ background: 'var(--s-bg)' }}>
+        <div className="text-xl font-semibold" style={{ color: 'var(--s-danger)' }}>Error: {error}</div>
       </div>
     );
   }
 
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 text-slate-100 pb-16">
-      {/* Header */}
-      <div className="border-b border-slate-700 bg-slate-800/50 backdrop-blur sticky top-0 z-40">
-        <div className="max-w-[1920px] mx-auto px-6 py-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-3xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
-                SAP Workflow Automation
-              </h1>
-              <p className="text-slate-400 text-sm mt-1">
-                Purchase Order → Sales Order → Loading Sheet → Invoice Management
-              </p>
-            </div>
-            <div className="flex gap-3">
-              <button className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 rounded-lg font-medium transition-all flex items-center gap-2 shadow-lg">
-                <Play className="w-4 h-4" />
-                Start Workflow
-              </button>
-              <button className="px-5 py-2.5 bg-slate-700 hover:bg-slate-600 rounded-lg font-medium transition-all flex items-center gap-2">
-                <Pause className="w-4 h-4" />
-                Pause
-              </button>
-            </div>
-          </div>
+  const NAV_ITEMS: { id: typeof activeTab; label: string; icon: typeof Layers }[] = [
+    { id: 'hierarchy', label: 'Orders', icon: Layers },
+    { id: 'chat', label: 'Agent Chat', icon: MessageSquare },
+    { id: 'screen', label: 'Agent Screen', icon: Monitor },
+    { id: 'queue', label: 'Work Queue', icon: ListChecks },
+    { id: 'logs', label: 'Logs', icon: ScrollText },
+  ];
+  const activeQueueCount = queueItems.filter((i) => i.state === 'queued' || i.state === 'firing').length;
 
-          {/* Tab Navigation */}
-          <div className="mt-4 flex flex-wrap gap-1 border-b border-slate-700">
-            <button
-              onClick={() => setActiveTab('hierarchy')}
-              className={`px-4 py-2.5 flex items-center gap-2 rounded-t-lg border-b-2 transition-colors ${
-                activeTab === 'hierarchy'
-                  ? 'border-cyan-500 text-cyan-400 bg-slate-700/40'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-700/20'
-              }`}
-            >
-              <Layers className="w-4 h-4" />
-              <span className="font-medium">Order Hierarchy</span>
-            </button>
-            <button
-              onClick={() => setActiveTab('chat')}
-              className={`px-4 py-2.5 flex items-center gap-2 rounded-t-lg border-b-2 transition-colors ${
-                activeTab === 'chat'
-                  ? 'border-cyan-500 text-cyan-400 bg-slate-700/40'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-700/20'
-              }`}
-            >
-              <MessageSquare className="w-4 h-4" />
-              <span className="font-medium">Agent Chat</span>
-            </button>
-            <button
-              onClick={() => setActiveTab('screen')}
-              className={`px-4 py-2.5 flex items-center gap-2 rounded-t-lg border-b-2 transition-colors ${
-                activeTab === 'screen'
-                  ? 'border-cyan-500 text-cyan-400 bg-slate-700/40'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-700/20'
-              }`}
-            >
-              <Monitor className="w-4 h-4" />
-              <span className="font-medium">Agent Screen</span>
-              <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
-            </button>
-            <button
-              onClick={() => setActiveTab('queue')}
-              className={`px-4 py-2.5 flex items-center gap-2 rounded-t-lg border-b-2 transition-colors ${
-                activeTab === 'queue'
-                  ? 'border-cyan-500 text-cyan-400 bg-slate-700/40'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-700/20'
-              }`}
-            >
-              <ListChecks className="w-4 h-4" />
-              <span className="font-medium">Work Queue</span>
-              {queueItems.some((i) => i.state === 'queued' || i.state === 'firing') && (
-                <span className="text-xs px-1.5 py-0.5 bg-cyan-900/50 text-cyan-300 rounded-full">
-                  {queueItems.filter((i) => i.state === 'queued' || i.state === 'firing').length}
-                </span>
-              )}
-            </button>
-            <button
-              onClick={() => setActiveTab('logs')}
-              className={`px-4 py-2.5 flex items-center gap-2 rounded-t-lg border-b-2 transition-colors ${
-                activeTab === 'logs'
-                  ? 'border-cyan-500 text-cyan-400 bg-slate-700/40'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-700/20'
-              }`}
-            >
-              <ScrollText className="w-4 h-4" />
-              <span className="font-medium">Logs</span>
-              {connected && <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>}
-            </button>
+  return (
+    <div
+      className="satori-v2 min-h-screen flex"
+      style={{ background: 'var(--s-bg)', color: 'var(--s-text)' }}
+    >
+      {/* ── Left Sidebar Nav ───────────────────────────────────────────── */}
+      <aside
+        className="fixed inset-y-0 left-0 z-40 w-60 flex flex-col border-r"
+        style={{ background: 'var(--s-bg-2)', borderColor: 'var(--s-border)' }}
+      >
+        <div className="px-5 py-5 border-b" style={{ borderColor: 'var(--s-border-soft)' }}>
+          <SatoriWordmark />
+        </div>
+
+        <nav className="flex-1 px-3 py-4 space-y-1">
+          {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
+            const active = activeTab === id;
+            return (
+              <button
+                key={id}
+                onClick={() => setActiveTab(id)}
+                className="group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
+                style={{
+                  background: active ? 'var(--s-panel-2)' : 'transparent',
+                  color: active ? 'var(--s-text)' : 'var(--s-muted)',
+                }}
+                onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--s-panel)'; }}
+                onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+              >
+                {active && (
+                  <span
+                    className="absolute left-0 top-1/2 -translate-y-1/2 h-6 w-1 rounded-r"
+                    style={{ background: 'var(--s-amber)' }}
+                  />
+                )}
+                <Icon className="w-4.5 h-4.5" style={{ color: active ? 'var(--s-amber)' : 'var(--s-muted)' }} />
+                <span className="flex-1 text-left">{label}</span>
+                {id === 'screen' && (
+                  <span
+                    className="w-1.5 h-1.5 rounded-full"
+                    style={{ background: agentStatus === 'live' ? 'var(--s-success)' : 'var(--s-muted-2)' }}
+                  />
+                )}
+                {id === 'queue' && activeQueueCount > 0 && (
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold"
+                    style={{ background: 'var(--s-amber-soft)', color: 'var(--s-amber)' }}
+                  >
+                    {activeQueueCount}
+                  </span>
+                )}
+                {id === 'logs' && (
+                  <span
+                    className="w-1.5 h-1.5 rounded-full"
+                    style={{ background: connected ? 'var(--s-success)' : 'var(--s-danger)' }}
+                  />
+                )}
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* Sidebar footer — quick stats */}
+        <div className="px-4 py-4 border-t text-xs space-y-2" style={{ borderColor: 'var(--s-border-soft)' }}>
+          <div className="flex items-center justify-between">
+            <span style={{ color: 'var(--s-muted-2)' }}>Active POs</span>
+            <span className="font-semibold" style={{ color: 'var(--s-sand)' }}>{purchaseOrders.length}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span style={{ color: 'var(--s-muted-2)' }}>Total SOs</span>
+            <span className="font-semibold" style={{ color: 'var(--s-sand)' }}>{totalSOs}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span style={{ color: 'var(--s-muted-2)' }}>Pending Inputs</span>
+            <span className="font-semibold" style={{ color: pendingInputs > 0 ? 'var(--s-amber)' : 'var(--s-sand)' }}>{pendingInputs}</span>
           </div>
         </div>
-      </div>
+      </aside>
 
-      {/* Main Content Area */}
-      <div className="max-w-[1920px] mx-auto p-6">
+      {/* ── Main column (offset by sidebar) ────────────────────────────── */}
+      <div className="flex-1 ml-60 flex flex-col min-h-screen">
+        {/* Top bar */}
+        <header
+          className="sticky top-0 z-30 flex items-center justify-between gap-4 px-6 py-3.5 border-b backdrop-blur"
+          style={{ background: 'rgba(28,24,19,0.85)', borderColor: 'var(--s-border)' }}
+        >
+          <div className="flex items-center gap-3 min-w-0">
+            <h1 className="text-base font-semibold truncate">SAP Workflow Automation</h1>
+            <span className="hidden md:inline text-xs truncate" style={{ color: 'var(--s-muted-2)' }}>
+              PO → SO → Loading Sheet → Invoice
+            </span>
+          </div>
+          <div className="flex items-center gap-3">
+            {/* Live workflow status pill */}
+            <div
+              className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full text-xs"
+              style={{ background: 'var(--s-panel)', border: '1px solid var(--s-border)' }}
+            >
+              <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: 'var(--s-success)' }} />
+              <span style={{ color: 'var(--s-muted)' }}>
+                Stage <span style={{ color: 'var(--s-sand)' }}>{purchaseOrders[0]?.stage || 1}/6</span>
+                {purchaseOrders[0]?.poNumber && <> · {purchaseOrders[0].poNumber}</>}
+              </span>
+            </div>
+            <button
+              className="px-4 py-2 rounded-lg font-medium text-sm flex items-center gap-2 transition-colors"
+              style={{ background: 'var(--s-amber)', color: '#1a1206' }}
+            >
+              <Play className="w-4 h-4" />
+              Start
+            </button>
+            <button
+              className="px-4 py-2 rounded-lg font-medium text-sm flex items-center gap-2 transition-colors"
+              style={{ background: 'var(--s-panel-2)', color: 'var(--s-text)' }}
+            >
+              <Pause className="w-4 h-4" />
+              Pause
+            </button>
+          </div>
+        </header>
+
+        {/* Main Content Area */}
+        <div className="flex-1 p-6 pb-20">
         {/* Order Hierarchy Tab */}
         {activeTab === 'hierarchy' && (
           <div
-            className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl p-6"
+            className="s-panel p-6"
             style={{ minHeight: 'calc(100vh - 340px)' }}
           >
             <div className="flex items-center justify-between mb-6">
               <h2 className="text-xl font-semibold flex items-center gap-3">
-                <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-cyan-500/10 ring-1 ring-cyan-500/30">
-                  <Package className="w-5 h-5 text-cyan-400" />
+                <span className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <Package className="w-5 h-5 s-accent" />
                 </span>
                 Order Hierarchy View
               </h2>
@@ -919,7 +956,7 @@ export default function WorkV2Page() {
 
             {ordersLoading ? (
               <div className="flex items-center justify-center py-20">
-                <Loader2 className="w-8 h-8 animate-spin text-cyan-400" />
+                <Loader2 className="w-8 h-8 animate-spin s-accent" />
               </div>
             ) : purchaseOrders.length === 0 ? (
               <div className="text-center py-20 text-slate-400">
@@ -1285,7 +1322,7 @@ export default function WorkV2Page() {
         {/* Agent Chat Tab */}
         {activeTab === 'chat' && (
           <div
-            className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl flex flex-col"
+            className="s-panel flex flex-col"
             style={{ height: 'calc(100vh - 340px)' }}
           >
             <WorkChat session={chat} onUpdateTitle={handleUpdateTitle} />
@@ -1295,13 +1332,13 @@ export default function WorkV2Page() {
         {/* Agent Screen Tab */}
         {activeTab === 'screen' && (
           <div
-            className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl overflow-hidden"
+            className="s-panel overflow-hidden"
             style={{ minHeight: 'calc(100vh - 340px)' }}
           >
             <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-700">
               <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-cyan-500/10 ring-1 ring-cyan-500/30">
-                  <Monitor className="w-5 h-5 text-cyan-400" />
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <Monitor className="w-5 h-5 s-accent" />
                 </div>
                 <div>
                   <h2 className="font-semibold text-lg leading-tight">
@@ -1429,7 +1466,7 @@ export default function WorkV2Page() {
                   <p className="text-slate-300">Screen hidden</p>
                   <button
                     onClick={() => setShowVmScreen(true)}
-                    className="mt-2 text-cyan-400 hover:text-cyan-300"
+                    className="mt-2 s-accent hover:text-cyan-300"
                   >
                     Click to show
                   </button>
@@ -1442,14 +1479,14 @@ export default function WorkV2Page() {
         {/* Logs Tab */}
         {activeTab === 'queue' && (
           <div
-            className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl flex flex-col"
+            className="s-panel flex flex-col"
             style={{ height: 'calc(100vh - 200px)' }}
           >
             {/* Queue Header */}
             <div className="flex items-center justify-between p-4 border-b border-slate-700">
               <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-cyan-500/10 ring-1 ring-cyan-500/30">
-                  <ListChecks className="w-5 h-5 text-cyan-400" />
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <ListChecks className="w-5 h-5 s-accent" />
                 </div>
                 <div>
                   <h2 className="font-semibold text-lg leading-tight">Work Queue</h2>
@@ -1460,7 +1497,7 @@ export default function WorkV2Page() {
               </div>
               <button
                 onClick={fetchQueue}
-                className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-slate-400 hover:text-cyan-400"
+                className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-slate-400 hover:s-accent"
                 title="Refresh"
               >
                 <RotateCcw className="w-4 h-4" />
@@ -1551,14 +1588,14 @@ export default function WorkV2Page() {
 
         {activeTab === 'logs' && (
           <div
-            className="bg-slate-800/50 backdrop-blur rounded-xl border border-slate-700 shadow-xl flex flex-col"
+            className="s-panel flex flex-col"
             style={{ height: 'calc(100vh - 200px)' }}
           >
             {/* Logs Header */}
             <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-700">
               <div className="flex items-center gap-3">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-cyan-500/10 ring-1 ring-cyan-500/30">
-                  <ScrollText className="w-5 h-5 text-cyan-400" />
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <ScrollText className="w-5 h-5 s-accent" />
                 </div>
                 <div>
                   <h2 className="font-semibold text-lg leading-tight">Agent Logs</h2>
@@ -1707,7 +1744,7 @@ export default function WorkV2Page() {
                     // Regular debug log rendering
                     const levelColor: Record<string, string> = {
                       DEBUG: 'text-slate-500',
-                      INFO: 'text-cyan-400',
+                      INFO: 's-accent',
                       WARNING: 'text-yellow-400',
                       ERROR: 'text-red-400',
                       CRITICAL: 'text-red-500 font-bold',
@@ -1741,13 +1778,20 @@ export default function WorkV2Page() {
             </div>
           </div>
         )}
+        </div>
       </div>
 
       {/* Input Modal */}
       {showInputModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-6">
-          <div className="bg-slate-800 rounded-xl border border-slate-700 shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-auto">
-            <div className="flex items-center justify-between p-6 border-b border-slate-700 sticky top-0 bg-slate-800 z-10">
+          <div
+            className="rounded-xl border shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-auto"
+            style={{ background: 'var(--s-panel)', borderColor: 'var(--s-border)' }}
+          >
+            <div
+              className="flex items-center justify-between p-6 border-b sticky top-0 z-10"
+              style={{ background: 'var(--s-panel)', borderColor: 'var(--s-border)' }}
+            >
               <div>
                 <h2 className="text-xl font-semibold">
                   {inputType === 'new-po'
@@ -1823,7 +1867,7 @@ export default function WorkV2Page() {
                       {newPOSOs.map((so, index) => (
                         <div key={so.id} className="border border-slate-700 rounded-lg p-4 bg-slate-900/50">
                           <div className="flex items-center justify-between mb-3">
-                            <h4 className="text-sm font-medium text-cyan-400">SO #{index + 1}</h4>
+                            <h4 className="text-sm font-medium s-accent">SO #{index + 1}</h4>
                             {newPOSOs.length > 1 && (
                               <button
                                 type="button"
@@ -2358,36 +2402,22 @@ export default function WorkV2Page() {
         </div>
       )}
 
-      {/* Status Bar */}
-      <div className="fixed bottom-0 left-0 right-0 bg-slate-800/90 backdrop-blur border-t border-slate-700 px-6 py-3 z-40">
-        <div className="max-w-[1920px] mx-auto flex items-center justify-between text-sm">
-          <div className="flex items-center gap-6">
+      {/* Slim status footer — fixed to the main column (offset past sidebar) */}
+      <div
+        className="fixed bottom-0 right-0 left-60 backdrop-blur border-t px-6 py-2.5 z-30"
+        style={{ background: 'rgba(28,24,19,0.9)', borderColor: 'var(--s-border)' }}
+      >
+        <div className="flex items-center justify-between text-xs" style={{ color: 'var(--s-muted)' }}>
+          <div className="flex items-center gap-5">
             <div className="flex items-center gap-2">
-              <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
+              <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: 'var(--s-success)' }} />
               <span>System Active</span>
             </div>
-            <span className="text-slate-400">
-              Processing: {purchaseOrders[0]?.poNumber || 'None'}
-            </span>
-            <span className="text-slate-400">
-              Current Stage: {purchaseOrders[0]?.stage || 1}/6
-            </span>
+            <span>Processing: <span style={{ color: 'var(--s-sand)' }}>{purchaseOrders[0]?.poNumber || 'None'}</span></span>
           </div>
-          <div className="flex items-center gap-6 text-slate-400">
-            <span>
-              Active POs: <span className="text-cyan-400 font-semibold">{purchaseOrders.length}</span>
-            </span>
-            <span>
-              Total SOs: <span className="text-cyan-400 font-semibold">{totalSOs}</span>
-            </span>
-            <span>
-              Invoices Created:{' '}
-              <span className="text-purple-400 font-semibold">{totalInvoices}</span>
-            </span>
-            <span>
-              Pending Inputs:{' '}
-              <span className="text-orange-400 font-semibold">{pendingInputs}</span>
-            </span>
+          <div className="flex items-center gap-5">
+            <span>Invoices: <span className="font-semibold" style={{ color: 'var(--s-info)' }}>{totalInvoices}</span></span>
+            <span>Pending Inputs: <span className="font-semibold" style={{ color: pendingInputs > 0 ? 'var(--s-amber)' : 'var(--s-sand)' }}>{pendingInputs}</span></span>
           </div>
         </div>
       </div>

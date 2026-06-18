@@ -120,3 +120,128 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* ──────────────────────────────────────────────────────────────────────
+   Satori Labs — Work v2 theme
+   Warm "zen / charcoal + amber" identity, scoped to .satori-v2 so it never
+   leaks into the original /work page or anything else.
+   ────────────────────────────────────────────────────────────────────── */
+.satori-v2 {
+  --s-bg: #16130f;          /* warm charcoal base */
+  --s-bg-2: #1c1813;        /* slightly raised */
+  --s-panel: #211c16;       /* card / panel */
+  --s-panel-2: #2a2419;     /* raised panel / hover */
+  --s-border: #3a3225;      /* hairline border */
+  --s-border-soft: #2e281d;
+  --s-amber: #f5a623;       /* primary accent */
+  --s-amber-soft: #f3b85133;
+  --s-sand: #e8dcc8;        /* warm light text accent */
+  --s-text: #f0ebe2;        /* primary text */
+  --s-muted: #a89b86;       /* muted text */
+  --s-muted-2: #7c715f;     /* dimmest */
+  --s-success: #8aa86b;     /* warm green */
+  --s-danger: #d9694a;      /* warm red/clay */
+  --s-info: #c9a25e;        /* gold-info */
+}
+.satori-v2 .s-glow {
+  box-shadow: 0 0 0 1px var(--s-amber-soft), 0 8px 40px -12px rgba(245, 166, 35, 0.25);
+}
+/* Enso ring draw-in for the brand mark */
+@keyframes s-enso {
+  from { stroke-dashoffset: 300; }
+  to { stroke-dashoffset: 40; }
+}
+.satori-v2 .s-enso-ring {
+  stroke-dasharray: 300;
+  animation: s-enso 1.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+/* Form controls inside v2: warm focus + dark fields, without touching globals */
+.satori-v2 input,
+.satori-v2 select,
+.satori-v2 textarea {
+  background-color: var(--s-bg) !important;
+  border-color: var(--s-border) !important;
+  color: var(--s-text);
+}
+.satori-v2 input::placeholder,
+.satori-v2 textarea::placeholder { color: var(--s-muted-2); }
+.satori-v2 input:focus,
+.satori-v2 select:focus,
+.satori-v2 textarea:focus {
+  border-color: var(--s-amber) !important;
+  outline: none;
+  box-shadow: 0 0 0 2px var(--s-amber-soft);
+}
+.satori-v2 select option { background-color: var(--s-bg); color: var(--s-text); }
+/* Reusable panel surface for v2 sections */
+.satori-v2 .s-panel {
+  background-color: var(--s-panel);
+  border: 1px solid var(--s-border);
+  border-radius: 0.75rem;
+  box-shadow: 0 10px 30px -18px rgba(0, 0, 0, 0.7);
+}
+.satori-v2 .s-icon-chip {
+  background-color: var(--s-amber-soft);
+  box-shadow: inset 0 0 0 1px var(--s-border);
+  color: var(--s-amber);
+}
+.satori-v2 .s-divider { border-color: var(--s-border); }
+.satori-v2 .s-accent { color: var(--s-amber) !important; }
+.satori-v2 .s-accent-sand { color: var(--s-sand) !important; }
+
+/* ── Palette remap ───────────────────────────────────────────────────────
+   The v2 JSX reuses the original slate/cyan Tailwind utilities. Rather than
+   rewrite every class, remap those utilities to the warm palette *only*
+   inside .satori-v2. Keeps the markup stable and the theme fully scoped. */
+
+/* Surfaces (backgrounds) */
+.satori-v2 .bg-slate-900,
+.satori-v2 .bg-slate-900\/50,
+.satori-v2 .bg-slate-900\/40,
+.satori-v2 .bg-slate-900\/60 { background-color: var(--s-bg) !important; }
+.satori-v2 .bg-slate-800,
+.satori-v2 .bg-slate-800\/50,
+.satori-v2 .bg-slate-800\/70,
+.satori-v2 .bg-slate-800\/90 { background-color: var(--s-panel) !important; }
+.satori-v2 .bg-slate-700,
+.satori-v2 .bg-slate-700\/30,
+.satori-v2 .bg-slate-700\/50 { background-color: var(--s-panel-2) !important; }
+.satori-v2 .hover\:bg-slate-700:hover,
+.satori-v2 .hover\:bg-slate-700\/30:hover { background-color: var(--s-panel-2) !important; }
+.satori-v2 .hover\:bg-slate-600:hover { background-color: var(--s-border) !important; }
+
+/* Borders */
+.satori-v2 .border-slate-700,
+.satori-v2 .border-slate-600 { border-color: var(--s-border) !important; }
+
+/* Text */
+.satori-v2 .text-slate-300 { color: var(--s-text) !important; }
+.satori-v2 .text-slate-400 { color: var(--s-muted) !important; }
+.satori-v2 .text-slate-500 { color: var(--s-muted-2) !important; }
+.satori-v2 .text-slate-600 { color: var(--s-muted-2) !important; }
+.satori-v2 .text-slate-200 { color: var(--s-sand) !important; }
+.satori-v2 .text-slate-100 { color: var(--s-text) !important; }
+
+/* Cyan accents → amber */
+.satori-v2 .bg-cyan-600,
+.satori-v2 .bg-cyan-500 { background-color: var(--s-amber) !important; color: #1a1206 !important; }
+.satori-v2 .hover\:bg-cyan-700:hover { background-color: #e0951a !important; }
+.satori-v2 .text-cyan-300 { color: var(--s-amber) !important; }
+.satori-v2 .bg-cyan-900\/50 { background-color: var(--s-amber-soft) !important; }
+.satori-v2 .bg-cyan-500 { background-color: var(--s-amber) !important; }
+/* the small "agent working" pulsing dot uses bg-cyan-500 — keep it readable */
+.satori-v2 .border-l-cyan-500 { border-left-color: var(--s-amber) !important; }
+
+/* Hierarchy level tints — re-warm the colored left-border blocks */
+.satori-v2 .bg-emerald-900\/30,
+.satori-v2 .bg-emerald-900\/40 { background-color: rgba(138, 168, 107, 0.12) !important; }
+.satori-v2 .border-emerald-500 { border-color: var(--s-success) !important; }
+.satori-v2 .bg-cyan-900\/30,
+.satori-v2 .bg-cyan-900\/40 { background-color: var(--s-amber-soft) !important; }
+.satori-v2 .border-cyan-500 { border-color: var(--s-amber) !important; }
+.satori-v2 .bg-purple-900\/20,
+.satori-v2 .bg-purple-900\/30 { background-color: rgba(201, 162, 94, 0.12) !important; }
+.satori-v2 .border-purple-700\/50,
+.satori-v2 .border-purple-500 { border-color: var(--s-info) !important; }
+.satori-v2 .text-purple-300,
+.satori-v2 .text-purple-400 { color: var(--s-info) !important; }
