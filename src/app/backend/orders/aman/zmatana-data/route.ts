@@ -84,14 +84,18 @@ export async function POST(request: Request) {
     // qty when it swapped the SO line; ZMatana only fetches batch + free stock.
     await prisma.material.upsert({
       where: {
-        salesOrderId_material_batch: {
+        salesOrderId_material: {
           salesOrderId: salesOrder.id,
           material: materialCode,
-          batch,
         },
       },
+      // `batch` is updated too: ZMatana may report a different (reordered /
+      // augmented) batch string for a material we already have a row for.
+      // One row per (SO, material) — overwrite the batch field with the
+      // latest. orderQuantity is left untouched on update (VA02 owns it).
       update: {
         materialDescription,
+        batch,
         availableStock: body.available_stock_for_so ?? null,
         ...(body.order_weight_kg != null ? { orderWeightKg: body.order_weight_kg } : {}),
       },
@@ -100,7 +104,7 @@ export async function POST(request: Request) {
         material: materialCode,
         materialDescription,
         batch,
-        orderQuantity: 0, // VA02 already sets this on the existing row; this branch is only hit when ZMatana returns a NEW batch we hadn't seen.
+        orderQuantity: 0, // Only hit when ZMatana returns a material with no prior row on this SO at all.
         availableStock: body.available_stock_for_so ?? null,
         orderWeightKg: body.order_weight_kg ?? null,
       },

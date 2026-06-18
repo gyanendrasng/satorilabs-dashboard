@@ -399,7 +399,13 @@ model Material {
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
 
-  @@unique([salesOrderId, material, batch])
+  // One Material row per (SO, material). `batch` is informational — SAP
+  // returns it as a (possibly comma-joined, possibly reordered) string that
+  // changes across ZSO_Visibility / ZMatana runs, so it must NOT be part of
+  // the identity. Keying on batch previously let a reordered batch string
+  // create a duplicate row for the same material, surfacing the same item
+  // twice in the dispatch email. No reader filters Material by batch.
+  @@unique([salesOrderId, material])
   @@map("material")
 }
 

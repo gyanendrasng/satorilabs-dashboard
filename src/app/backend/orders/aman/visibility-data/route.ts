@@ -123,14 +123,18 @@ export async function POST(request: Request) {
       const batch = rawBatch || 'N/A';
       await prisma.material.upsert({
         where: {
-          salesOrderId_material_batch: {
+          salesOrderId_material: {
             salesOrderId: salesOrder.id,
             material: materialCode,
-            batch,
           },
         },
+        // `batch` is updated too: SAP may return a different (reordered /
+        // augmented) batch string for the same material on a later
+        // ZSO_Visibility run. One row per (SO, material) — overwrite the
+        // batch field with whatever SAP last reported.
         update: {
           materialDescription: raw.material_description ?? null,
+          batch,
           orderQuantity: raw.order_quantity,
           availableStock: raw.available_stock_for_so ?? null,
           orderWeightKg: raw.order_weight_kg ?? null,
