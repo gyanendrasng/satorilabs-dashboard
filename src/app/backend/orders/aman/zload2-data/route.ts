@@ -175,30 +175,41 @@ export async function POST(request: Request) {
       where: { salesOrderId: loadingSlip.salesOrderId },
       select: { material: true, materialDescription: true, batch: true },
     });
-    const codeByDescBatch = new Map<string, string>();
+    // Index each Material row by (normalised description, batch token). A
+    // multi-batch material stores its batches as one comma-joined string
+    // ("RP08, B01"), but the LS PDF prints one physical row PER batch — index
+    // every individual batch token (plus the joined string) so a per-batch PDF
+    // row resolves to the real code instead of the family prefix.
+    const matEntries: Array<{ desc: string; batchTokens: string[]; code: string }> = [];
     for (const m of soMaterials) {
       if (!m.materialDescription) continue;
       const desc = normaliseDesc(m.materialDescription);
-      // A multi-batch material stores its batches as one comma-joined string
-      // ("RP08, B01"), but the LS PDF prints one physical row PER batch. Index
-      // every individual batch token (plus the joined string as a fallback) so
-      // a per-batch PDF row resolves to the real code instead of falling back
-      // to the family prefix.
-      const tokens = String(m.batch ?? '')
+      const batchTokens = String(m.batch ?? '')
         .split(',')
         .map((b) => b.trim())
         .filter((b) => b.length > 0);
-      const keys = [`${desc}|${m.batch}`, ...tokens.map((t) => `${desc}|${t}`)];
-      for (const key of keys) {
-        if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
-      }
+      matEntries.push({ desc, batchTokens: [...batchTokens, normaliseDesc(m.batch ?? '')], code: m.material });
     }
+
+    // Resolve a PDF row (description, batch) to a real SAP code. The PDF
+    // description is sometimes TRUNCATED relative to the Material row's (e.g.
+    // "…SPDR" vs "…SPDR-P"), so match on description PREFIX in either direction
+    // then require the batch token to match. Only a unique match wins.
+    const resolveCode = (rawDesc: string, rawBatch: string): string | undefined => {
+      const d = normaliseDesc(rawDesc);
+      const b = rawBatch.trim();
+      const hits = new Set<string>();
+      for (const e of matEntries) {
+        const descMatch = e.desc === d || e.desc.startsWith(d) || d.startsWith(e.desc);
+        if (descMatch && e.batchTokens.includes(b)) hits.add(e.code);
+      }
+      return hits.size === 1 ? [...hits][0] : undefined;
+    };
 
     // Build the set of (material, batch) the regenerated PDF reports.
     const keptKeys = new Set<string>();
     for (const item of parsed.items) {
-      const lookupKey = `${normaliseDesc(item.description)}|${item.batch.trim()}`;
-      const realMaterialCode = codeByDescBatch.get(lookupKey);
+      const realMaterialCode = resolveCode(item.description, item.batch);
       const materialForLsi = realMaterialCode ?? item.material;
       if (!realMaterialCode) {
         console.warn(

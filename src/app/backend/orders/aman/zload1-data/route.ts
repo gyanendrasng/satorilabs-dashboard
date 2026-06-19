@@ -248,35 +248,44 @@ export async function POST(request: Request) {
         where: { salesOrderId: salesOrder.id },
         select: { material: true, materialDescription: true, batch: true },
       });
-      const codeByDescBatch = new Map<string, string>();
+      // Index each Material row by (normalised description, batch token). A
+      // multi-batch material stores its batches as one comma-joined string
+      // ("RP08, B01"), but the LS PDF prints one physical row PER batch — so
+      // we index every individual batch token (plus the joined string) so a
+      // per-batch PDF row resolves to the real code instead of falling back
+      // to the family prefix and creating a mangled LSI per batch.
+      const matEntries: Array<{ desc: string; batchTokens: string[]; code: string }> = [];
       for (const m of soMaterials) {
         if (!m.materialDescription) continue;
         const desc = normaliseDesc(m.materialDescription);
-        // A multi-batch material stores its batches as one comma-joined string
-        // ("RP08, B01"), but the LS PDF prints one physical row PER batch. So
-        // index every individual batch token against the real code — otherwise
-        // the per-batch PDF row ("…|RP08") never matches the joined Material
-        // row ("…|RP08, B01") and falls back to the family prefix, creating a
-        // mangled LSI per batch. Also index the whole string as a fallback.
-        const tokens = String(m.batch ?? '')
+        const batchTokens = String(m.batch ?? '')
           .split(',')
           .map((b) => b.trim())
           .filter((b) => b.length > 0);
-        const keys = [`${desc}|${m.batch}`, ...tokens.map((t) => `${desc}|${t}`)];
-        for (const key of keys) {
-          // First write wins; if visibility-data ever has duplicates for the
-          // same (desc, batch) we log on read miss anyway.
-          if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
-        }
+        matEntries.push({ desc, batchTokens: [...batchTokens, normaliseDesc(m.batch ?? '')], code: m.material });
       }
 
+      // Resolve a PDF row (description, batch) to a real SAP code. The PDF
+      // description is sometimes TRUNCATED relative to the Material row's
+      // (e.g. "…SPDR" vs "…SPDR-P"), so we match on description PREFIX in
+      // either direction, then require the batch token to match. Only a unique
+      // match wins; ambiguous matches return undefined and fall back below.
+      const resolveCode = (rawDesc: string, rawBatch: string): string | undefined => {
+        const d = normaliseDesc(rawDesc);
+        const b = rawBatch.trim();
+        const hits = new Set<string>();
+        for (const e of matEntries) {
+          const descMatch = e.desc === d || e.desc.startsWith(d) || d.startsWith(e.desc);
+          if (descMatch && e.batchTokens.includes(b)) hits.add(e.code);
+        }
+        return hits.size === 1 ? [...hits][0] : undefined;
+      };
+
       for (const item of parsed.items) {
-        // Look up the real SAP code by (description, batch). If the SO's
-        // Material rows don't carry this (desc, batch) pair, fall back to
-        // the PDF's family prefix and log — that's a recoverable miss but
-        // worth attention.
-        const lookupKey = `${normaliseDesc(item.description)}|${item.batch.trim()}`;
-        const realMaterialCode = codeByDescBatch.get(lookupKey);
+        // Look up the real SAP code by (description, batch). If no unique
+        // Material row matches, fall back to the PDF's family prefix and log —
+        // that's a recoverable miss but worth attention.
+        const realMaterialCode = resolveCode(item.description, item.batch);
 
         const materialForLsi = realMaterialCode ?? item.material;
         if (!realMaterialCode) {
