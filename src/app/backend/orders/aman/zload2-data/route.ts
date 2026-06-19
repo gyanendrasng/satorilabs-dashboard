@@ -178,14 +178,26 @@ export async function POST(request: Request) {
     const codeByDescBatch = new Map<string, string>();
     for (const m of soMaterials) {
       if (!m.materialDescription) continue;
-      const key = `${normaliseDesc(m.materialDescription)}|${m.batch}`;
-      if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
+      const desc = normaliseDesc(m.materialDescription);
+      // A multi-batch material stores its batches as one comma-joined string
+      // ("RP08, B01"), but the LS PDF prints one physical row PER batch. Index
+      // every individual batch token (plus the joined string as a fallback) so
+      // a per-batch PDF row resolves to the real code instead of falling back
+      // to the family prefix.
+      const tokens = String(m.batch ?? '')
+        .split(',')
+        .map((b) => b.trim())
+        .filter((b) => b.length > 0);
+      const keys = [`${desc}|${m.batch}`, ...tokens.map((t) => `${desc}|${t}`)];
+      for (const key of keys) {
+        if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
+      }
     }
 
     // Build the set of (material, batch) the regenerated PDF reports.
     const keptKeys = new Set<string>();
     for (const item of parsed.items) {
-      const lookupKey = `${normaliseDesc(item.description)}|${item.batch}`;
+      const lookupKey = `${normaliseDesc(item.description)}|${item.batch.trim()}`;
       const realMaterialCode = codeByDescBatch.get(lookupKey);
       const materialForLsi = realMaterialCode ?? item.material;
       if (!realMaterialCode) {

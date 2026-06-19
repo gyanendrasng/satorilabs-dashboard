@@ -251,10 +251,23 @@ export async function POST(request: Request) {
       const codeByDescBatch = new Map<string, string>();
       for (const m of soMaterials) {
         if (!m.materialDescription) continue;
-        const key = `${normaliseDesc(m.materialDescription)}|${m.batch}`;
-        // First write wins; if visibility-data ever has duplicates for the
-        // same (desc, batch) we log on read miss anyway.
-        if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
+        const desc = normaliseDesc(m.materialDescription);
+        // A multi-batch material stores its batches as one comma-joined string
+        // ("RP08, B01"), but the LS PDF prints one physical row PER batch. So
+        // index every individual batch token against the real code — otherwise
+        // the per-batch PDF row ("…|RP08") never matches the joined Material
+        // row ("…|RP08, B01") and falls back to the family prefix, creating a
+        // mangled LSI per batch. Also index the whole string as a fallback.
+        const tokens = String(m.batch ?? '')
+          .split(',')
+          .map((b) => b.trim())
+          .filter((b) => b.length > 0);
+        const keys = [`${desc}|${m.batch}`, ...tokens.map((t) => `${desc}|${t}`)];
+        for (const key of keys) {
+          // First write wins; if visibility-data ever has duplicates for the
+          // same (desc, batch) we log on read miss anyway.
+          if (!codeByDescBatch.has(key)) codeByDescBatch.set(key, m.material);
+        }
       }
 
       for (const item of parsed.items) {
@@ -262,7 +275,7 @@ export async function POST(request: Request) {
         // Material rows don't carry this (desc, batch) pair, fall back to
         // the PDF's family prefix and log — that's a recoverable miss but
         // worth attention.
-        const lookupKey = `${normaliseDesc(item.description)}|${item.batch}`;
+        const lookupKey = `${normaliseDesc(item.description)}|${item.batch.trim()}`;
         const realMaterialCode = codeByDescBatch.get(lookupKey);
 
         const materialForLsi = realMaterialCode ?? item.material;
