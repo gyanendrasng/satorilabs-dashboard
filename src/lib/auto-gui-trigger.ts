@@ -436,8 +436,19 @@ export async function sendVehicleDetailsForBundle(
   // Flatten LSIs across all LSs in the bundle (a bundle can hold ≥1 LS
   // when its SKUs come from multiple plants). Fall back to Material rows
   // when ZLOAD1 hasn't fired yet.
+  // One line per (SO, LS, material) — collapse the per-batch LSI rows of a
+  // multi-batch material into a single line. Batch is intentionally NOT shown
+  // in the vehicle-details email, so two LSIs that differ only by batch would
+  // otherwise render as duplicate lines.
+  const seenMatLines = new Set<string>();
   const lsiLines = bundle.loadingSlips.flatMap((ls) =>
-    ls.items.map((it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`)
+    ls.items
+      .map((it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`)
+      .filter((line) => {
+        if (seenMatLines.has(line)) return false;
+        seenMatLines.add(line);
+        return true;
+      })
   );
   const lsLines = lsiLines.length > 0
     ? lsiLines.join('\n')
@@ -629,10 +640,17 @@ export async function sendCombinedVehicleDetailsEmailForPo(
   const bundleBlocks: string[] = [];
   for (const bundle of po.bundles) {
     const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
+    // One line per (SO, LS, material) — collapse the per-batch LSI rows of a
+    // multi-batch material (batch is not shown in the vehicle-details email).
+    const seenMatLines = new Set<string>();
     const lsiLines = bundle.loadingSlips.flatMap((ls) =>
-      ls.items.map(
-        (it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`
-      )
+      ls.items
+        .map((it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`)
+        .filter((line) => {
+          if (seenMatLines.has(line)) return false;
+          seenMatLines.add(line);
+          return true;
+        })
     );
     const lsLines = lsiLines.length > 0
       ? lsiLines.join('\n')
