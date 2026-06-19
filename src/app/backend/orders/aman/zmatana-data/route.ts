@@ -2,37 +2,48 @@ import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getProduct } from '@/lib/product-db';
 
-interface ZmatanaPayload {
-  work_id?: string;
-  so_number?: string;
-  soNumber?: string;
-  /** The material code ZMatana was run for. */
+/** One material row in a LONE-ZMATANA response. Mirrors the visibility-data
+ *  material shape. */
+interface ZmatanaMaterial {
   material?: string;
   material_code?: string;
+  material_description?: string | null;
   /** Batch returned by SAP for this material on this SO. */
   batch?: string;
   batch_number?: string;
+  /** Quantity SAP read off the SO line for this material (optional). */
+  order_quantity?: number | null;
   /** Per-SO availability, equivalent to the visibility-data shape. */
   available_stock_for_so?: number | null;
-  /** Optional weight (kg) if SAP returns it for the substitute material. */
+  /** Optional weight (kg) if SAP returns it. */
   order_weight_kg?: number | null;
+}
+
+interface ZmatanaPayload extends ZmatanaMaterial {
+  work_id?: string;
+  so_number?: string;
+  soNumber?: string;
+  /** Multi-material response (preferred): one LONE-ZMATANA run carries every
+   *  requested material, mirroring ZSO-VISIBILITY. The top-level single-material
+   *  fields above remain accepted for backward compatibility. */
+  materials?: ZmatanaMaterial[];
 }
 
 /**
  * POST /backend/orders/aman/zmatana-data
  *
- * Callback for the standalone ZMatana SAP transaction (`ZMATANA_LONE`).
- * Triggered by the planner's `lone_zmatana` step after stock_precheck
- * substituted a short material with a cross-plant equivalent and VA02 swapped
- * the SO line in SAP.
+ * Callback for the standalone ZMatana SAP transaction (`LONE-ZMATANA`).
+ * Triggered by the planner's `lone_zmatana` step to fetch the batch + per-SO
+ * availability of materials whose quantity just changed (post-plant_ls
+ * increase) or that VA02 swapped (cross-plant substitution).
  *
- * Single-material payload. Upserts one Material row keyed on
- * (salesOrderId, material, batch) — sets `availableStock` (and weight if
- * present), pulls `materialDescription` from the product DB.
+ * Accepts a multi-material `materials[]` array (one LONE-ZMATANA run reports
+ * every requested material, mirroring ZSO-VISIBILITY) and, for backward
+ * compatibility, the legacy single-material top-level shape. Upserts one
+ * Material row per (salesOrderId, material) — sets `availableStock` + batch
+ * (and weight if present), pulls `materialDescription` from the product DB.
  *
- * Mirrors visibility-data's per-row upsert pattern but does not assemble any
- * email; the planner's next step (typically `email_2nd_release`) handles
- * notifying the plant.
+ * Does not assemble any email; the planner's next step handles notification.
  */
 export async function POST(request: Request) {
   try {
@@ -51,15 +62,17 @@ export async function POST(request: Request) {
     }
 
     const soNumber = body.so_number || body.soNumber;
-    const materialCode = body.material || body.material_code;
-    const batchRaw = body.batch || body.batch_number || '';
-    const batch = batchRaw || 'N/A';
 
-    if (!soNumber || !materialCode) {
-      return NextResponse.json(
-        { error: 'so_number and material are required' },
-        { status: 400 },
-      );
+    // Normalize to a material list. Preferred: a `materials[]` array (one
+    // LONE-ZMATANA run reports every requested material). Fallback: the legacy
+    // single-material top-level fields.
+    const rawMaterials: ZmatanaMaterial[] =
+      Array.isArray(body.materials) && body.materials.length > 0
+        ? body.materials
+        : [body];
+
+    if (!soNumber) {
+      return NextResponse.json({ error: 'so_number is required' }, { status: 400 });
     }
 
     const salesOrder = await prisma.salesOrder.findFirst({
@@ -74,43 +87,63 @@ export async function POST(request: Request) {
       );
     }
 
-    // Pull a description from the product DB so the dispatch email reads
-    // cleanly. Falls back to null when the substitute isn't in the static DB
-    // (rare — every code in the JSON corresponds to a real plant SKU).
-    const product = getProduct(materialCode);
-    const materialDescription = product?.material_description ?? null;
+    // Upsert one Material row per material in the response.
+    const summaries: string[] = [];
+    let persisted = 0;
+    for (const m of rawMaterials) {
+      const materialCode = m.material || m.material_code;
+      if (!materialCode) {
+        console.warn(`[ZmatanaData] Skipping material row missing code:`, m);
+        continue;
+      }
+      const batch = (m.batch || m.batch_number || '') || 'N/A';
 
-    // We intentionally do NOT touch orderQuantity here — VA02 set the desired
-    // qty when it swapped the SO line; ZMatana only fetches batch + free stock.
-    await prisma.material.upsert({
-      where: {
-        salesOrderId_material: {
+      // Description from the product DB; payload value wins when SAP supplies
+      // one, else fall back to the static DB (null when neither has it).
+      const product = getProduct(materialCode);
+      const materialDescription =
+        m.material_description ?? product?.material_description ?? null;
+
+      // We do NOT touch orderQuantity on update — VA02 owns the SO line qty;
+      // LONE-ZMATANA only fetches batch + free stock. `batch` IS updated:
+      // SAP may report a reordered / augmented batch string for a material we
+      // already have a row for. One row per (SO, material).
+      await prisma.material.upsert({
+        where: {
+          salesOrderId_material: {
+            salesOrderId: salesOrder.id,
+            material: materialCode,
+          },
+        },
+        update: {
+          materialDescription,
+          batch,
+          availableStock: m.available_stock_for_so ?? null,
+          ...(m.order_weight_kg != null ? { orderWeightKg: m.order_weight_kg } : {}),
+        },
+        create: {
           salesOrderId: salesOrder.id,
           material: materialCode,
+          materialDescription,
+          batch,
+          // Only hit when SAP reports a material with no prior row on this SO.
+          orderQuantity: m.order_quantity ?? 0,
+          availableStock: m.available_stock_for_so ?? null,
+          orderWeightKg: m.order_weight_kg ?? null,
         },
-      },
-      // `batch` is updated too: ZMatana may report a different (reordered /
-      // augmented) batch string for a material we already have a row for.
-      // One row per (SO, material) — overwrite the batch field with the
-      // latest. orderQuantity is left untouched on update (VA02 owns it).
-      update: {
-        materialDescription,
-        batch,
-        availableStock: body.available_stock_for_so ?? null,
-        ...(body.order_weight_kg != null ? { orderWeightKg: body.order_weight_kg } : {}),
-      },
-      create: {
-        salesOrderId: salesOrder.id,
-        material: materialCode,
-        materialDescription,
-        batch,
-        orderQuantity: 0, // Only hit when ZMatana returns a material with no prior row on this SO at all.
-        availableStock: body.available_stock_for_so ?? null,
-        orderWeightKg: body.order_weight_kg ?? null,
-      },
-    });
+      });
+      persisted++;
+      summaries.push(`${materialCode} batch=${batch} avail=${m.available_stock_for_so ?? '?'}`);
+    }
+
+    if (persisted === 0) {
+      return NextResponse.json(
+        { error: 'no material rows with a material code in payload' },
+        { status: 400 },
+      );
+    }
     console.log(
-      `[ZmatanaData] Upserted Material(${materialCode}, batch=${batch}, avail=${body.available_stock_for_so ?? '?'}) for SO ${soNumber}`,
+      `[ZmatanaData] Upserted ${persisted} Material row(s) for SO ${soNumber}: ${summaries.join('; ')}`,
     );
 
     // Live-update Bundle.totalWeightKg for any bundle that holds Material
@@ -140,11 +173,15 @@ export async function POST(request: Request) {
           kind: 'lone_zmatana',
           scenario_key: 'planner',
           sap_output: {
-            material: materialCode,
-            batch,
-            available: body.available_stock_for_so,
+            materials: rawMaterials
+              .filter((m) => m.material || m.material_code)
+              .map((m) => ({
+                material: m.material ?? m.material_code,
+                batch: (m.batch || m.batch_number || '') || 'N/A',
+                available: m.available_stock_for_so,
+              })),
           },
-          summary: `${materialCode} batch=${batch} avail=${body.available_stock_for_so ?? '?'}`,
+          summary: summaries.join('; '),
         },
       });
     } catch {
@@ -175,8 +212,8 @@ export async function POST(request: Request) {
     return NextResponse.json({
       success: true,
       so_number: soNumber,
-      material: materialCode,
-      batch,
+      persisted,
+      materials: summaries,
     });
   } catch (error) {
     const errMsg = error instanceof Error ? error.message : String(error);

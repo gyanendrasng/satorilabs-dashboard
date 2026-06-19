@@ -1779,60 +1779,63 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
  * that re-syncs the entire SO and would reset state we've intentionally
  * changed.
  *
- * Enqueues ONE WorkQueue row per material. The auto_gui2 endpoint for the
- * `ZMATANA_LONE` transaction is a parallel work item on the SAP-automation
- * side; on success it POSTs to /backend/orders/aman/zmatana-data with the
- * material's batch + available_stock_for_so.
+ * Enqueues ONE WorkQueue row carrying the full material list. The auto_gui2
+ * endpoint for the `LONE-ZMATANA` transaction runs the SO + materials in a
+ * single pass and POSTs back to /backend/orders/aman/zmatana-data with a
+ * `materials[]` array (batch + available_stock_for_so per material), mirroring
+ * the ZSO-VISIBILITY response shape.
  */
 export async function triggerLoneZmatana(
   soNumber: string,
   materialCodes: string[],
 ): Promise<void> {
   if (materialCodes.length === 0) {
-    console.log(`[ZMATANA_LONE] No materials provided for SO ${soNumber} — skipping`);
+    console.log(`[LONE-ZMATANA] No materials provided for SO ${soNumber} — skipping`);
     return;
   }
-  const normalized = Array.from(new Set(materialCodes));
+  // Sort so the dedup key is stable regardless of caller ordering.
+  const normalized = Array.from(new Set(materialCodes)).sort();
   const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
 
-  for (const material of normalized) {
-    // Dedup on (soNumber, material) — calling triggerLoneZmatana twice within
-    // a single flow for the same material is a no-op for already-queued or
-    // in-flight rows.
-    const existing = await prisma.workQueue.findFirst({
-      where: {
-        step: 'lone_zmatana',
-        state: { in: ['queued', 'firing', 'done'] },
-        AND: [
-          { payload: { contains: `"transaction_code":"ZMATANA_LONE"` } },
-          { payload: { contains: `"so_number":"${soNumber}"` } },
-          { payload: { contains: `"material":"${material}"` } },
-        ],
-      },
-      select: { id: true, state: true },
-    });
-    if (existing) {
-      console.log(`[ZMATANA_LONE] Already exists for SO ${soNumber} material ${material} (${existing.state}) — skipping`);
-      continue;
-    }
-
-    await enqueueWork({
-      salesOrderId: so?.id ?? null,
+  // Dedup on (soNumber, sorted-material-set) — calling triggerLoneZmatana twice
+  // within a single flow for the same SO + materials is a no-op for an
+  // already-queued / in-flight / done row.
+  const materialsKey = normalized.join(',');
+  const existing = await prisma.workQueue.findFirst({
+    where: {
       step: 'lone_zmatana',
-      payload: {
-        instruction:
-          `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
-          `Transaction ZMATANA for Sales Order number ${soNumber}, material ${material}.`,
-        transaction_code: 'ZMATANA_LONE',
-        meta: {
-          so_number: soNumber,
-          material,
-        },
-      },
-    });
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"LONE-ZMATANA"` } },
+        { payload: { contains: `"so_number":"${soNumber}"` } },
+        { payload: { contains: `"materials_key":"${materialsKey}"` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(`[LONE-ZMATANA] Already exists for SO ${soNumber} materials [${materialsKey}] (${existing.state}) — skipping`);
+    return;
   }
+
+  const materialList = normalized.join(', ');
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'lone_zmatana',
+    payload: {
+      instruction:
+        `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+        `Transaction LONE-ZMATANA for Sales Order number ${soNumber} for material ${materialList}.`,
+      transaction_code: 'LONE-ZMATANA',
+      meta: {
+        so_number: soNumber,
+        materials: normalized,
+        materials_key: materialsKey,
+      },
+    },
+  });
   await pumpQueue();
-  console.log(`[ZMATANA_LONE] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${normalized.join(', ')})`);
+  console.log(`[LONE-ZMATANA] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${materialList})`);
 }
 
 /**
