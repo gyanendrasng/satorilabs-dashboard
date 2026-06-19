@@ -218,7 +218,13 @@ export default function WorkV2Page() {
         const log: LogEntry = JSON.parse(event.data);
         setLogs((prev) => {
           const next = [...prev, log];
-          return next.length > 500 ? next.slice(-500) : next;
+          // Only trim old entries off the top while the user is pinned to the
+          // bottom (auto-scroll on). When they've scrolled up to read, trimming
+          // would shift content out from under them — so we let the list grow
+          // and trim later, once they scroll back down. HARD_CAP keeps it from
+          // growing without bound if they stay scrolled up indefinitely.
+          const limit = autoScrollRef.current ? 500 : 5000;
+          return next.length > limit ? next.slice(-limit) : next;
         });
         // If the user has scrolled up (auto-scroll paused), surface a
         // "new logs" affordance instead of yanking the view down.
@@ -239,6 +245,10 @@ export default function WorkV2Page() {
   // Guard the scroll so the onScroll handler doesn't read it as a user scroll.
   useEffect(() => {
     if (!autoScroll) return;
+    // Re-pinned to the bottom: reclaim any overflow we allowed to accumulate
+    // while scrolled up. Trimming here is invisible because we're at the
+    // bottom and about to jump to the bottom anyway.
+    setLogs((prev) => (prev.length > 500 ? prev.slice(-500) : prev));
     const el = logContainerRef.current;
     if (!el) return;
     programmaticScrollRef.current = true;
@@ -1332,8 +1342,8 @@ export default function WorkV2Page() {
         {/* Agent Screen Tab */}
         {activeTab === 'screen' && (
           <div
-            className="s-panel overflow-hidden"
-            style={{ minHeight: 'calc(100vh - 340px)' }}
+            className="s-panel overflow-hidden flex flex-col"
+            style={{ height: 'calc(100vh - 160px)' }}
           >
             <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-700">
               <div className="flex items-center gap-3">
@@ -1429,31 +1439,30 @@ export default function WorkV2Page() {
             )}
 
             {activeScreen && showVmScreen && (
-              <div className="p-6 bg-slate-900 overflow-auto">
+              // Flex-fills the panel; never scrolls. The frame clips, and the
+              // image is contained within it. Zoom scales the image in place
+              // (clipping at the edges) rather than growing the layout.
+              <div className="flex-1 min-h-0 p-4 bg-slate-900">
                 <div
-                  className="bg-slate-800 rounded-lg overflow-hidden ring-1 ring-slate-700 shadow-2xl mx-auto transition-transform"
-                  style={{
-                    transform: `scale(${screenZoom / 100})`,
-                    transformOrigin: 'top center',
-                    maxWidth: '1400px',
-                  }}
+                  className="relative w-full h-full rounded-lg overflow-hidden ring-1 ring-slate-700 shadow-2xl flex items-center justify-center"
+                  style={{ background: '#000' }}
                 >
-                  <div style={{ position: 'relative', width: '100%', height: '650px', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}>
-                    <img
-                      ref={agentImgRef}
-                      alt={activeScreen.label}
-                      style={{ maxWidth: '100%', maxHeight: '100%', userSelect: 'none', pointerEvents: 'none' }}
-                    />
-                    <div style={{ position: 'absolute', top: 10, left: 10, background: 'rgba(0,0,0,0.7)', padding: '4px 10px', borderRadius: 6, fontSize: 12, color: '#ddd' }}>
-                      {agentStatus === 'live' && agentFps != null ? `live · ${agentFps} fps` : agentStatus}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-4 flex items-center justify-center gap-3 text-sm text-slate-400">
-                  <div className="flex items-center gap-2">
-                    <div className="w-2 h-2 bg-cyan-500 rounded-full animate-pulse"></div>
-                    <span>{activeScreen.label} — live agent view</span>
+                  <img
+                    ref={agentImgRef}
+                    alt={activeScreen.label}
+                    className="transition-transform"
+                    style={{
+                      maxWidth: '100%',
+                      maxHeight: '100%',
+                      objectFit: 'contain',
+                      transform: `scale(${screenZoom / 100})`,
+                      transformOrigin: 'center center',
+                      userSelect: 'none',
+                      pointerEvents: 'none',
+                    }}
+                  />
+                  <div style={{ position: 'absolute', top: 10, left: 10, background: 'rgba(0,0,0,0.7)', padding: '4px 10px', borderRadius: 6, fontSize: 12, color: '#ddd' }}>
+                    {agentStatus === 'live' && agentFps != null ? `live · ${agentFps} fps` : agentStatus}
                   </div>
                 </div>
               </div>
