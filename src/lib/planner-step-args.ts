@@ -91,7 +91,14 @@ export function coerceVa02Args(step: PlannedStep | undefined): Va02Item[] {
 // ─── zload1 (append mode) ──────────────────────────────────────────────────
 
 export interface Zload1AppendArgs {
-  appendToBundleId: string;
+  /**
+   * Existing bundle to append the new LS to. Undefined when `createNewBundle`
+   * is true — the engine creates a fresh bundle (extra vehicle) and appends to
+   * it (LS-created "preserve" overflow path).
+   */
+  appendToBundleId?: string;
+  /** Append onto a BRAND-NEW bundle the engine creates at execution time. */
+  createNewBundle?: boolean;
   materials: Array<{ code: string; batch?: string; qty: number }>;
 }
 
@@ -99,14 +106,21 @@ export interface Zload1AppendArgs {
  * Returns the append-mode args when the planner supplied them, otherwise null
  * (initial mode — no args, fan-out from computed bundles). Throws if the
  * planner emitted a partial / malformed append payload.
+ *
+ * Two append shapes:
+ *   - { appendToBundleId, materials }       → append to an existing bundle.
+ *   - { createNewBundle: true, materials }  → create a new bundle, then append.
  */
 export function coerceZload1AppendArgs(step: PlannedStep | undefined): Zload1AppendArgs | null {
   const raw = step?.args;
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
-  if (r.appendToBundleId === undefined && r.materials === undefined) return null;
+  if (r.appendToBundleId === undefined && r.materials === undefined && r.createNewBundle === undefined) return null;
 
-  const appendToBundleId = asString(r.appendToBundleId, 'appendToBundleId', 'zload1');
+  const createNewBundle = r.createNewBundle === true;
+  const appendToBundleId = createNewBundle
+    ? undefined
+    : asString(r.appendToBundleId, 'appendToBundleId', 'zload1');
   const materials = requireArray(r.materials, 'materials', 'zload1').map((m, i) => {
     const item = m as Record<string, unknown>;
     const code = asString(item.code, `materials[${i}].code`, 'zload1');
@@ -117,7 +131,7 @@ export function coerceZload1AppendArgs(step: PlannedStep | undefined): Zload1App
     }
     return { code, batch, qty };
   });
-  return { appendToBundleId, materials };
+  return { appendToBundleId, createNewBundle, materials };
 }
 
 // ─── bundle_capacity_assessment ────────────────────────────────────────────
@@ -128,10 +142,21 @@ export interface BundleCapacityAssessmentItem {
   deltaKg: number;
 }
 
-export function coerceBundleCapacityArgs(step: PlannedStep | undefined): BundleCapacityAssessmentItem[] {
+export interface BundleCapacityAssessmentArgs {
+  items: BundleCapacityAssessmentItem[];
+  /**
+   * How overflow (kg that doesn't fit existing bundles) resolves:
+   *   'new_so'     (default) — post-plant_ls: overflow → branch raises a new SO.
+   *   'new_bundle' — LS-created "preserve" path: overflow → extra vehicle
+   *                  (new bundle) on the same PO. Set via args.overflowMode.
+   */
+  overflowMode: 'new_so' | 'new_bundle';
+}
+
+export function coerceBundleCapacityArgs(step: PlannedStep | undefined): BundleCapacityAssessmentArgs {
   const args = requireArgs(step, 'bundle_capacity_assessment');
-  const items = requireArray(args.items, 'items', 'bundle_capacity_assessment');
-  return items.map((raw, i) => {
+  const rawItems = requireArray(args.items, 'items', 'bundle_capacity_assessment');
+  const items = rawItems.map((raw, i) => {
     const it = raw as Record<string, unknown>;
     const material = asString(it.material, `items[${i}].material`, 'bundle_capacity_assessment');
     if (typeof it.deltaKg !== 'number' || !Number.isFinite(it.deltaKg) || it.deltaKg <= 0) {
@@ -141,6 +166,8 @@ export function coerceBundleCapacityArgs(step: PlannedStep | undefined): BundleC
     }
     return { material, deltaKg: it.deltaKg };
   });
+  const overflowMode = args.overflowMode === 'new_bundle' ? 'new_bundle' : 'new_so';
+  return { items, overflowMode };
 }
 
 // ─── email_branch_request_new_so ───────────────────────────────────────────
@@ -173,10 +200,21 @@ export interface BranchOverflowItem {
   overflowKg: number;
 }
 
-export function coerceBranchOverflowArgs(step: PlannedStep | undefined): BranchOverflowItem[] {
+export interface BranchOverflowArgs {
+  items: BranchOverflowItem[];
+  /**
+   * How the overflow resolves once the branch confirms:
+   *   'new_so'     (default) — branch raises a fresh SO (post-plant_ls flow).
+   *   'new_bundle' — we add an extra vehicle on the same PO (LS-created
+   *                  "preserve" flow). Set by the planner via args.resolution.
+   */
+  resolution: 'new_so' | 'new_bundle';
+}
+
+export function coerceBranchOverflowArgs(step: PlannedStep | undefined): BranchOverflowArgs {
   const args = requireArgs(step, 'email_branch_overflow_request');
-  const items = requireArray(args.items, 'items', 'email_branch_overflow_request');
-  return items.map((raw, i) => {
+  const rawItems = requireArray(args.items, 'items', 'email_branch_overflow_request');
+  const items = rawItems.map((raw, i) => {
     const it = raw as Record<string, unknown>;
     const material = asString(it.material, `items[${i}].material`, 'email_branch_overflow_request');
     if (typeof it.placedKg !== 'number' || !Number.isFinite(it.placedKg) || it.placedKg < 0) {
@@ -191,6 +229,8 @@ export function coerceBranchOverflowArgs(step: PlannedStep | undefined): BranchO
     }
     return { material, placedKg: it.placedKg, overflowKg: it.overflowKg };
   });
+  const resolution = args.resolution === 'new_bundle' ? 'new_bundle' : 'new_so';
+  return { items, resolution };
 }
 
 // ─── lone_zmatana ──────────────────────────────────────────────────────────

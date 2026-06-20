@@ -21,10 +21,28 @@ export type Substitution = {
   substituteAvailable: number;
 };
 
+/**
+ * Per-material availability verdict for an increase line, independent of the
+ * substitution decision. Surfaces the THREE-WAY distinction the LS-created
+ * "don't preserve" flow (path [A], A1/A2/A3) needs:
+ *   - 'fully'   → available >= requested (covered at the SO's own plant)
+ *   - 'partial' → 0 < available < requested
+ *   - 'none'    → available == 0
+ * `available` here is free stock at the SO's OWN plant only (pre-substitution);
+ * a material can be `partial`/`none` here yet still resolve via a cross-plant
+ * substitute, which is reflected separately in `outcome: 'substituted'`.
+ */
+export type PerMaterialVerdict = {
+  material: string;
+  requested: number;
+  available: number;
+  verdict: 'fully' | 'partial' | 'none';
+};
+
 export type StockPrecheckResult =
-  | { outcome: 'sufficient' }
-  | { outcome: 'substituted'; substitutions: Substitution[] }
-  | { outcome: 'short'; shortages: StockShortage[]; plant: string; substitutions?: Substitution[] }
+  | { outcome: 'sufficient'; perMaterial: PerMaterialVerdict[] }
+  | { outcome: 'substituted'; substitutions: Substitution[]; perMaterial: PerMaterialVerdict[] }
+  | { outcome: 'short'; shortages: StockShortage[]; plant: string; substitutions?: Substitution[]; perMaterial: PerMaterialVerdict[] }
   | { outcome: 'plant_unknown' };
 
 /**
@@ -121,10 +139,14 @@ export async function runStockPrecheck(args: {
   const increases = (args.classification.materials ?? []).filter(
     (m) => m.operation === 'inc',
   );
-  if (increases.length === 0) return { outcome: 'sufficient' };
+  if (increases.length === 0) return { outcome: 'sufficient', perMaterial: [] };
 
   const shortages: StockShortage[] = [];
   const substitutions: Substitution[] = [];
+  // Three-way availability at the SO's OWN plant, computed for every increase
+  // line regardless of how the outcome resolves (substitution etc.). Consumed
+  // by the LS-created "don't preserve" path to drive the A1/A2/A3 branch.
+  const perMaterial: PerMaterialVerdict[] = [];
 
   for (const m of increases) {
     const snap = await prisma.inventorySnapshot.findUnique({
@@ -132,6 +154,12 @@ export async function runStockPrecheck(args: {
       select: { freeStock: true },
     });
     const available = snap?.freeStock ?? 0;
+    perMaterial.push({
+      material: m.material_code,
+      requested: m.quantity,
+      available,
+      verdict: available >= m.quantity ? 'fully' : available > 0 ? 'partial' : 'none',
+    });
     if (available >= m.quantity) continue;
 
     // Short at the SO's plant. Try cross-plant substitution before giving up.
@@ -147,12 +175,12 @@ export async function runStockPrecheck(args: {
   }
 
   if (shortages.length === 0 && substitutions.length === 0) {
-    return { outcome: 'sufficient' };
+    return { outcome: 'sufficient', perMaterial };
   }
   if (shortages.length === 0) {
-    return { outcome: 'substituted', substitutions };
+    return { outcome: 'substituted', substitutions, perMaterial };
   }
   // Mixed result: some lines substituted, others still short. Engine fires VA02
   // for the substitutions AND emails the branch about the remaining gap.
-  return { outcome: 'short', shortages, plant, substitutions: substitutions.length > 0 ? substitutions : undefined };
+  return { outcome: 'short', shortages, plant, substitutions: substitutions.length > 0 ? substitutions : undefined, perMaterial };
 }

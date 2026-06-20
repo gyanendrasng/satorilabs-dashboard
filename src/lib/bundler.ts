@@ -647,3 +647,41 @@ export async function previewBundlesForPo(purchaseOrderId: string): Promise<Bund
  * /backend/orders/aman/zload1-data when SAP returns the LS PDF. No
  * post-hoc linking step is needed.
  */
+
+/**
+ * Create exactly ONE new Bundle on a PO without touching any existing bundle.
+ *
+ * Used by the post-LS overflow path (Rule 6e "preserve" flow): when an
+ * increase doesn't fit in any existing bundle, we add an extra vehicle rather
+ * than wipe-and-re-bundle (which `wipeAndCommit` does) or ask for a new SO.
+ * Bundles are frozen for COMPOSITION, but appending a brand-new bundle + its
+ * own loading slip is additive and safe — it never migrates an existing LS.
+ *
+ * `bundleNumber` is the next sequential value for the PO (max + 1), satisfying
+ * the `@@unique([purchaseOrderId, bundleNumber])` constraint. The new bundle
+ * starts at `totalWeightKg: 0`; the ZLOAD1-append callback recomputes it once
+ * the LS PDF lands. Capacity is per-PO (`PurchaseOrder.weightage`), so the new
+ * bundle implicitly inherits the same vehicle capacity as its siblings.
+ *
+ * Caller is responsible for linking the overflow Material(s) to the returned
+ * bundle (set `Material.bundleId`) BEFORE firing the ZLOAD1-append, because
+ * the zload1-data callback requires the target bundle to already exist.
+ */
+export async function createSingleBundleForPo(
+  purchaseOrderId: string,
+): Promise<{ bundleId: string; bundleNumber: number }> {
+  const highest = await prisma.bundle.findFirst({
+    where: { purchaseOrderId },
+    select: { bundleNumber: true },
+    orderBy: { bundleNumber: 'desc' },
+  });
+  const bundleNumber = (highest?.bundleNumber ?? 0) + 1;
+  const bundle = await prisma.bundle.create({
+    data: {
+      purchaseOrderId,
+      bundleNumber,
+      totalWeightKg: 0,
+    },
+  });
+  return { bundleId: bundle.id, bundleNumber };
+}

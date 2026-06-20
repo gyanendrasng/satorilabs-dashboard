@@ -895,10 +895,14 @@ function renderDispatchConfirmationBody(args: {
     const heading = pureQtyChange
       ? 'Changes since last plan (quantity adjustments only — loading slips will be updated):'
       : 'Changes since last plan (composition shift — bundles will be re-organised):';
+    const existingBundleCount = bundles.length;
     const diffLines = diff.map((d) => {
       const label = `${d.material} (Batch ${d.batch})`;
       if (d.currentQty === 0 && d.proposedQty > 0) {
-        return `  + ${label}: NEW LINE → ${d.proposedQty} units in Bundle ${d.proposedBundleNumber}`;
+        // A proposed bundle number beyond the existing count means a brand-new
+        // vehicle is being added for this (overflow) line.
+        const newVehicle = d.proposedBundleNumber > existingBundleCount ? ' (new vehicle)' : '';
+        return `  + ${label}: NEW LINE → ${d.proposedQty} units in Bundle ${d.proposedBundleNumber}${newVehicle}`;
       }
       if (d.proposedQty === 0 && d.currentQty > 0) {
         return `  - ${label}: REMOVED (was ${d.currentQty} units in Bundle ${d.currentBundleNumber ?? '?'})`;
@@ -1190,8 +1194,9 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
    */
   allocations: Array<{
     material: string;
-    kind: 'same_bundle' | 'other_bundle';
-    bundleId: string;
+    kind: 'same_bundle' | 'other_bundle' | 'new_bundle';
+    /** Null for `new_bundle` legs — the bundle doesn't exist yet at confirm time. */
+    bundleId: string | null;
     kg: number;
   }>;
   /** Per-material overflow legs that will be sent to a new SO. Optional. */
@@ -1267,7 +1272,7 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
     const batch = md?.batch ?? '';
     const kgPerUnit = md?.kgPerUnit ?? 0;
     const addedUnits = kgPerUnit > 0 ? Math.round(a.kg / kgPerUnit) : 0;
-    const targetBundleNumber = bundleNumberById.get(a.bundleId) ?? 0;
+    const targetBundleNumber = a.bundleId ? (bundleNumberById.get(a.bundleId) ?? 0) : 0;
 
     if (a.kind === 'same_bundle') {
       // The existing LS on this bundle (which already carries `material`) will
@@ -1284,6 +1289,19 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
         proposedQty: currentQty + addedUnits,
         currentBundleNumber: targetBundleNumber,
         proposedBundleNumber: targetBundleNumber,
+      });
+    } else if (a.kind === 'new_bundle') {
+      // Overflow leg routed to a BRAND-NEW bundle (extra vehicle) created in
+      // Phase 3. The bundle doesn't exist yet, so show it as a new line on the
+      // next bundle number (current count + 1) — the renderer annotates numbers
+      // beyond the existing count as "(new vehicle)".
+      diff.push({
+        material: a.material,
+        batch,
+        currentQty: 0,
+        proposedQty: addedUnits,
+        currentBundleNumber: null,
+        proposedBundleNumber: bundlesForEmail.length + 1,
       });
     } else {
       // ZLOAD1-append: a NEW LS will be created on `bundleId` carrying
@@ -1943,20 +1961,34 @@ export async function triggerZloadingClose(
  * call with different quantities fires normally — supports legitimate
  * sequential edits.
  */
+/**
+ * One material line in a VA02 call. Either SET the SO line to an absolute
+ * quantity (used for increases and pending-decrease flushes), or DELETE the SO
+ * line entirely (pending-delete flush). auto_gui2's VA02 automation supports
+ * line deletion when instructed.
+ */
+export type Va02Material =
+  | { material: string; orderQuantity: number }
+  | { material: string; op: 'del' };
+
+function isVa02Delete(m: Va02Material): m is { material: string; op: 'del' } {
+  return 'op' in m && m.op === 'del';
+}
+
 export async function triggerVa02(
   soNumber: string,
-  materials: Array<{ material: string; orderQuantity: number }>
+  materials: Array<Va02Material>
 ): Promise<void> {
   if (materials.length === 0) {
     console.log(`[VA02] No materials provided for SO ${soNumber} — skipping`);
     return;
   }
 
-  const byMaterial = new Map<string, number>();
-  for (const m of materials) byMaterial.set(m.material, m.orderQuantity);
-  const normalized = Array.from(byMaterial.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([material, orderQuantity]) => ({ material, orderQuantity }));
+  // Latest-wins on duplicate codes; sort by code for a stable payload_key.
+  const byMaterial = new Map<string, Va02Material>();
+  for (const m of materials) byMaterial.set(m.material, m);
+  const normalized = Array.from(byMaterial.values())
+    .sort((a, b) => a.material.localeCompare(b.material));
   const payloadKey = JSON.stringify({ soNumber, materials: normalized });
 
   // Dedup is scoped to VA02 via both `step` and a payload substring match on
@@ -1980,7 +2012,11 @@ export async function triggerVa02(
   }
 
   const clauses = normalized
-    .map((m) => `for material ${m.material} set the order quantity to ${m.orderQuantity}`)
+    .map((m) =>
+      isVa02Delete(m)
+        ? `for material ${m.material} delete the order line`
+        : `for material ${m.material} set the order quantity to ${m.orderQuantity}`,
+    )
     .join(', ');
   const clausesSentence = clauses.charAt(0).toUpperCase() + clauses.slice(1);
   const instruction =
@@ -2008,6 +2044,43 @@ export async function triggerVa02(
   });
   await pumpQueue();
   console.log(`[VA02] Enqueued for SO ${soNumber} (${normalized.length} material(s))`);
+}
+
+/** A pending SO-line change read off Material rows for the flush. */
+export type PendingSoChange = {
+  material: string;
+  pendingSoOp: 'dec' | 'del';
+  pendingSoQty: number | null;
+};
+
+/**
+ * Merge the planner's INCREASE list with any PENDING decreases/deletes into the
+ * single material list a VA02 call will carry. Pure — no DB, no side effects;
+ * unit-tested directly.
+ *
+ * Rules:
+ *   - Seed from pending: 'dec' → set to pendingSoQty; 'del' → delete the line.
+ *   - An increase for the SAME material SUPERSEDES its pending entry (a fresh
+ *     increase is the live truth; the stale dec/del is dropped).
+ *   - A pending 'dec' with a null/invalid qty is skipped defensively.
+ */
+export function mergeVa02Flush(
+  increases: Array<{ material: string; orderQuantity: number }>,
+  pending: PendingSoChange[],
+): Va02Material[] {
+  const byMaterial = new Map<string, Va02Material>();
+  for (const p of pending) {
+    if (p.pendingSoOp === 'del') {
+      byMaterial.set(p.material, { material: p.material, op: 'del' });
+    } else if (p.pendingSoOp === 'dec' && typeof p.pendingSoQty === 'number') {
+      byMaterial.set(p.material, { material: p.material, orderQuantity: p.pendingSoQty });
+    }
+  }
+  // Increases win over any pending entry for the same code.
+  for (const inc of increases) {
+    byMaterial.set(inc.material, { material: inc.material, orderQuantity: inc.orderQuantity });
+  }
+  return Array.from(byMaterial.values());
 }
 
 /**

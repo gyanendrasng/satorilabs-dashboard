@@ -88,6 +88,28 @@ npx prisma db push --schema prisma/schema.prisma && npx prisma generate --schema
 - `workflowState: 'awaiting_confirmation'` → reminder sent, waiting for production confirmation
 - `workflowState: 'completed'` → workflow finished
 
+## Modify-after-bundling (branch asks to change qty after loading slips exist)
+The planner (`src/lib/llm-planner.ts`) routes a branch increase based on whether
+loading slips already exist (`loading slips exist (bundles frozen): yes` in SO
+state) and, when they do but plant_ls is NOT yet sent, on what the BRANCH chooses:
+
+- **No LS yet** (bundles computed, ZLOAD1 not fired) → Rule 6 (normal pre-LS).
+- **LS exist, plant_ls NOT sent** → ask the branch "preserve or recreate?" (Rule 6b fork):
+  - **recreate** → Path [A] (Rule 6b-A): `zloading_close(all)` wipe → re-bundle →
+    redo pipeline. Stock precheck is 3-way (fully/partial/none); partial/none
+    inform the branch and wait.
+  - **preserve** → Path [B] = Rule 6e surgical flow (same as post-plant_ls), EXCEPT
+    overflow creates an **extra vehicle (new bundle)** on the same PO instead of a
+    new SO, and the terminal `email_modified_ls_to_plant` sends the FULL LS set
+    (first intimation).
+- **LS sent to plant** → Rule 6e surgical flow; overflow → new SO.
+
+Key plumbing: `bundle_capacity_assessment` takes `overflowMode: 'new_so'|'new_bundle'`;
+the `new_bundle` verdict is `allocated_with_new_bundle`; `createSingleBundleForPo`
+(`src/lib/bundler.ts`) adds one bundle without wiping; the Phase-3 overflow leg is a
+`zload1` step with `args.createNewBundle=true`. Every "inform the branch" step is a
+WAIT point (send + stop, resume on reply).
+
 ## auto_gui2 Backend Endpoints Used
 - `POST /chat` — Triggers SAP transactions (ZSO-VISIBILITY, ZLOAD3, etc.)
 - `POST /email/reminder` — Generates reminder email content via LLM

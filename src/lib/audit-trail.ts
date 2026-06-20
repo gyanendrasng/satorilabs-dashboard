@@ -93,7 +93,13 @@ function summarizePayload(type: string, p: Record<string, unknown>): string {
       const verdicts = type === 'step_completed' && kind === 'bundle_capacity_assessment'
         ? ' — verdicts: ' + summariseBundleVerdicts(p.verdicts)
         : '';
-      return `${kind}${ok}${sap}${verdicts}`;
+      // stock_precheck writes per-material 3-way availability
+      // (fully/partial/none) onto its step_completed payload. Surface it so
+      // the LS-created "don't preserve" path can branch A1/A2/A3 off the trail.
+      const availability = type === 'step_completed' && kind === 'stock_precheck' && p.perMaterial
+        ? ' — availability: ' + summariseStockAvailability(p.perMaterial)
+        : '';
+      return `${kind}${ok}${sap}${verdicts}${availability}`;
     }
     case 'email_sent': {
       const recipient = String(p.recipient ?? p.to ?? '?');
@@ -165,6 +171,29 @@ function summariseBundleVerdicts(v: unknown): string {
     parts.push(`${material}=${verdict}${tail}`);
   }
   return parts.join(', ') || '(no verdicts)';
+}
+
+/**
+ * One-line summary of stock_precheck per-material 3-way availability. Shape
+ * matches `PerMaterialVerdict[]` from stock-precheck.ts:
+ *   `[{material, requested, available, verdict: 'fully'|'partial'|'none'}, ...]`
+ *
+ * Consumed by the LS-created "don't preserve" path (Rule 6b A1/A2/A3) to decide
+ * whether to proceed, ask the branch about a partial, or ask about no stock.
+ */
+function summariseStockAvailability(v: unknown): string {
+  if (!Array.isArray(v) || v.length === 0) return '(none)';
+  const parts: string[] = [];
+  for (const row of v) {
+    if (!row || typeof row !== 'object') continue;
+    const r = row as Record<string, unknown>;
+    const material = String(r.material ?? '?');
+    const verdict = String(r.verdict ?? '?');
+    const requested = typeof r.requested === 'number' ? r.requested : '?';
+    const available = typeof r.available === 'number' ? r.available : '?';
+    parts.push(`${material}=${verdict}(req=${requested}, avail=${available})`);
+  }
+  return parts.join(', ') || '(none)';
 }
 
 /**

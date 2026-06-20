@@ -393,6 +393,15 @@ model Material {
   // persistDispatchPlan. Used by the FCFS shortage reactivator to subtract
   // our own outflow from the inflow pool — see shortage-reactivator.ts.
   releasedAt          DateTime?
+  // Pending SO-line change requested by the branch (dec/del), applied to the
+  // loading slip immediately (zload2 / zloading_close) but NOT yet to the SO
+  // line in SAP. Flushed by the next VA02 run (which otherwise only handles
+  // increases). Latest-wins, one pending change per material.
+  //   pendingSoOp='dec' → set the SO line to pendingSoQty on next VA02
+  //   pendingSoOp='del' → delete the SO line on next VA02 (pendingSoQty null)
+  //   pendingSoOp=null  → nothing pending
+  pendingSoOp         String?  // 'dec' | 'del'
+  pendingSoQty        Int?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 

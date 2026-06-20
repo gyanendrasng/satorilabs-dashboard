@@ -171,7 +171,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'va02',
-    description: 'Modify SO line items in SAP. Use ONLY when increasing a material quantity. Decreases and deletes do not need va02.',
+    description: 'Modify SO line items in SAP. Emit ONLY increases here (one entry per material being increased). You do NOT list decreases/deletes — the engine automatically flushes any pending branch decreases/deletes onto the SO line on this same VA02 run.',
     argsSchema: '{ materials: [{ code: "<material code>", op: "inc", qty: <new total quantity, integer> }, ...] }',
   },
   {
@@ -314,7 +314,11 @@ interface SoStateSnapshot {
   status: string;
   stage: string;
   materialCount: number;
+  /** Number of LoadingSlip rows on this SO (ZLOAD1 has created them). */
   lsCount: number;
+  /** True once ANY LoadingSlip row exists — bundle composition is FROZEN from
+   *  this point (the preserve/recreate fork keys on this). */
+  loadingSlipsExist: boolean;
   plantLsSent: boolean;
   invoiceReceived: boolean;
   shipmentCreated: boolean;
@@ -333,6 +337,7 @@ async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapsh
     include: {
       materials: { orderBy: { createdAt: 'asc' } },
       items: { select: { id: true } },
+      loadingSlips: { select: { id: true } },
       purchaseOrder: {
         include: {
           customer: true,
@@ -382,7 +387,8 @@ async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapsh
     status: so.status,
     stage,
     materialCount: so.materials.length,
-    lsCount: so.items.length,
+    lsCount: so.loadingSlips.length,
+    loadingSlipsExist: so.loadingSlips.length > 0,
     plantLsSent: !!plantLs,
     invoiceReceived: !!so.invoice,
     shipmentCreated: so.shipments.length > 0,
@@ -408,6 +414,7 @@ function renderSoState(s: SoStateSnapshot): string {
     `- stage (derived): ${s.stage}`,
     `- material lines: ${s.materialCount}`,
     `- loading slips created: ${s.lsCount}`,
+    `- loading slips exist (bundles frozen): ${s.loadingSlipsExist ? 'yes' : 'no'}`,
     tonnageLine,
     `- plant_ls email sent: ${s.plantLsSent ? 'yes' : 'no'}`,
     `- plant invoice received: ${s.invoiceReceived ? 'yes' : 'no'}`,
@@ -534,26 +541,80 @@ trigger email type, to decide whose intent this is.
   6. INBOUND: branch MODIFY-INCREASE on ls_dispatch (pre-LS, no LSs yet).
      EMIT: stock_precheck → va02 → email_2nd_release. STOP.
 
-  6b. INBOUND: branch MODIFY-INCREASE — LSs exist but plant_ls NOT yet sent
-      (audit trail has step_completed zload1 ✓ but NO email_sent plant_ls).
-      Bundles can still be re-composed safely, but ONLY by wiping every
-      existing LS first so the bundler can re-pack optimally for the new
-      quantities. EMIT: zloading_close (args.all=true) → stock_precheck →
-      va02 → email_2nd_release. STOP.
-      Do NOT emit zload2 in this case — pre-plant_ls modifications NEVER
-      use zload2. The wipe-and-re-bundle path produces optimal truck
-      packing; zload2 leaves the existing bundle composition frozen.
+  6b. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL — LOADING SLIPS
+      EXIST (CURRENT SO STATE shows \`loading slips exist (bundles frozen): yes\`,
+      i.e. ZLOAD1 has run) but plant_ls NOT yet sent. THE BRANCH CHOOSES how to
+      handle this — we do NOT decide for them. Two-step rule:
+
+      6b-FORK — NO \`email_sent branch_preserve_choice\` (or \`branch_clarify\`
+        asking the preserve question) exists AFTER the latest \`email_received\`.
+        EMIT a single email_clarify_branch with question =
+          "The loading slips for this order have already been created. To apply
+           your change, should we PRESERVE the existing loading slips (we'll add
+           the extra quantity onto them, creating an extra vehicle only if
+           needed), or DELETE and RECREATE them from scratch? Reply 'preserve'
+           or 'recreate'." STOP. Wait for the branch's reply.
+
+      6b-ROUTE — the branch has REPLIED to the preserve question (a new
+        \`email_received\` after that email_clarify_branch). Read their reply:
+        (a) "recreate" / "delete" / "fresh" / "redo" → PATH [A] (Rule 6b-A).
+        (b) "preserve" / "keep" / "add on" → PATH [B] = Rule 6e (the surgical
+            flow). Treat the SO exactly as Rule 6e and proceed from its Phase 1.
+        (c) ambiguous → email_clarify_branch re-asking the same question.
+
+  6b-A. PATH [A] — DON'T PRESERVE (delete & recreate). The branch chose to wipe.
+      Bundles are re-composed by wiping every existing LS first so the bundler
+      can re-pack optimally for the new quantities.
+      EMIT: zloading_close (args.all=true) → stock_precheck → va02 →
+      email_2nd_release. STOP.
+      Do NOT emit zload2 in this path — recreate NEVER uses zload2.
       Downstream: after the branch acks 2nd_release, Rule 8 fires zso_visibility,
       the visibility callback auto-sends a round-2 ls_dispatch, the branch
       accepts the new material list (Rule 9 case a → email_confirm_bundle_details
       which calls the bundler to wipe + recreate Bundle rows), the branch
       accepts the new bundle plan (Rule 10b path a → zload1 fresh →
-      email_to_branch_for_vehicle). No ZLOAD2 anywhere in this chain.
+      email_to_branch_for_vehicle).
 
-  6e. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL on a plant_ls
-      email — i.e. plant_ls has already been sent (CURRENT SO STATE shows
-      \`plant_ls email sent: yes\` AND audit trail has \`email_sent plant_ls\`).
+      THREE-WAY STOCK BRANCH (read \`step_completed stock_precheck — availability:\`
+      from the trail; each material is \`fully\`/\`partial\`/\`none\` at the SO's
+      own plant; cross-plant substitution, when it fully covers a line, already
+      resolved it before this point and that line counts as available):
+        A1 — every increased material is \`fully\` available (or substituted):
+             proceed with va02 → email_2nd_release as above.
+        A2 — a material is \`partial\` (0 < avail < requested) and no substitute
+             covers it: the engine has already emailed the branch a shortage
+             inquiry and paused. On the branch's reply — if they give a REVISED
+             (smaller) qty → re-run from stock_precheck/va02 with the new qty;
+             if they say "drop"/"skip" → treat like A3.
+        A3 — a material is \`none\` (avail == 0) and no substitute: the engine
+             emailed the branch. On their reply — if they REVISE qty → re-run;
+             if "proceed with existing"/"no change" → emit NO further SAP txns
+             for that material; continue to vehicle details.
+
+  6e. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL where LOADING SLIPS
+      EXIST and the surgical (preserve) flow applies. This fires in TWO cases:
+        (i)  plant_ls has already been sent (CURRENT SO STATE shows
+             \`plant_ls email sent: yes\`), OR
+        (ii) loading slips exist but plant_ls NOT sent AND the branch chose
+             "preserve" at the Rule 6b fork.
+      In BOTH cases \`loading slips exist (bundles frozen): yes\`.
       Bundles are FROZEN: loading slips cannot migrate between bundles.
+
+      DIFFERENCES between (i) and (ii), and they are the ONLY differences:
+        - OVERFLOW RESOLUTION. Case (i): overflow → branch raises a new SO
+          (email_branch_overflow_request with NO resolution arg / default;
+          Phase 3 ends with email_branch_request_new_so). Case (ii): overflow →
+          we add an EXTRA VEHICLE (new bundle) on the same PO — emit
+          email_branch_overflow_request with args.resolution="new_bundle", and
+          in Phase 3 emit the overflow leg as zload1 with
+          args.createNewBundle=true (NOT a new-SO request).
+        - TERMINAL PLANT EMAIL. Case (i): plant already intimated → Phase 3's
+          email_modified_ls_to_plant forwards only the touched LSs. Case (ii):
+          plant never intimated → the SAME email_modified_ls_to_plant step is
+          emitted, and the engine automatically forwards the FULL LS set (first
+          send). Emit email_modified_ls_to_plant in both cases; the engine
+          decides full-vs-touched.
+      To tell the cases apart, read \`plant_ls email sent\` from SO state.
 
       **CRITICAL — MULTI-PHASE RULE. Check the audit trail before
       emitting.** The state of the modify cycle is read off the audit
@@ -573,20 +634,33 @@ trigger email type, to decide whose intent this is.
         material being increased / added. deltaKg = additional kilograms
         this material is gaining (read it from the email — branch usually
         states units; convert via the material's Material.orderWeightKg if
-        shown, otherwise read the email's weight figure directly). STOP.
-        The engine emits step_completed with verdicts and re-enters this
-        planner.
+        shown, otherwise read the email's weight figure directly).
+        For CASE (ii) (plant_ls NOT sent, branch chose preserve), ALSO set
+        args.overflowMode="new_bundle" so the assessment packs any residual
+        into new bundle(s) (verdict \`allocated_with_new_bundle\`) instead of
+        flagging it as overflow-to-new-SO. For CASE (i), omit overflowMode
+        (default new_so). STOP. The engine emits step_completed with verdicts
+        and re-enters this planner.
 
-      - PHASE 1.5 — OVERFLOW GATE. \`step_completed bundle_capacity_assessment\`
-        exists with overflowKgTotal > 0 (any material has overflowKg > 0)
-        AND NO \`email_sent overflow_request\` exists AFTER that
-        assessment. The branch must opt in to the partial dispatch
-        BEFORE we touch SAP. Emit ONLY email_branch_overflow_request
-        with args.items = [{material, placedKg, overflowKg}, ...] for
-        every material that had a partial_overflow OR needs_new_so
-        verdict (placedKg = sum of that material's allocations.kg from
-        the verdict; overflowKg = the verdict's overflowKg). STOP.
-        Wait for the branch to reply.
+      - PHASE 1.5 — OVERFLOW GATE. Applies to BOTH cases when the assessment
+        shows kg that didn't fit existing bundles, AND NO \`email_sent
+        overflow_request\` exists AFTER that assessment. The branch must opt in
+        BEFORE we touch SAP — this is a WAIT point.
+        CASE (i): trigger on overflowKgTotal > 0 (partial_overflow /
+          needs_new_so verdicts). Emit email_branch_overflow_request with
+          args.items = [{material, placedKg, overflowKg}, ...]; do NOT set
+          resolution (default new_so). The overflow becomes a new SO.
+        CASE (ii): trigger on any verdict being \`allocated_with_new_bundle\`
+          (the residual went to a new vehicle). Emit
+          email_branch_overflow_request with args.resolution="new_bundle" and
+          args.items = [{material, placedKg, overflowKg}, ...] where placedKg =
+          sum of same_bundle+other_bundle allocation kg and overflowKg = sum of
+          the new_bundle allocation kg for that material (the kg headed to the
+          extra vehicle). This INFORMS the branch an extra vehicle is needed.
+        STOP. Wait for the branch to reply (Phase 1.6 handles the reply: a
+        plain confirmation → Phase 2; a revised qty → re-emit Phase 1; a
+        rejection → for case (i) email_branch_request_new_so, for case (ii)
+        drop the overflow / re-assess per the reply).
 
       - PHASE 1.6 — \`email_sent overflow_request\` exists AND a new
         \`email_received\` AFTER it (the branch's reply to the overflow
@@ -606,28 +680,28 @@ trigger email type, to decide whose intent this is.
               the partial.
           (d) UNCLEAR / AMBIGUOUS → email_clarify_branch.
 
-      - PHASE 2 — EITHER overflowKgTotal == 0 (no overflow gate needed)
-        OR Phase 1.6 (a) "PLAIN CONFIRMATION" applies (branch acked the
-        partial dispatch). AND \`step_completed bundle_capacity_assessment\`
+      - PHASE 2 — EITHER no overflow gate was needed (case i: overflowKgTotal
+        == 0; case ii: no \`allocated_with_new_bundle\` verdict) OR Phase 1.6
+        (a) "PLAIN CONFIRMATION" applies (branch acked the partial dispatch /
+        the extra vehicle). AND \`step_completed bundle_capacity_assessment\`
         exists with verdicts, AND NO \`step_completed va02\` exists
         AFTER that assessment.
         Read the verdicts off the latest assessment line. Each verdict has
         the form
-          \`material=fully_allocated|partial_overflow|needs_new_so(assessedDeltaKg=N; alloc=[same_bundle:Akg + other_bundle:Bkg + ...]; overflowKg=O)\`
-        Compute placedKgTotal across all verdicts.
-        - If placedKgTotal > 0, emit IN ORDER:
-            (1) stock_precheck for the placed portion of each material
-                (materials = the verdicts whose allocations are non-empty;
-                qty = the placed-kg portion converted to units using
-                Material.orderWeightKg).
-            (2) va02 with materials = the placed portion only. Target qty
-                for each material = current SO qty + (sum of that
-                material's allocation kg, converted to units). DO NOT add
-                the overflowKg to the VA02 target — the overflow goes to
-                a new SO, not this SO's line. The SO line ceiling stays
-                at "current + placed", which exactly matches what we
-                will dispatch from this SO.
-            (3) email_2nd_release  (branch acks the placed-qty increase).
+          \`material=fully_allocated|partial_overflow|needs_new_so|allocated_with_new_bundle(assessedDeltaKg=N; alloc=[same_bundle:Akg + other_bundle:Bkg + new_bundle:Ckg + ...]; overflowKg=O)\`
+        Define shipKg(material) = sum of allocation kg that ships from THIS SO:
+          - CASE (i): same_bundle + other_bundle kg only (overflow → new SO).
+          - CASE (ii): same_bundle + other_bundle + new_bundle kg (the new
+            bundle is on THIS PO/SO, so its kg ships from this SO too).
+        - If total shipKg > 0, emit IN ORDER:
+            (1) stock_precheck for each material with shipKg > 0
+                (qty = shipKg converted to units using Material.orderWeightKg).
+            (2) va02 with materials = those materials. Target qty for each =
+                current SO qty + (shipKg(material) converted to units).
+                CASE (i): do NOT add overflowKg — it goes to a new SO.
+                CASE (ii): the new_bundle kg IS included (it ships from this
+                SO via the extra vehicle).
+            (3) email_2nd_release  (branch acks the increase).
           STOP. Wait for the branch to confirm 2nd_release.
         - If placedKgTotal == 0 for ALL materials (every verdict is
           needs_new_so), Phase 1.5 has already routed: the overflow
@@ -668,11 +742,11 @@ trigger email type, to decide whose intent this is.
         at the current dispatchRound. Branch acked the material list;
         time to send them the bundle plan. Emit:
             email_confirm_bundle_details
-        STOP. The engine handler detects the post-plant_ls assessment
-        marker + sent_to_plant LS and routes to the upcoming-changes
-        renderer (no bundler call). The branch reads the bundle plan
-        with the upcoming ZLOAD2 / ZLOAD1-append annotations and replies
-        confirming.
+        STOP. The engine handler detects the assessment marker + any existing
+        LoadingSlip and routes to the upcoming-changes renderer (no bundler
+        call). The branch reads the bundle plan with the upcoming ZLOAD2 /
+        ZLOAD1-append annotations (and the extra vehicle, for case ii) and
+        replies confirming.
         (If the branch reply on the round-N ls_dispatch is NOT a plain
         confirmation — e.g. they ask for further changes — this is
         Rule 9 territory: route per Rule 9's branches.)
@@ -703,14 +777,23 @@ trigger email type, to decide whose intent this is.
               The zload1 step MUST include args; without them the engine
               treats it as initial-mode which would re-bundle and fail
               with BundlesFrozenError.
-          (3) email_modified_ls_to_plant. The plant is told about the
-              ZLOAD2 modifications AND the new LSs created via
-              zload1-append in one consolidated email.
-          (4) If overflowKgTotal > 0:
+          (2b) CASE (ii) ONLY — for each \`new_bundle\` allocation across all
+              materials (verdict \`allocated_with_new_bundle\`): EMIT zload1
+              with args.createNewBundle=true (NO appendToBundleId) and
+              args.materials = [{code: material, batch, qty: allocation-kg in
+              units}]. ONE zload1 per new_bundle leg. The engine creates a
+              fresh bundle (extra vehicle), links the material, and appends the
+              LS. batch comes from the lone_zmatana Material row.
+          (3) email_modified_ls_to_plant. Emitted in BOTH cases. The engine
+              forwards only the touched LSs when plant_ls was already sent
+              (case i), or the FULL LS set on first intimation (case ii).
+          (4) CASE (i) ONLY — if overflowKgTotal > 0:
               EMIT email_branch_request_new_so with args.items =
               [{material, deltaKg: overflowKg}, ...] for ONLY the
               overflow legs. Items that were fully allocated do not
               appear in this list. STOP after this email.
+              CASE (ii) does NOT emit this — its overflow already became a new
+              bundle in step (2b), so there is nothing to send to a new SO.
 
       Multiple materials in one reply share the same Phase 2 / Phase 3
       plans — collect every material's allocations into one va02 call,
@@ -718,12 +801,17 @@ trigger email type, to decide whose intent this is.
       calls (one per other_bundle leg), and ONE consolidated
       email_modified_ls_to_plant.
 
-      Do NOT skip bundle_capacity_assessment when plant_ls has been sent —
-      Rule 6 / 6b apply only BEFORE plant_ls.
+      Do NOT skip bundle_capacity_assessment when loading slips exist — Rule 6
+      applies only BEFORE bundles/LSs exist; Rule 6b's recreate (Path [A]) only
+      when the branch explicitly chose "recreate". Otherwise (plant_ls sent, OR
+      branch chose preserve) this surgical Rule 6e flow applies.
       Do NOT re-fire a SECOND va02 in Phase 3 to "correct" the SO line
       down. The SO line ceiling set in Phase 2 already matches the placed
-      qty; the overflow lives on a separate (new) SO and the branch
-      raises that themselves.
+      qty; for case (i) the overflow lives on a separate (new) SO the branch
+      raises; for case (ii) the overflow rides a new bundle on THIS SO/PO, so
+      the SO line ceiling must include the new-bundle kg too (Phase 2's va02
+      target for case ii = current qty + placed kg + new_bundle kg, since all
+      of it ships from this SO).
       Do NOT emit zso_visibility in this entire flow — its visibility-data
       callback sends an unwanted round-N ls_dispatch. lone_zmatana
       replaces it (Phase 2.5); Phase 2.75 emits ls_dispatch itself via
@@ -935,7 +1023,10 @@ trigger email type, to decide whose intent this is.
      EMIT: zload2 (decrease/inc-dec) AND/OR zloading_close (delete) AND email_modified_ls_to_plant — ALL IN THE SAME PLAN (steps array MUST end with email_modified_ls_to_plant). Do NOT emit just zload2/zloading_close alone; the plant must always be notified of the change. STOP after the email step.
      Do NOT emit email_to_branch_notifying_plant_change — that's for PLANT-proposed changes.
      Do NOT emit plain email_to_plant here — it would send EVERY LS to the plant, including unmodified ones. Use email_modified_ls_to_plant which sends only the touched LSs.
-     No va02, no 2nd release. Decreases / deletes don't change the SO; they only revise the LS.
+     No va02, no 2nd release here. Decreases / deletes revise the LS now; the
+     SO line is brought down (decrease) or removed (delete) automatically on the
+     NEXT va02 run — the engine records the pending change and flushes it then.
+     You still do NOT emit va02 for a decrease/delete.
 
 ANYTIME / OTHER:
  12. For a "Seeking Order Update" inquiry: emit a single email_order_status step. STOP.

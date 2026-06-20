@@ -298,12 +298,14 @@ async function loadTriggerReply(progressId: string): Promise<TriggerReply | null
 import type { WorkStep } from './work-queue';
 import {
   triggerVa02,
+  mergeVa02Flush,
   triggerZsoVisibility,
   triggerZload2,
   triggerZloadingClose,
   checkAndSendCombinedVehicleEmailForPo,
   fanOutZload1ForPo,
 } from './auto-gui-trigger';
+import type { PendingSoChange } from './auto-gui-trigger';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 const PLANT_EMAIL = process.env.PLANT_EMAIL || '';
@@ -1447,6 +1449,24 @@ async function fireStep(
       });
 
       if (result.outcome === 'sufficient') {
+        // Emit a step_completed carrying the per-material 3-way availability so
+        // the LS-created "don't preserve" path (Rule 6b A1/A2/A3) can read it.
+        // For a plain decrease/delete step perMaterial is [] — harmless.
+        if (result.perMaterial.length > 0) {
+          try {
+            const { emitEvent } = await import('./scenario-events');
+            await emitEvent({
+              salesOrderId: progress.salesOrderId,
+              scenarioProgressId: progress.id,
+              type: 'step_completed',
+              payload: {
+                kind: 'stock_precheck',
+                scenario_key: 'planner',
+                perMaterial: result.perMaterial,
+              },
+            });
+          } catch {}
+        }
         log('[ENGINE] stock_precheck — sufficient, advancing to VA02');
         return 'advance_now';
       }
@@ -1492,6 +1512,7 @@ async function fireStep(
               kind: 'stock_precheck',
               scenario_key: 'planner',
               substitutions: result.substitutions,
+              perMaterial: result.perMaterial,
             },
           });
         } catch {}
@@ -1535,22 +1556,28 @@ async function fireStep(
       // that DID get covered. We emit a step_completed event for those (so
       // the planner can still use them on its next call) AND send the
       // shortage email for the remaining gap.
+      //
+      // Always include the per-material 3-way availability so the LS-created
+      // "don't preserve" path can tell A2 (partial) from A3 (none) when the
+      // branch replies to the shortage inquiry.
+      try {
+        const { emitEvent } = await import('./scenario-events');
+        await emitEvent({
+          salesOrderId: progress.salesOrderId,
+          scenarioProgressId: progress.id,
+          type: 'step_completed',
+          payload: {
+            kind: 'stock_precheck',
+            scenario_key: 'planner',
+            ...(result.substitutions && result.substitutions.length > 0
+              ? { substitutions: result.substitutions, partial: true }
+              : {}),
+            perMaterial: result.perMaterial,
+          },
+        });
+      } catch {}
       if (result.substitutions && result.substitutions.length > 0) {
         log(`[ENGINE] stock_precheck — MIXED: ${result.substitutions.length} substituted, ${result.shortages.length} still short`);
-        try {
-          const { emitEvent } = await import('./scenario-events');
-          await emitEvent({
-            salesOrderId: progress.salesOrderId,
-            scenarioProgressId: progress.id,
-            type: 'step_completed',
-            payload: {
-              kind: 'stock_precheck',
-              scenario_key: 'planner',
-              substitutions: result.substitutions,
-              partial: true,
-            },
-          });
-        } catch {}
       }
       const triggerEmailId = (
         await prisma.scenarioProgress.findUnique({
@@ -1648,12 +1675,13 @@ async function fireStep(
 
       const { coerceBundleCapacityArgs } = await import('./planner-step-args');
       const { assessPostLsIncrease } = await import('./bundle-capacity');
-      const items = coerceBundleCapacityArgs(_plannedStep);
+      const { items, overflowMode } = coerceBundleCapacityArgs(_plannedStep);
       let result;
       try {
         result = await assessPostLsIncrease({
           salesOrderId: progress.salesOrderId,
           items: items.map((i) => ({ material: i.material, deltaKg: i.deltaKg })),
+          overflowMode,
         });
       } catch (assessErr) {
         log(`[ENGINE] bundle_capacity_assessment — helper failed: ${assessErr instanceof Error ? assessErr.message : String(assessErr)}`);
@@ -1736,17 +1764,62 @@ async function fireStep(
 
     // -------- SAP transactions --------
     case 'va02': {
-      // VA02 in SAP changes the order quantity to a new (typically larger)
-      // value. Run ONLY for materials whose quantity is being INCREASED;
-      // decreases and deletes are handled downstream (zload2, zloading_close).
-      //
-      // Materials + new quantities come from the planner step args. The planner
-      // reads the email thread and emits them directly; no extractor here.
+      // VA02 in SAP changes SO line quantities. The planner emits ONLY
+      // increases (coerceVa02Args enforces qty > 0). On top of those, this
+      // handler FLUSHES any pending branch decreases/deletes onto the SO line
+      // in the SAME VA02 call: a decrease/delete is applied to the loading slip
+      // immediately (zload2 / zloading_close set Material.pendingSoOp), but the
+      // SO line is only reconciled here, when a VA02 runs anyway.
       const { coerceVa02Args } = await import('./planner-step-args');
-      const items = coerceVa02Args(_plannedStep);
+      const items = coerceVa02Args(_plannedStep); // increases only, qty > 0
       const soNumber = await soNumberFor(progress.salesOrderId);
-      log(`[ENGINE] va02 firing for ${items.length} increase line(s): ${items.map((i) => `${i.material}→${i.orderQuantity}`).join(', ')}`);
-      await triggerVa02(soNumber, items);
+
+      // Load pending dec/del for THIS SO and merge them with the increases.
+      const pendingRows = await prisma.material.findMany({
+        where: { salesOrderId: progress.salesOrderId, pendingSoOp: { not: null } },
+        select: { material: true, pendingSoOp: true, pendingSoQty: true },
+      });
+      const pending: PendingSoChange[] = pendingRows
+        .filter((p) => p.pendingSoOp === 'dec' || p.pendingSoOp === 'del')
+        .map((p) => ({
+          material: p.material,
+          pendingSoOp: p.pendingSoOp as 'dec' | 'del',
+          pendingSoQty: p.pendingSoQty,
+        }));
+
+      const merged = mergeVa02Flush(items, pending);
+      const describe = merged
+        .map((m) => ('op' in m ? `${m.material}→DELETE` : `${m.material}→${m.orderQuantity}`))
+        .join(', ');
+      log(`[ENGINE] va02 firing for ${merged.length} line(s) (${items.length} increase, ${pending.length} pending dec/del): ${describe}`);
+      await triggerVa02(soNumber, merged);
+
+      // Optimistically reconcile the DB + clear the pending flags. There is no
+      // per-material VA02 callback to hang a precise clear on (step-status only
+      // flips the WorkQueue row), and VA02 is the only flush trigger — so we
+      // apply at fire time. If VA02 fails in SAP the WorkQueue row retries; the
+      // LS already reflects the change, so the bounded inconsistency is the SO
+      // line briefly showing the intended value before SAP confirms.
+      const increasedCodes = new Set(items.map((i) => i.material));
+      for (const p of pending) {
+        if (increasedCodes.has(p.material)) {
+          // Superseded by a fresh increase — drop the stale pending change.
+          await prisma.material.updateMany({
+            where: { salesOrderId: progress.salesOrderId, material: p.material },
+            data: { pendingSoOp: null, pendingSoQty: null },
+          });
+        } else if (p.pendingSoOp === 'del') {
+          await prisma.material.deleteMany({
+            where: { salesOrderId: progress.salesOrderId, material: p.material },
+          });
+        } else {
+          await prisma.material.updateMany({
+            where: { salesOrderId: progress.salesOrderId, material: p.material },
+            data: { orderQuantity: p.pendingSoQty ?? 0, pendingSoOp: null, pendingSoQty: null },
+          });
+        }
+      }
+
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
@@ -1891,6 +1964,18 @@ async function fireStep(
       for (const bucket of byLs.values()) {
         await triggerZload2(bucket.lsNumber, bucket.items);
       }
+
+      // Record the SO-line decrease as PENDING. The LS was just revised above;
+      // the SO line stays high until the next VA02 flushes this. `orderQuantity`
+      // on the revision is the new absolute target — the same value the SO line
+      // should land on. updateMany is a no-op if the Material row is missing.
+      for (const r of requested) {
+        await prisma.material.updateMany({
+          where: { salesOrderId: progress.salesOrderId, material: r.material },
+          data: { pendingSoOp: 'dec', pendingSoQty: r.orderQuantity },
+        });
+      }
+
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
@@ -2085,6 +2170,20 @@ async function fireStep(
         }
       }
 
+      // SURGICAL mode only (Rule 11 per-material branch delete): record the
+      // SO-line delete as PENDING so the next VA02 removes the line. The LS was
+      // just closed above; the SO line lags until then. The wipe-all branch
+      // must NOT set pending — its materials are re-staged for re-bundling, not
+      // removed from the order.
+      if (coerced.mode === 'surgical') {
+        for (const d of coerced.deletions) {
+          await prisma.material.updateMany({
+            where: { salesOrderId: progress.salesOrderId, material: d.material },
+            data: { pendingSoOp: 'del', pendingSoQty: null },
+          });
+        }
+      }
+
       await markAwaitingCallback(progress.id);
       return 'pause';
     }
@@ -2102,10 +2201,39 @@ async function fireStep(
       const appendArgs = coerceZload1AppendArgs(_plannedStep);
 
       if (appendArgs) {
+        // New-bundle overflow leg (LS-created "preserve" path): create a fresh
+        // bundle (extra vehicle), link the overflow material(s) to it, then
+        // append the new LS. The zload1-data callback requires the bundle to
+        // pre-exist, so creation MUST happen before the fan-out fires.
+        let targetBundleId = appendArgs.appendToBundleId;
+        if (appendArgs.createNewBundle) {
+          const soForBundle = await prisma.salesOrder.findUnique({
+            where: { id: progress.salesOrderId },
+            select: { purchaseOrderId: true },
+          });
+          if (!soForBundle?.purchaseOrderId) {
+            throw new Error(`SO ${progress.salesOrderId} has no purchaseOrderId for new-bundle ZLOAD1-append`);
+          }
+          const { createSingleBundleForPo } = await import('./bundler');
+          const created = await createSingleBundleForPo(soForBundle.purchaseOrderId);
+          targetBundleId = created.bundleId;
+          log(`[ENGINE] zload1 (new bundle) — created Bundle ${created.bundleNumber} (id=${created.bundleId}) for overflow`);
+          // Link the overflow material(s) on this SO to the new bundle so the
+          // bundle-weight recompute + downstream grouping see the membership.
+          const codes = appendArgs.materials.map((m) => m.code);
+          const linked = await prisma.material.updateMany({
+            where: { salesOrderId: progress.salesOrderId, material: { in: codes } },
+            data: { bundleId: targetBundleId },
+          });
+          log(`[ENGINE] zload1 (new bundle) — linked ${linked.count} Material row(s) [${codes.join(', ')}] to Bundle ${created.bundleNumber}`);
+        }
+        if (!targetBundleId) {
+          throw new Error('zload1 append: no target bundle (neither appendToBundleId nor createNewBundle resolved)');
+        }
         const { fanOutZload1AppendToBundle } = await import('./auto-gui-trigger');
         const fanOut = await fanOutZload1AppendToBundle({
           salesOrderId: progress.salesOrderId,
-          appendToBundleId: appendArgs.appendToBundleId,
+          appendToBundleId: targetBundleId,
           materials: appendArgs.materials.map((m) => ({
             material_code: m.code,
             batch: m.batch,
@@ -2237,21 +2365,23 @@ async function fireStep(
         latestAssessment !== null &&
         (latestEmailReceived === null || latestAssessment.createdAt >= latestEmailReceived.createdAt);
       if (assessmentNewerThanInbound) {
-        const anyLsAtPlant = await prisma.loadingSlip.findFirst({
-          where: {
-            salesOrderId: progress.salesOrderId,
-            status: { in: ['sent_to_plant', 'invoiced', 'completed'] },
-          },
+        // Fire the upcoming-changes renderer whenever loading slips EXIST for
+        // this SO — not only once they're sent_to_plant. The LS-created-but-
+        // not-sent "preserve" flow runs the same surgical assessment, so it
+        // must reach this renderer too (bundles are frozen for composition the
+        // moment any LS exists).
+        const anyLsExists = await prisma.loadingSlip.findFirst({
+          where: { salesOrderId: progress.salesOrderId },
           select: { id: true },
         });
-        if (anyLsAtPlant) {
+        if (anyLsExists) {
           // Decode the verdict's allocations + overflow off the audit payload.
           // The shape was written by `case 'bundle_capacity_assessment':` and
           // mirrors `CapacityVerdict[]` from bundle-capacity.ts.
           type StoredVerdict = {
             material: string;
-            verdict: 'fully_allocated' | 'partial_overflow' | 'needs_new_so';
-            allocations?: Array<{ kind: 'same_bundle' | 'other_bundle'; bundleId: string; kg: number }>;
+            verdict: 'fully_allocated' | 'partial_overflow' | 'needs_new_so' | 'allocated_with_new_bundle';
+            allocations?: Array<{ kind: 'same_bundle' | 'other_bundle' | 'new_bundle'; bundleId: string | null; kg: number }>;
             overflowKg?: number;
           };
           let verdicts: StoredVerdict[] = [];
@@ -2405,62 +2535,100 @@ async function fireStep(
     }
 
     case 'email_modified_ls_to_plant': {
-      // Post-modification: forward ONLY the LSs that were just touched by
-      // the preceding zload2 / zloading_close steps in THIS plan. Does NOT
-      // extract vehicle details (the bundle already has them from the
-      // earlier vehicle_details exchange); does NOT forward unmodified LSs.
+      // Two modes, decided by whether the plant has EVER been intimated:
       //
-      // Source of "which LSs were touched": WorkQueue rows for this SO
-      // with step ∈ {zload2, zloading_close} created since this scenario
-      // started. Each row's meta.ls_number is the target LS.
+      //  (1) FIRST SEND (no prior plant_ls email exists): the plant has never
+      //      seen any LS for this SO — forward the FULL set of LoadingSlips,
+      //      not just the touched ones. This is the terminal email of the
+      //      LS-created-but-not-sent "preserve" modify flow, where plant_ls
+      //      was never sent. (email_to_plant can't be used here — its handler
+      //      requires a vehicle-details trigger reply this flow doesn't have.)
+      //
+      //  (2) FOLLOW-UP (a prior plant_ls exists): post-modification — forward
+      //      ONLY the LSs touched by the preceding zload2/zloading_close steps
+      //      in THIS plan (each WorkQueue row's meta.ls_number).
+      //
+      // Neither mode extracts vehicle details (bundles already carry them).
+      const priorPlantLs = await prisma.email.findFirst({
+        where: {
+          salesOrderId: progress.salesOrderId,
+          emailType: 'plant_ls',
+          status: { in: ['sent', 'replied', 'processed'] },
+        },
+        select: { id: true },
+      });
+      const firstSend = !priorPlantLs;
+
       const progressRow = await prisma.scenarioProgress.findUnique({
         where: { id: progress.id },
         select: { createdAt: true },
       });
       const scenarioStartedAt = progressRow?.createdAt ?? new Date(0);
 
-      const modWork = await prisma.workQueue.findMany({
-        where: {
-          salesOrderId: progress.salesOrderId,
-          step: { in: ['zload2', 'zloading_close'] },
-          createdAt: { gte: scenarioStartedAt },
-        },
-        select: { id: true, step: true, payload: true },
-        orderBy: { createdAt: 'asc' },
-      });
+      let modifiedSlips: Array<{
+        id: string;
+        salesOrderId: string;
+        lsNumber: string;
+        fileUrl: string | null;
+        bundle: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } | null;
+      }>;
 
-      const touchedLsNumbers = new Set<string>();
-      for (const w of modWork) {
-        try {
-          const parsed = JSON.parse(w.payload) as { meta?: { ls_number?: string } };
-          const lsNum = parsed.meta?.ls_number;
-          if (lsNum) touchedLsNumbers.add(lsNum);
-        } catch {
-          // ignore — payload should always be valid JSON, but never break
-          // the email step over a parse error in a sibling row
-        }
-      }
-
-      if (touchedLsNumbers.size === 0) {
-        log('[ENGINE] email_modified_ls_to_plant — no zload2/zloading_close work rows found in this scenario; nothing to forward.');
-        return 'advance_now';
-      }
-
-      const modifiedSlips = await prisma.loadingSlip.findMany({
-        where: {
-          salesOrderId: progress.salesOrderId,
-          lsNumber: { in: [...touchedLsNumbers] },
-        },
-        include: {
-          bundle: {
-            select: { vehicleNumber: true, driverMobile: true, containerNumber: true },
+      if (firstSend) {
+        // First intimation — send every LS on the SO.
+        modifiedSlips = await prisma.loadingSlip.findMany({
+          where: { salesOrderId: progress.salesOrderId },
+          include: {
+            bundle: { select: { vehicleNumber: true, driverMobile: true, containerNumber: true } },
           },
-        },
-      });
+        });
+        if (modifiedSlips.length === 0) {
+          log('[ENGINE] email_modified_ls_to_plant — first send but no LoadingSlip rows on SO; nothing to forward.');
+          return 'advance_now';
+        }
+        log(`[ENGINE] email_modified_ls_to_plant — FIRST SEND (no prior plant_ls): forwarding ALL ${modifiedSlips.length} LS(s) to plant.`);
+      } else {
+        // Follow-up — only the LSs touched in this scenario.
+        const modWork = await prisma.workQueue.findMany({
+          where: {
+            salesOrderId: progress.salesOrderId,
+            step: { in: ['zload2', 'zloading_close'] },
+            createdAt: { gte: scenarioStartedAt },
+          },
+          select: { id: true, step: true, payload: true },
+          orderBy: { createdAt: 'asc' },
+        });
 
-      if (modifiedSlips.length === 0) {
-        log(`[ENGINE] email_modified_ls_to_plant — no LoadingSlip rows for [${[...touchedLsNumbers].join(', ')}]; nothing to forward.`);
-        return 'advance_now';
+        const touchedLsNumbers = new Set<string>();
+        for (const w of modWork) {
+          try {
+            const parsed = JSON.parse(w.payload) as { meta?: { ls_number?: string } };
+            const lsNum = parsed.meta?.ls_number;
+            if (lsNum) touchedLsNumbers.add(lsNum);
+          } catch {
+            // ignore — payload should always be valid JSON, but never break
+            // the email step over a parse error in a sibling row
+          }
+        }
+
+        if (touchedLsNumbers.size === 0) {
+          log('[ENGINE] email_modified_ls_to_plant — no zload2/zloading_close work rows found in this scenario; nothing to forward.');
+          return 'advance_now';
+        }
+
+        modifiedSlips = await prisma.loadingSlip.findMany({
+          where: {
+            salesOrderId: progress.salesOrderId,
+            lsNumber: { in: [...touchedLsNumbers] },
+          },
+          include: {
+            bundle: { select: { vehicleNumber: true, driverMobile: true, containerNumber: true } },
+          },
+        });
+
+        if (modifiedSlips.length === 0) {
+          log(`[ENGINE] email_modified_ls_to_plant — no LoadingSlip rows for [${[...touchedLsNumbers].join(', ')}]; nothing to forward.`);
+          return 'advance_now';
+        }
       }
 
       const { downloadFromS3 } = await import('./s3');
@@ -2834,13 +3002,14 @@ async function fireStep(
       // → clarify.
       const { coerceBranchOverflowArgs } = await import('./planner-step-args');
       const { sendBranchOverflowRequestEmail } = await import('./branch-overflow-request-email');
-      const items = coerceBranchOverflowArgs(_plannedStep);
+      const { items, resolution } = coerceBranchOverflowArgs(_plannedStep);
       await sendBranchOverflowRequestEmail({
         salesOrderId: progress.salesOrderId,
         items,
+        resolution,
         log,
       });
-      log(`[ENGINE] email_branch_overflow_request — sent for ${items.length} item(s); awaiting branch reply`);
+      log(`[ENGINE] email_branch_overflow_request — sent for ${items.length} item(s) (resolution=${resolution}); awaiting branch reply`);
       return 'complete_segment';
       await markAwaitingReply(progress.id);
       return 'pause';

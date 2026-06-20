@@ -46,19 +46,42 @@ export type Allocation =
   /** ZLOAD2 on the LS that already carries this material. */
   | { kind: 'same_bundle'; bundleId: string; kg: number }
   /** ZLOAD1-append: new LS on a sibling bundle that had headroom. */
-  | { kind: 'other_bundle'; bundleId: string; kg: number };
+  | { kind: 'other_bundle'; bundleId: string; kg: number }
+  /**
+   * ZLOAD1 onto a BRAND-NEW bundle (extra vehicle) that does not exist yet.
+   * Only emitted when `overflowMode: 'new_bundle'` (the LS-created-but-not-sent
+   * "preserve" path). `bundleId` is null because the engine creates the bundle
+   * (createSingleBundleForPo) at execution time. One leg per new vehicle.
+   */
+  | { kind: 'new_bundle'; bundleId: null; kg: number };
 
 export type CapacityVerdict =
-  /** Every kg of the requested delta was placed. */
+  /** Every kg of the requested delta was placed in EXISTING bundles. */
   | { material: string; verdict: 'fully_allocated'; allocations: Allocation[]; overflowKg: 0 }
-  /** Some kg placed, some kg overflow — branch raises a new SO for the overflow. */
+  /** Some kg placed in existing bundles, some kg overflow — branch raises a new SO for the overflow. */
   | { material: string; verdict: 'partial_overflow'; allocations: Allocation[]; overflowKg: number }
-  /** Nothing fit — branch raises a new SO for the whole delta. */
-  | { material: string; verdict: 'needs_new_so'; allocations: []; overflowKg: number };
+  /** Nothing fit in existing bundles — branch raises a new SO for the whole delta. */
+  | { material: string; verdict: 'needs_new_so'; allocations: []; overflowKg: number }
+  /**
+   * Every kg placed, but the residual that didn't fit existing bundles is
+   * routed to one or more NEW bundles (extra vehicles) instead of a new SO.
+   * Only produced when `overflowMode: 'new_bundle'`. `allocations` may mix
+   * same_bundle / other_bundle (existing headroom) with new_bundle legs.
+   */
+  | { material: string; verdict: 'allocated_with_new_bundle'; allocations: Allocation[]; overflowKg: 0 };
 
 export interface AssessPostLsIncreaseArgs {
   salesOrderId: string;
   items: Array<{ material: string; deltaKg: number }>;
+  /**
+   * How to handle kg that doesn't fit existing bundles.
+   *   'new_so'     (default) — post-plant_ls behavior: overflow → new SO
+   *                 (partial_overflow / needs_new_so verdicts).
+   *   'new_bundle' — LS-created-but-not-sent "preserve" path: pack the residual
+   *                 into one or more new bundles (extra vehicles) on the same PO
+   *                 (allocated_with_new_bundle verdict). Never overflows to a SO.
+   */
+  overflowMode?: 'new_so' | 'new_bundle';
 }
 
 export interface AssessPostLsIncreaseResult {
@@ -107,6 +130,7 @@ export async function assessPostLsIncrease(
     );
   }
   const capacityKg = tonnes * 1000;
+  const overflowMode = args.overflowMode ?? 'new_so';
 
   // Self-heal any stale Bundle.totalWeightKg rows so the per-bundle remaining
   // calculation below is honest. Cheap and idempotent.
@@ -193,8 +217,28 @@ export async function assessPostLsIncrease(
       remaining -= take;
     }
 
+    // Step 3 — when the caller wants overflow to become NEW BUNDLES (the
+    // LS-created "preserve" path) rather than a new SO, pack any residual into
+    // one or more brand-new bundles, each up to one vehicle's capacity. The
+    // engine materializes these via createSingleBundleForPo at execution time.
+    if (overflowMode === 'new_bundle' && remaining >= MIN_ALLOCATION_KG) {
+      while (remaining >= MIN_ALLOCATION_KG) {
+        const take = Math.min(remaining, capacityKg);
+        allocations.push({ kind: 'new_bundle', bundleId: null, kg: take });
+        remaining -= take;
+      }
+    }
+
     // Classify the outcome for this material.
-    if (allocations.length === 0) {
+    if (overflowMode === 'new_bundle' && allocations.some((a) => a.kind === 'new_bundle')) {
+      // Residual was absorbed by new bundle(s); nothing overflows to a SO.
+      verdicts.push({
+        material: item.material,
+        verdict: 'allocated_with_new_bundle',
+        allocations,
+        overflowKg: 0,
+      });
+    } else if (allocations.length === 0) {
       verdicts.push({
         material: item.material,
         verdict: 'needs_new_so',

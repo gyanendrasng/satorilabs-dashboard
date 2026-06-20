@@ -32,9 +32,17 @@ export interface BranchOverflowItem {
 export async function sendBranchOverflowRequestEmail(args: {
   salesOrderId: string;
   items: BranchOverflowItem[];
+  /**
+   * How the overflow will be handled once the branch confirms:
+   *   'new_so'     (default) — post-plant_ls flow: branch raises a fresh SO.
+   *   'new_bundle' — LS-created "preserve" flow: we add an extra vehicle
+   *                  (new bundle) on the same PO; branch just confirms.
+   */
+  resolution?: 'new_so' | 'new_bundle';
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
   const { salesOrderId, items, log } = args;
+  const resolution = args.resolution ?? 'new_so';
 
   if (!BRANCH_EMAIL) {
     log('[BranchOverflow] BRANCH_EMAIL not configured — skipping');
@@ -70,23 +78,39 @@ export async function sendBranchOverflowRequestEmail(args: {
     return `  - ${desc} — can accommodate ${placed} kg in this dispatch; ${overflow} kg overflow`;
   });
 
-  const body = [
-    `Hi,`,
-    ``,
-    `Thank you for the increase request on SO ${so.soNumber}.`,
-    ``,
-    `Based on the bundles already shared with the plant, we can only partially accommodate your request:`,
-    ``,
-    ...lines,
-    ``,
-    `For the overflow above, please raise a fresh Sales Order — those units cannot fit into the current dispatch's bundles.`,
-    ``,
-    `If you'd like us to proceed with the partial quantities listed above (matching what fits in the current bundles) while you raise the new SO separately, please reply "confirm" or "proceed".`,
-    ``,
-    `If you'd like to revise the requested quantity instead, just reply with the new number and we'll re-check.`,
-    ``,
-    `Thanks.`,
-  ].join('\n');
+  const body = resolution === 'new_bundle'
+    ? [
+        `Hi,`,
+        ``,
+        `Thank you for the increase request on SO ${so.soNumber}.`,
+        ``,
+        `The existing bundles can't fully absorb the increase, so an additional vehicle (a new bundle) is needed for the overflow:`,
+        ``,
+        ...lines,
+        ``,
+        `If you'd like us to proceed — keeping the existing loading slips and adding one more vehicle for the overflow above — please reply "confirm" or "proceed".`,
+        ``,
+        `If you'd like to revise the requested quantity instead, just reply with the new number and we'll re-check.`,
+        ``,
+        `Thanks.`,
+      ].join('\n')
+    : [
+        `Hi,`,
+        ``,
+        `Thank you for the increase request on SO ${so.soNumber}.`,
+        ``,
+        `Based on the bundles already shared with the plant, we can only partially accommodate your request:`,
+        ``,
+        ...lines,
+        ``,
+        `For the overflow above, please raise a fresh Sales Order — those units cannot fit into the current dispatch's bundles.`,
+        ``,
+        `If you'd like us to proceed with the partial quantities listed above (matching what fits in the current bundles) while you raise the new SO separately, please reply "confirm" or "proceed".`,
+        ``,
+        `If you'd like to revise the requested quantity instead, just reply with the new number and we'll re-check.`,
+        ``,
+        `Thanks.`,
+      ].join('\n');
 
   const subject = `Action required — partial dispatch for SO ${so.soNumber}`;
 
