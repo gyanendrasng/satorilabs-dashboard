@@ -110,7 +110,13 @@ export async function POST(request: Request) {
       const materialDescription =
         m.material_description ?? product?.material_description ?? null;
 
-      // We do NOT touch orderQuantity on update — VA02 owns the SO line qty;
+      // We do NOT touch orderQuantity OR orderWeightKg on update. Both are
+      // FULL-order fields owned by the SO line (VA02 sets the quantity; the
+      // weight is the whole order's weight). A delta-scoped LONE-ZMATANA run
+      // reports order_quantity/order_weight_kg for ONLY the added units (e.g.
+      // 10 units / 95 kg), so writing order_weight_kg here would replace the
+      // full-order weight (210 units / 1995 kg) with the delta weight and break
+      // the bundler/capacity formula (dispatchQuantity/orderQuantity)*orderWeightKg.
       // LONE-ZMATANA only fetches batch + free stock. `batch` IS updated:
       // SAP may report a reordered / augmented batch string for a material we
       // already have a row for. One row per (SO, material).
@@ -125,7 +131,6 @@ export async function POST(request: Request) {
           materialDescription,
           batch,
           availableStock: m.available_stock_for_so ?? null,
-          ...(m.order_weight_kg != null ? { orderWeightKg: m.order_weight_kg } : {}),
         },
         create: {
           salesOrderId: salesOrder.id,
@@ -206,11 +211,17 @@ export async function POST(request: Request) {
         );
       }
       try {
-        const { maybeAdvanceScenario } = await import('@/lib/scenario-engine');
+        const { maybeAdvanceScenario, replanAfterEngineFetch } = await import('@/lib/scenario-engine');
+        // Advance any in-flight plan first (no-op for a single-step lone_zmatana
+        // plan, which completes on fire). Then re-enter the planner: lone_zmatana
+        // is an engine-only fetch step that ends a plan WITHOUT an outbound email,
+        // and the branch has already replied — so nothing else would re-drive the
+        // planner to emit the next phase (Rule 6e Phase 2.75). This bridges that.
         await maybeAdvanceScenario(salesOrder.id);
+        await replanAfterEngineFetch(salesOrder.id);
       } catch (advErr) {
         console.error(
-          `[ZmatanaData] maybeAdvanceScenario failed for SO ${soNumber}: ${advErr instanceof Error ? advErr.message : String(advErr)}`,
+          `[ZmatanaData] advance/replan failed for SO ${soNumber}: ${advErr instanceof Error ? advErr.message : String(advErr)}`,
         );
       }
     }

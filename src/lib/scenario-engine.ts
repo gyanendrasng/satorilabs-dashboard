@@ -3283,6 +3283,60 @@ export async function maybeAdvanceScenario(
   await advanceScenario(salesOrderId);
 }
 
+/**
+ * Re-enter the planner from scratch after an engine-only step (one that fetches
+ * data and completes WITHOUT sending an outbound email) finishes.
+ *
+ * The engine's segmented model assumes every plan ends in an outbound email, so
+ * the NEXT inbound re-drives the planner. But a data-fetch step like
+ * `lone_zmatana` ends a plan with no email — and the branch has already replied,
+ * so no inbound is coming. The flow would park forever. This bridges that gap:
+ * once the fetch's callback has persisted its data and emitted `step_completed`,
+ * we replay the original trigger email through handleReplyV2 so the planner sees
+ * the new audit state and emits the next phase (e.g. Rule 6e Phase 2.75 →
+ * email_confirm_bundle_details).
+ *
+ * No-op unless the SO's latest scenario is `completed` (the fetch plan just
+ * finished) and we can resolve the trigger reply. Idempotent enough: the
+ * planner reads the audit trail and will only emit steps not already present.
+ */
+export async function replanAfterEngineFetch(
+  salesOrderId: string | null | undefined,
+): Promise<void> {
+  if (!salesOrderId) return;
+  if (!isScenarioEngineEnabled()) return;
+
+  // The fetch plan should have just completed. If a non-terminal plan is still
+  // in flight, leave it alone — maybeAdvanceScenario owns that case.
+  const inFlight = await prisma.scenarioProgress.findFirst({
+    where: { salesOrderId, state: { notIn: ['completed', 'aborted', 'failed'] } },
+    select: { id: true },
+  });
+  if (inFlight) return;
+
+  const latest = await prisma.scenarioProgress.findFirst({
+    where: { salesOrderId },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true, state: true },
+  });
+  if (!latest || latest.state !== 'completed') return;
+
+  const trigger = await loadTriggerReply(latest.id);
+  if (!trigger) {
+    console.warn(`[ENGINE] replanAfterEngineFetch — no trigger reply for SO ${salesOrderId}; cannot re-plan`);
+    return;
+  }
+
+  console.log(`[ENGINE] replanAfterEngineFetch — re-entering handleReplyV2 for SO ${salesOrderId} after engine fetch`);
+  const r = await handleReplyV2({
+    emailId: trigger.emailId,
+    replyHtml: trigger.replyHtml,
+    originalEmailHtml: '',
+    sourceEmailType: trigger.sender === 'production' ? 'branch' : trigger.sender,
+  });
+  for (const line of r.logs) console.log(line);
+}
+
 // Maps engine StepKind → the WorkStep that completes it. Only steps that fire
 // a WorkQueue row have an entry. Used by maybeAdvanceScenario to make sure
 // we're advancing on the right callback.
