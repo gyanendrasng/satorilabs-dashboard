@@ -1825,6 +1825,32 @@ async function fireStep(
     }
 
     case 'zso_visibility': {
+      // BACKSTOP: never run ZSO_Visibility once loading slips exist. Bundles are
+      // frozen for composition the moment any LS exists, and the visibility
+      // callback fans out a fresh ls_dispatch + re-reads the full SO — the
+      // surgical/preserve flow (Rule 6e) deliberately replaces that with
+      // lone_zmatana. If the planner misroutes a frozen-bundle 2nd_release ack
+      // here (Rule 8 vs Rule 6e collision), refuse rather than corrupt the flow.
+      const lsExists = await prisma.loadingSlip.findFirst({
+        where: { salesOrderId: progress.salesOrderId },
+        select: { id: true },
+      });
+      if (lsExists) {
+        log(
+          '[ENGINE] zso_visibility REFUSED — loading slips exist (bundles frozen); ' +
+            'the surgical flow must use lone_zmatana, not a visibility fan-out. ' +
+            'Failing so the planner re-routes via Rule 6e.',
+        );
+        await prisma.scenarioProgress.update({
+          where: { id: progress.id },
+          data: {
+            state: 'failed',
+            error:
+              'zso_visibility refused: loading slips exist (bundles frozen). Use lone_zmatana (Rule 6e), not visibility.',
+          },
+        });
+        return 'pause';
+      }
       const soNumber = await soNumberFor(progress.salesOrderId);
       await triggerZsoVisibility(soNumber);
       await markAwaitingCallback(progress.id);

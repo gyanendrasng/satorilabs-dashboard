@@ -550,6 +550,14 @@ trigger email type, to decide whose intent this is.
     in SAP. Apply rule 8 (emit zso_visibility), NOT zload2 /
     email_modified_ls_to_plant. The presence of an existing LSI does not
     change this: rule 8 wins because the trigger email is 2nd_release.
+    **EXCEPTION — surgical / preserve flow (Rule 6e).** If loading slips
+    exist (bundles frozen: yes) AND a \`step_completed bundle_capacity_assessment\`
+    exists after the latest inbound, this 2nd_release ack belongs to Rule 6e,
+    NOT Rule 8. Do NOT emit zso_visibility — its callback fans out an unwanted
+    ls_dispatch and re-runs full visibility, which the bundle-freeze flow
+    deliberately replaces with lone_zmatana. Route by Rule 6e Phase instead
+    (typically Phase 2.5 → lone_zmatana, or Phase 2.75 → email_confirm_product_details
+    once lone_zmatana is done). Rule 8 wins ONLY in the normal pre-LS cycle.
 
   6. INBOUND: branch MODIFY-INCREASE on ls_dispatch (pre-LS, no LSs yet).
      EMIT: stock_precheck → va02 → email_2nd_release. STOP.
@@ -876,22 +884,35 @@ trigger email type, to decide whose intent this is.
      to the BRANCH — they perform the second release — so the reply comes
      from sender=branch. This is the only correct path for a 2nd_release reply.
 
-     Branch on what KIND of modify cycle this 2nd_release belongs to:
+     Branch on what KIND of modify cycle this 2nd_release belongs to. Check in
+     THIS ORDER — the surgical/preserve checks come FIRST and take precedence:
 
-     (a) POST-PLANT_LS PARTIAL-ALLOCATION CYCLE — audit trail also shows
-         \`step_completed bundle_capacity_assessment\` AFTER the latest
-         \`email_received\` (the va02 was Phase 2 of Rule 6e, sized to the
-         placed portion). EMIT lone_zmatana with args.materials =
-         [{ code: "<placed-portion code>" }, ...] for every material the
-         bundle_capacity_assessment placed allocations on (see Rule 6e
-         Phase 2.5). STOP. Do NOT emit zso_visibility — its callback
-         would send an unwanted ls_dispatch.
+     (a0) SURGICAL / PRESERVE — lone_zmatana ALREADY DONE. The audit trail
+         shows \`step_completed lone_zmatana\` AND loading slips exist
+         (bundles frozen: yes), and NO \`email_sent ls_dispatch\` at the
+         current dispatchRound after it. The 2nd_release leg of Rule 6e is
+         finished; the fetch is done. DO NOT re-fire anything from Rule 8 —
+         in particular DO NOT emit zso_visibility (it fans out an unwanted
+         ls_dispatch + redoes full visibility, which the bundle-freeze flow
+         replaced with lone_zmatana). Defer to Rule 6e Phase 2.75 and emit
+         email_confirm_product_details. STOP.
 
-     (b) NORMAL MODIFY CYCLE (pre-plant_ls modify, or post-plant_ls modify
-         without a bundle_capacity_assessment in the trail — including the
-         cross-plant substitution Rule 6c flow). EMIT zso_visibility.
-         STOP. The /visibility-data callback auto-sends round-2
-         ls_dispatch.
+     (a) SURGICAL / PRESERVE — lone_zmatana NOT yet run. The audit trail shows
+         loading slips exist (bundles frozen: yes) AND a
+         \`step_completed bundle_capacity_assessment\` ANYWHERE after the start
+         of this modify cycle (it may be in an earlier segment for Case (ii),
+         where plant_ls was never sent). EMIT lone_zmatana with args.materials =
+         [{ code, delta }, ...] for every material the bundle_capacity_assessment
+         placed allocations on (see Rule 6e Phase 2.5). STOP. Do NOT emit
+         zso_visibility — its callback would send an unwanted ls_dispatch.
+
+     (b) NORMAL MODIFY CYCLE — loading slips DO NOT exist yet (bundles frozen:
+         no), OR there is no bundle_capacity_assessment anywhere in this cycle
+         (the plain pre-plant_ls modify, or the cross-plant substitution Rule 6c
+         flow). EMIT zso_visibility. STOP. The /visibility-data callback
+         auto-sends round-2 ls_dispatch.
+         CRITICAL: if loading slips exist (bundles frozen: yes), you are NOT in
+         this branch — never emit zso_visibility for a frozen-bundle SO.
 
      For BOTH branches:
      Do NOT chain to email_confirm_bundle_details here.
