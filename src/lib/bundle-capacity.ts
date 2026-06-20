@@ -180,10 +180,17 @@ export async function assessPostLsIncrease(
     // Step 1 — pack the current bundle to its remaining capacity first. The
     // existing LS stays on the same bundle (no LSI migration); the extra
     // weight rides the same LS via a ZLOAD2 quantity bump.
+    //
+    // The MIN_ALLOCATION_KG floor exists to avoid FRAGMENTING a delta into
+    // useless slivers across bundles — it must NOT reject a leg that places
+    // the ENTIRE remaining delta. A small total increase (e.g. 47.5 kg) that
+    // fits wholly in the bundle the material already lives on is a clean
+    // ZLOAD2 bump, not a sliver. So: accept the leg if it either clears the
+    // whole remaining amount OR meets the floor.
     if (currentBundleId) {
       const headroom = remainingFor(currentBundleId);
       const take = Math.min(remaining, headroom);
-      if (take >= MIN_ALLOCATION_KG) {
+      if (take > 0 && (take >= remaining || take >= MIN_ALLOCATION_KG)) {
         allocations.push({ kind: 'same_bundle', bundleId: currentBundleId, kg: take });
         debit(currentBundleId, take);
         remaining -= take;
@@ -195,11 +202,18 @@ export async function assessPostLsIncrease(
     // future asks. When no single bundle can absorb the whole residual, take
     // from the LARGEST available (pack the spill in the chunkiest leg first
     // — fewer fragmented LSs).
-    while (remaining >= MIN_ALLOCATION_KG) {
+    //
+    // Loop while there's anything left to place (remaining > 0), not just
+    // while it clears the floor — otherwise a small whole residual (< floor)
+    // that a sibling could fully absorb would be wrongly skipped and end up
+    // as overflow. The floor still applies to the per-leg `take` below (a
+    // partial spill leaves residual, so it must be a meaningful chunk), but a
+    // leg that clears the whole remaining amount is always accepted.
+    while (remaining > 0) {
       const candidates = bundles
         .filter((b) => b.id !== currentBundleId && !dispatchedIds.has(b.id))
         .map((b) => ({ id: b.id, remainingKg: remainingFor(b.id) }))
-        .filter((c) => c.remainingKg >= MIN_ALLOCATION_KG);
+        .filter((c) => c.remainingKg >= Math.min(remaining, MIN_ALLOCATION_KG));
       if (candidates.length === 0) break;
 
       // Prefer a bundle that can take the entire residual (smallest such).
@@ -221,8 +235,11 @@ export async function assessPostLsIncrease(
     // LS-created "preserve" path) rather than a new SO, pack any residual into
     // one or more brand-new bundles, each up to one vehicle's capacity. The
     // engine materializes these via createSingleBundleForPo at execution time.
-    if (overflowMode === 'new_bundle' && remaining >= MIN_ALLOCATION_KG) {
-      while (remaining >= MIN_ALLOCATION_KG) {
+    // Any residual goes here regardless of the floor — once we've decided a new
+    // vehicle is needed, even a small leftover must ride it (it can't overflow
+    // to a SO in the preserve path).
+    if (overflowMode === 'new_bundle' && remaining > 0) {
+      while (remaining > 0) {
         const take = Math.min(remaining, capacityKg);
         allocations.push({ kind: 'new_bundle', bundleId: null, kg: take });
         remaining -= take;
