@@ -1202,7 +1202,7 @@ export async function planNextSteps(args: {
         // nested args, plus per-step rationale strings) and can run long on
         // multi-step modify cycles. Lock the cap here so a low LLM_MAX_TOKENS
         // env value can't truncate the JSON mid-stream and fail the Zod parse.
-        maxTokens: 16000,
+        maxTokens: 50000,
       });
 
       if (!result.text) {
