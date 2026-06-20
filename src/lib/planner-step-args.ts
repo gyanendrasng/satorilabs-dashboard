@@ -236,16 +236,38 @@ export function coerceBranchOverflowArgs(step: PlannedStep | undefined): BranchO
 // ─── lone_zmatana ──────────────────────────────────────────────────────────
 
 /**
- * Returns the list of material codes the planner wants ZMatana run for. The
- * planner emits `{ materials: [{ code }, ...] }`; we project to a flat string
- * array since the trigger function only needs codes.
+ * One material the planner wants ZMatana run for. `delta` is the DELTA quantity
+ * (units) being added for this material — the amount ZMatana should look for
+ * stock against, since the original quantity is already reserved by the
+ * existing loading slips. Optional: omitted on the substitution use-case
+ * (Rule 6e Phase 2.5) where there is no delta concept; the SAP agent then
+ * falls back to the SO line as before.
  */
-export function coerceLoneZmatanaArgs(step: PlannedStep | undefined): string[] {
+export interface LoneZmatanaItem {
+  code: string;
+  delta?: number;
+}
+
+/**
+ * Returns the materials (code + optional delta) the planner wants ZMatana run
+ * for. The planner emits `{ materials: [{ code, delta? }, ...] }`.
+ */
+export function coerceLoneZmatanaArgs(step: PlannedStep | undefined): LoneZmatanaItem[] {
   const args = requireArgs(step, 'lone_zmatana');
   const materials = requireArray(args.materials, 'materials', 'lone_zmatana');
   return materials.map((raw, i) => {
     const m = raw as Record<string, unknown>;
-    return asString(m.code, `materials[${i}].code`, 'lone_zmatana');
+    const code = asString(m.code, `materials[${i}].code`, 'lone_zmatana');
+    let delta: number | undefined;
+    if (m.delta !== undefined && m.delta !== null) {
+      delta = asInt(m.delta, `materials[${i}].delta`, 'lone_zmatana');
+      if (delta <= 0) {
+        throw new PlannerArgsError(
+          `lone_zmatana.args.materials[${i}].delta must be a positive integer when present, got ${delta}`,
+        );
+      }
+    }
+    return { code, delta };
   });
 }
 

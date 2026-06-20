@@ -1839,10 +1839,13 @@ async function fireStep(
       // the callback.
       const { coerceLoneZmatanaArgs } = await import('./planner-step-args');
       const { triggerLoneZmatana } = await import('./auto-gui-trigger');
-      const codes = coerceLoneZmatanaArgs(_plannedStep);
+      const items = coerceLoneZmatanaArgs(_plannedStep);
       const soNumber = await soNumberFor(progress.salesOrderId);
-      log(`[ENGINE] lone_zmatana firing for ${codes.length} material(s): ${codes.join(', ')}`);
-      await triggerLoneZmatana(soNumber, codes);
+      const describe = items
+        .map((i) => (i.delta !== undefined ? `${i.code}(Δ${i.delta})` : i.code))
+        .join(', ');
+      log(`[ENGINE] lone_zmatana firing for ${items.length} material(s): ${describe}`);
+      await triggerLoneZmatana(soNumber, items.map((i) => ({ material: i.code, delta: i.delta })));
       await markAwaitingCallback(progress.id);
       return 'pause';
     }

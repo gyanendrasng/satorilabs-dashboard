@@ -161,8 +161,20 @@ function loadManagerPrompt(): string {
 const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: string | null }> = [
   {
     kind: 'stock_precheck',
-    description: 'Free-stock pre-check (replaces Zmatana). Use BEFORE va02 on any increase.',
-    argsSchema: '{ materials: [{ code: "<material code>", op: "inc"|"dec"|"del", qty?: <number, omit for del> }, ...] }',
+    description: 'Free-stock pre-check (replaces Zmatana). Use BEFORE va02 on any increase. ' +
+      'CRITICAL — the qty you check depends on whether loading slips already exist ' +
+      '(read `loading slips exist (bundles frozen)` from CURRENT SO STATE):\n' +
+      '  • NO loading slips yet → check the FULL new target quantity. The original ' +
+      'amount has not been reserved against stock anywhere, so the whole order must ' +
+      'be available. (e.g. 200 → 220 ⇒ qty: 220.)\n' +
+      '  • Loading slips EXIST (frozen, or about to be wiped+recreated) → check only ' +
+      'the DELTA being added. The original quantity is already accounted for by the ' +
+      'existing loading slips (and in the recreate path the precheck runs BEFORE the ' +
+      'wipe, so those items are still reserved). (e.g. 200 → 220 ⇒ qty: 20.)\n' +
+      'This differs from va02, which ALWAYS takes the absolute new total. So when ' +
+      'loading slips exist, stock_precheck.qty (delta) and va02.qty (new total) are ' +
+      'DIFFERENT numbers for the same material.',
+    argsSchema: '{ materials: [{ code: "<material code>", op: "inc"|"dec"|"del", qty?: <number — FULL new total when no LS exist; DELTA being added when LS exist; omit for del> }, ...] }',
   },
   {
     kind: 'bundle_capacity_assessment',
@@ -181,8 +193,9 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'lone_zmatana',
-    description: 'Run ZMatana standalone for one or more material codes — fetches per-material availability + batch from SAP WITHOUT re-running ZSO_Visibility. Use ONLY when stock_precheck substituted a short material with a cross-plant equivalent (you will see step_completed stock_precheck with a substitutions payload in the audit trail). Sequence: va02 (with the substitute material codes) → lone_zmatana (with the same substitute codes) → email_2nd_release. The substitute Material rows need batch + availableStock populated before any downstream step can ship them.',
-    argsSchema: '{ materials: [{ code: "<substitute material code>" }, ...] }',
+    description: 'Run ZMatana standalone for one or more material codes — fetches per-material availability + batch from SAP WITHOUT re-running ZSO_Visibility. Two uses: (1) when stock_precheck substituted a short material with a cross-plant equivalent (you will see step_completed stock_precheck with a substitutions payload) — sequence va02 → lone_zmatana → email_2nd_release; (2) the surgical/preserve delta path (Rule 6e Phase 2.5) where a new loading slip is being created for an increased material. ' +
+      'DELTA: when loading slips already exist and you are fetching stock for the ADDED quantity only, pass `delta` (units) per material — the SO line already shows the new total after VA02, but the original qty is reserved by existing slips, so ZMatana should look for stock against the delta. OMIT `delta` for the substitution use-case (no delta concept; the SAP agent falls back to the SO line). The Material rows need batch + availableStock populated before any downstream step can ship them.',
+    argsSchema: '{ materials: [{ code: "<material code>", delta?: <units added, positive integer — include when LS exist and only the delta needs stock; omit for substitution> }, ...] }',
   },
   {
     kind: 'mb51',
@@ -540,6 +553,9 @@ trigger email type, to decide whose intent this is.
 
   6. INBOUND: branch MODIFY-INCREASE on ls_dispatch (pre-LS, no LSs yet).
      EMIT: stock_precheck → va02 → email_2nd_release. STOP.
+     No loading slips exist yet → stock_precheck.qty = the FULL new target
+     quantity (e.g. 200 → 220 ⇒ check 220), since nothing is reserved yet.
+     va02.qty is also the full new total here, so the two match in this case.
 
   6b. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL — LOADING SLIPS
       EXIST (CURRENT SO STATE shows \`loading slips exist (bundles frozen): yes\`,
@@ -568,6 +584,12 @@ trigger email type, to decide whose intent this is.
       EMIT: zloading_close (args.all=true) → stock_precheck → va02 →
       email_2nd_release. STOP.
       Do NOT emit zload2 in this path — recreate NEVER uses zload2.
+      LOADING SLIPS EXIST here (bundles frozen: yes), so stock_precheck.qty =
+      the DELTA being added, NOT the new total (e.g. 200 → 220 ⇒ check 20). The
+      original quantity is still reserved by the existing loading slips at the
+      moment the precheck runs — the precheck is sequenced BEFORE the wipe takes
+      effect — so only the added delta needs fresh stock. va02.qty stays the
+      absolute new total (220), so the two numbers differ.
       Downstream: after the branch acks 2nd_release, Rule 8 fires zso_visibility,
       the visibility callback auto-sends a round-2 ls_dispatch, the branch
       accepts the new material list (Rule 9 case a → email_confirm_bundle_details
@@ -717,9 +739,14 @@ trigger email type, to decide whose intent this is.
         a post-plant_ls 2nd_release ack to here.) DO NOT emit
         zso_visibility — its visibility-data callback would fan out into
         an unwanted ls_dispatch email. Instead emit:
-            lone_zmatana with materials = [{ code }, ...] for the
+            lone_zmatana with materials = [{ code, delta }, ...] for the
             placed-portion material list from the bundle_capacity_assessment
-            verdicts (the same list VA02 just bumped).
+            verdicts (the same list VA02 just bumped). delta = the ADDED
+            units per material (shipKg converted to units via
+            Material.orderWeightKg — the same delta you used for the va02
+            target minus the prior SO qty). Loading slips already exist
+            here, so ZMatana only needs stock for the delta, NOT the new
+            total.
         STOP. zmatana-data writes batch + availableStock onto Material
         rows for those codes, emits step_completed lone_zmatana, and
         re-enters this planner.

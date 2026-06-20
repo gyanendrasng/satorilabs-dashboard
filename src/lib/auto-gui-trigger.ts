@@ -1821,16 +1821,33 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
  * `materials[]` array (batch + available_stock_for_so per material), mirroring
  * the ZSO-VISIBILITY response shape.
  */
+/**
+ * One material for LONE-ZMATANA. `delta` (units) is the additional quantity
+ * being added for this material — the amount ZMatana should look for stock
+ * against. The SO line already shows the NEW total after VA02, but the original
+ * quantity is reserved by existing loading slips, so only the delta needs fresh
+ * stock. Optional: when omitted (e.g. the cross-plant substitution flow) the
+ * SAP agent falls back to the SO line as before.
+ */
+export type LoneZmatanaMaterial = string | { material: string; delta?: number };
+
 export async function triggerLoneZmatana(
   soNumber: string,
-  materialCodes: string[],
+  materials: LoneZmatanaMaterial[],
 ): Promise<void> {
-  if (materialCodes.length === 0) {
+  if (materials.length === 0) {
     console.log(`[LONE-ZMATANA] No materials provided for SO ${soNumber} — skipping`);
     return;
   }
-  // Sort so the dedup key is stable regardless of caller ordering.
-  const normalized = Array.from(new Set(materialCodes)).sort();
+  // Normalize to {material, delta?} and dedup by code (last delta wins).
+  const byCode = new Map<string, { material: string; delta?: number }>();
+  for (const m of materials) {
+    const entry = typeof m === 'string' ? { material: m } : { material: m.material, delta: m.delta };
+    byCode.set(entry.material, entry);
+  }
+  // Sort so the dedup key + instruction are stable regardless of caller ordering.
+  const normalizedItems = Array.from(byCode.values()).sort((a, b) => a.material.localeCompare(b.material));
+  const normalized = normalizedItems.map((e) => e.material);
   const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
 
   // Dedup on (soNumber, sorted-material-set) — calling triggerLoneZmatana twice
@@ -1867,11 +1884,21 @@ export async function triggerLoneZmatana(
         so_number: soNumber,
         materials: normalized,
         materials_key: materialsKey,
+        // Per-material delta (units) the SAP agent should look for stock
+        // against. The SO line already shows the new total post-VA02, but the
+        // original qty is reserved by existing loading slips — so only the
+        // delta needs fresh stock. Each entry: { material, delta? }. `delta`
+        // is omitted when the caller didn't supply one (substitution flow),
+        // in which case the agent falls back to the SO line.
+        materials_detail: normalizedItems.map((e) => ({ material: e.material, delta: e.delta ?? null })),
       },
     },
   });
   await pumpQueue();
-  console.log(`[LONE-ZMATANA] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${materialList})`);
+  const deltaSummary = normalizedItems
+    .map((e) => (e.delta !== undefined ? `${e.material}(Δ${e.delta})` : e.material))
+    .join(', ');
+  console.log(`[LONE-ZMATANA] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${deltaSummary})`);
 }
 
 /**
