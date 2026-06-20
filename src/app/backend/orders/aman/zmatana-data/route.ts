@@ -25,8 +25,9 @@ interface ZmatanaPayload extends ZmatanaMaterial {
   soNumber?: string;
   /** Multi-material response (preferred): one LONE-ZMATANA run carries every
    *  requested material, mirroring ZSO-VISIBILITY. The top-level single-material
-   *  fields above remain accepted for backward compatibility. */
-  materials?: ZmatanaMaterial[];
+   *  fields above remain accepted for backward compatibility. Entries may be
+   *  bare code strings (echoed meta.materials) — normalized before use. */
+  materials?: Array<ZmatanaMaterial | string>;
 }
 
 /**
@@ -66,9 +67,14 @@ export async function POST(request: Request) {
     // Normalize to a material list. Preferred: a `materials[]` array (one
     // LONE-ZMATANA run reports every requested material). Fallback: the legacy
     // single-material top-level fields.
+    // Some auto_gui2 responses send each entry as a bare code STRING (echoing
+    // the request's meta.materials) instead of an object. Normalize so a string
+    // "CODE" becomes { material: "CODE" } rather than being skipped.
     const rawMaterials: ZmatanaMaterial[] =
       Array.isArray(body.materials) && body.materials.length > 0
-        ? body.materials
+        ? body.materials.map((m) =>
+            typeof m === 'string' ? ({ material: m } as ZmatanaMaterial) : m,
+          )
         : [body];
 
     if (!soNumber) {

@@ -21,7 +21,9 @@ interface VisibilityPayload {
   so_number?: string;
   soNumber?: string;
   email_body?: string; // legacy; no longer required — dashboard composes the HTML itself
-  materials: VisibilityMaterial[];
+  // Entries are normally objects; some flows (LONE-ZMATANA echo) send bare code
+  // strings. Both are normalized to VisibilityMaterial before use.
+  materials: Array<VisibilityMaterial | string>;
 }
 
 /**
@@ -112,43 +114,76 @@ export async function POST(request: Request) {
     // email (matches existing convention, e.g. YOGRFL0000000SMP|N/A|10|0).
     let persisted = 0;
     let skipped = 0;
-    for (const raw of materials) {
+    for (const rawEntry of materials) {
+      // Defensive: some auto_gui2 responses (notably the LONE-ZMATANA flow,
+      // which echoes the request's `meta.materials` string array) send each
+      // entry as a bare code string instead of an object. Normalize so a
+      // string "CODE" is treated as { material: "CODE" } rather than skipped.
+      const raw: VisibilityMaterial =
+        typeof rawEntry === 'string' ? ({ material: rawEntry } as VisibilityMaterial) : rawEntry;
       const materialCode = raw.material ?? raw.material_code ?? '';
       if (!materialCode) {
-        console.warn(`[VisibilityData] Skipping material row missing code:`, raw);
+        console.warn(`[VisibilityData] Skipping material row missing code:`, rawEntry);
         skipped++;
         continue;
       }
       const rawBatch = raw.batch ?? raw.batch_number ?? '';
+      const hasBatch = rawBatch.length > 0;
       const batch = rawBatch || 'N/A';
-      await prisma.material.upsert({
-        where: {
-          salesOrderId_material: {
+      const hasOrderQty = typeof raw.order_quantity === 'number' && Number.isFinite(raw.order_quantity);
+
+      // A sparse entry (e.g. a bare code echoed by the LONE-ZMATANA flow) carries
+      // no batch/qty/stock. We must NOT overwrite the existing row's real data
+      // with nulls, nor try to CREATE a row without the required orderQuantity.
+      // So: build an update that only sets fields actually present, and skip the
+      // create path entirely when there's no orderQuantity to seed it with.
+      const existing = await prisma.material.findUnique({
+        where: { salesOrderId_material: { salesOrderId: salesOrder.id, material: materialCode } },
+        select: { id: true },
+      });
+
+      if (!existing && !hasOrderQty) {
+        console.warn(
+          `[VisibilityData] Sparse material entry (no order_quantity) and no existing row for ${materialCode} — skipping`,
+        );
+        skipped++;
+        continue;
+      }
+
+      // Only include fields the payload actually provided, so a sparse entry
+      // doesn't clobber a fully-populated existing row.
+      const data: Record<string, unknown> = {};
+      if (raw.material_description !== undefined) data.materialDescription = raw.material_description ?? null;
+      if (hasBatch) data.batch = batch;
+      if (hasOrderQty) data.orderQuantity = raw.order_quantity;
+      if (raw.available_stock_for_so !== undefined && raw.available_stock_for_so !== null) {
+        data.availableStock = raw.available_stock_for_so;
+      }
+      if (raw.order_weight_kg !== undefined && raw.order_weight_kg !== null) {
+        data.orderWeightKg = raw.order_weight_kg;
+      }
+
+      if (existing) {
+        if (Object.keys(data).length > 0) {
+          await prisma.material.update({
+            where: { salesOrderId_material: { salesOrderId: salesOrder.id, material: materialCode } },
+            data,
+          });
+        }
+      } else {
+        // hasOrderQty is guaranteed here. batch defaults to N/A if absent.
+        await prisma.material.create({
+          data: {
             salesOrderId: salesOrder.id,
             material: materialCode,
+            materialDescription: raw.material_description ?? null,
+            batch,
+            orderQuantity: raw.order_quantity as number,
+            availableStock: raw.available_stock_for_so ?? null,
+            orderWeightKg: raw.order_weight_kg ?? null,
           },
-        },
-        // `batch` is updated too: SAP may return a different (reordered /
-        // augmented) batch string for the same material on a later
-        // ZSO_Visibility run. One row per (SO, material) — overwrite the
-        // batch field with whatever SAP last reported.
-        update: {
-          materialDescription: raw.material_description ?? null,
-          batch,
-          orderQuantity: raw.order_quantity,
-          availableStock: raw.available_stock_for_so ?? null,
-          orderWeightKg: raw.order_weight_kg ?? null,
-        },
-        create: {
-          salesOrderId: salesOrder.id,
-          material: materialCode,
-          materialDescription: raw.material_description ?? null,
-          batch,
-          orderQuantity: raw.order_quantity,
-          availableStock: raw.available_stock_for_so ?? null,
-          orderWeightKg: raw.order_weight_kg ?? null,
-        },
-      });
+        });
+      }
       persisted++;
     }
     console.log(
@@ -176,7 +211,10 @@ export async function POST(request: Request) {
     // completed milestone the next time it builds a plan for this SO.
     try {
       const { emitEvent } = await import('@/lib/scenario-events');
-      const matSample = materials.slice(0, 3).map((m) => {
+      const asMat = (m: VisibilityMaterial | string): VisibilityMaterial =>
+        typeof m === 'string' ? ({ material: m } as VisibilityMaterial) : m;
+      const matSample = materials.slice(0, 3).map((rawM) => {
+        const m = asMat(rawM);
         const code = m.material ?? m.material_code ?? '?';
         const avail = m.available_stock_for_so ?? '?';
         return `${code}=${avail}`;
@@ -189,11 +227,14 @@ export async function POST(request: Request) {
           kind: 'zso_visibility',
           scenario_key: 'cron-driven',
           sap_output: {
-            materials: materials.map((m) => ({
-              material: m.material ?? m.material_code,
-              ordered: m.order_quantity,
-              available: m.available_stock_for_so,
-            })),
+            materials: materials.map((rawM) => {
+              const m = asMat(rawM);
+              return {
+                material: m.material ?? m.material_code,
+                ordered: m.order_quantity,
+                available: m.available_stock_for_so,
+              };
+            }),
           },
           summary: `materials ${matSample}${more}`,
         },
