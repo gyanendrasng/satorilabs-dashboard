@@ -2382,18 +2382,17 @@ async function fireStep(
         orderBy: { createdAt: 'desc' },
         select: { createdAt: true, payload: true },
       });
-      const latestEmailReceived = await prisma.scenarioEvent.findFirst({
-        where: {
-          salesOrderId: progress.salesOrderId,
-          type: 'email_received',
-        },
-        orderBy: { createdAt: 'desc' },
-        select: { createdAt: true },
-      });
-      const assessmentNewerThanInbound =
-        latestAssessment !== null &&
-        (latestEmailReceived === null || latestAssessment.createdAt >= latestEmailReceived.createdAt);
-      if (assessmentNewerThanInbound) {
+      // We used to gate on "assessment newer than latest email_received", but
+      // by Phase 2.875 several inbounds have stacked (branch confirms material
+      // list, branch will confirm bundle plan, etc.) so that comparison is
+      // always false and the engine fell back to the bundler-preview path.
+      // The bundler then renders "X moved to Bundle -1" because its proposed
+      // plan doesn't carry the surgical-flow material at all.
+      //
+      // The right gate is just: a bundle_capacity_assessment exists AND any LS
+      // exists. Both imply we're in the surgical/preserve flow where bundles
+      // are frozen for composition; the bundler-preview path MUST be skipped.
+      if (latestAssessment !== null) {
         // Fire the upcoming-changes renderer whenever loading slips EXIST for
         // this SO — not only once they're sent_to_plant. The LS-created-but-
         // not-sent "preserve" flow runs the same surgical assessment, so it
