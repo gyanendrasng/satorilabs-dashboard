@@ -1794,6 +1794,20 @@ async function fireStep(
       log(`[ENGINE] va02 firing for ${merged.length} line(s) (${items.length} increase, ${pending.length} pending dec/del): ${describe}`);
       await triggerVa02(soNumber, merged);
 
+      // Persist the INCREASE targets onto the SO line. `coerceVa02Args` returns
+      // the new ABSOLUTE total per material (e.g. 210), which is exactly what we
+      // just sent to SAP — so the DB Material.orderQuantity must match. Without
+      // this, the surgical-increase flow left orderQuantity stuck at the old
+      // value (e.g. 200) because nothing else writes it: visibility-data isn't
+      // called in this flow and zmatana-data deliberately skips orderQuantity.
+      // Mirrors the pending-dec flush write below.
+      for (const it of items) {
+        await prisma.material.updateMany({
+          where: { salesOrderId: progress.salesOrderId, material: it.material },
+          data: { orderQuantity: it.orderQuantity },
+        });
+      }
+
       // Optimistically reconcile the DB + clear the pending flags. There is no
       // per-material VA02 callback to hang a precise clear on (step-status only
       // flips the WorkQueue row), and VA02 is the only flush trigger — so we
@@ -1994,15 +2008,29 @@ async function fireStep(
         await triggerZload2(bucket.lsNumber, bucket.items);
       }
 
-      // Record the SO-line decrease as PENDING. The LS was just revised above;
-      // the SO line stays high until the next VA02 flushes this. `orderQuantity`
-      // on the revision is the new absolute target — the same value the SO line
-      // should land on. updateMany is a no-op if the Material row is missing.
+      // Record the SO-line decrease as PENDING — but ONLY for a GENUINE decrease.
+      // ZLOAD2 also carries the new LS total for a surgical INCREASE (Rule 6e
+      // same_bundle: qty = existing LSI qty + added units, e.g. 210). For an
+      // increase the SO line was already raised to that total by the Phase 2
+      // va02 (persisted above), so stamping pendingSoOp='dec' here was wrong — it
+      // mislabeled the increase as a pending decrease and a later unrelated va02
+      // would flush the SO line back down. Only stamp pending-dec when the
+      // revision is strictly below the current SO line.
+      const curRows = await prisma.material.findMany({
+        where: { salesOrderId: progress.salesOrderId, material: { in: requested.map((r) => r.material) } },
+        select: { material: true, orderQuantity: true },
+      });
+      const curByCode = new Map(curRows.map((m) => [m.material, m.orderQuantity]));
       for (const r of requested) {
-        await prisma.material.updateMany({
-          where: { salesOrderId: progress.salesOrderId, material: r.material },
-          data: { pendingSoOp: 'dec', pendingSoQty: r.orderQuantity },
-        });
+        const cur = curByCode.get(r.material);
+        if (cur !== undefined && r.orderQuantity < cur) {
+          // Genuine decrease: LS revised now, SO line flushed on the next va02.
+          await prisma.material.updateMany({
+            where: { salesOrderId: progress.salesOrderId, material: r.material },
+            data: { pendingSoOp: 'dec', pendingSoQty: r.orderQuantity },
+          });
+        }
+        // equal / increase → SO line already at (or above) target; no pending dec.
       }
 
       await markAwaitingCallback(progress.id);
