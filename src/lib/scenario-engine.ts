@@ -359,9 +359,15 @@ export async function sendSecondReleaseEmail(args: {
   //       quantity, so the plant has the complete picture without having to
   //       reconcile against an earlier email.
   //
-  // Source of truth for "previous quantity": Material.dispatchQuantity, which
-  // VA02 doesn't touch on our side — it still reflects the first-round
-  // confirmed values at this point in the flow.
+  // Source of truth for the "previous quantity" (the LHS of "200 → 210"): the
+  // physical loading-slip quantity (LSI), NOT Material.dispatchQuantity.
+  // VA02 fires immediately BEFORE this email (Phase 2: stock_precheck → va02 →
+  // email_2nd_release) and now bumps dispatchQuantity to the new total (210) so
+  // the later bundle-confirmation line can read it. Reading dispatchQuantity
+  // here would therefore show the no-op "210 → 210". The loading slips are not
+  // touched until ZLOAD2 (Phase 3), so LSI still holds the pre-increase qty
+  // (200) — the correct "was" value. Same rationale as `lsiQtyByCode` in
+  // sendDispatchConfirmationWithUpcomingChanges.
   const soMaterials = await prisma.material.findMany({
     where: { salesOrderId },
     select: {
@@ -373,6 +379,18 @@ export async function sendSecondReleaseEmail(args: {
     },
     orderBy: { createdAt: 'asc' },
   });
+
+  // Physical pre-change quantity per material, summed across its loading-slip
+  // items. Empty when no LS exist yet (pre-LS path) — fall back to
+  // dispatchQuantity/orderQuantity in that case.
+  const lsiRows = await prisma.loadingSlipItem.findMany({
+    where: { salesOrderId },
+    select: { material: true, orderQuantity: true },
+  });
+  const lsiQtyByCode = new Map<string, number>();
+  for (const r of lsiRows) {
+    lsiQtyByCode.set(r.material, (lsiQtyByCode.get(r.material) ?? 0) + (r.orderQuantity ?? 0));
+  }
 
   // Index modifications by material code for quick lookup.
   const modsByCode = new Map<string, EmailMaterialMod>();
@@ -387,7 +405,10 @@ export async function sendSecondReleaseEmail(args: {
     if (!mod) continue;
     const op = mod.operation ?? 'keep';
     const desc = m.materialDescription || m.material;
-    const wasQty = m.dispatchQuantity ?? m.orderQuantity ?? 0;
+    // "was" = pre-change physical LS qty when loading slips exist (VA02 has
+    // already mutated dispatchQuantity by now); fall back to the Material
+    // fields only on the pre-LS path where no LSI row exists.
+    const wasQty = lsiQtyByCode.get(m.material) ?? m.dispatchQuantity ?? m.orderQuantity ?? 0;
     if (op === 'delete') {
       changeLines.push(`  - Delete ${desc} (Batch ${m.batch}) — was ${wasQty}`);
     } else if (op === 'increase' || op === 'decrease') {
