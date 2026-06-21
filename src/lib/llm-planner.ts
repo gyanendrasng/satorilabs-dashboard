@@ -819,9 +819,19 @@ trigger email type, to decide whose intent this is.
               units}]. ONE zload1 per new_bundle leg. The engine creates a
               fresh bundle (extra vehicle), links the material, and appends the
               LS. batch comes from the lone_zmatana Material row.
-          (3) email_modified_ls_to_plant. Emitted in BOTH cases. The engine
-              forwards only the touched LSs when plant_ls was already sent
-              (case i), or the FULL LS set on first intimation (case ii).
+          (3) PLANT INTIMATION — differs by case:
+              CASE (i) (plant_ls ALREADY sent): EMIT email_modified_ls_to_plant.
+                The engine forwards ONLY the touched LSs (the plant already has
+                the rest).
+              CASE (ii) (plant_ls NOT yet sent): the plant has NEVER seen these
+                loading slips, and vehicle details must be gathered from the
+                branch BEFORE the first plant intimation. So do NOT send the
+                plant email yet — instead EMIT email_to_branch_for_vehicle to
+                collect vehicle details for the (now-final) bundle plan. STOP.
+                When the branch replies with vehicle details, that reply routes
+                to email_to_plant, which forwards the FULL LS set to the plant
+                (first intimation). Order for case (ii): zload2/zload1 legs →
+                email_to_branch_for_vehicle → (on reply) email_to_plant (full set).
           (4) CASE (i) ONLY — if overflowKgTotal > 0:
               EMIT email_branch_request_new_so with args.items =
               [{material, deltaKg: overflowKg}, ...] for ONLY the
