@@ -951,6 +951,10 @@ export async function handleReplyV2(args: {
       subject: email.subject,
       body_excerpt: stripAndExcerpt(args.replyHtml, 300),
       gmailMessageId: email.gmailMessageId,
+      // Surface a received PDF (e.g. a plant invoice) so the planner's audit
+      // trail shows it. Without this the LLM only sees the reply text and
+      // assumes no invoice arrived, looping on await_plant_invoice.
+      hasPdfAttachment: !!email.replyPdfUrl,
     },
   });
 

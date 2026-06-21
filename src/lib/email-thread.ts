@@ -56,6 +56,7 @@ export async function renderEmailThreadForSO(args: {
       emailType: true,
       sentBody: true,
       replyHtml: true,
+      replyPdfUrl: true,
     },
   });
 
@@ -68,6 +69,9 @@ export async function renderEmailThreadForSO(args: {
     subject: string;
     body: string;
     emailType: string | null;
+    /** Inbound reply carried a PDF attachment (e.g. a plant invoice). The
+     *  planner can't see attachments otherwise, so we surface it explicitly. */
+    hasPdf: boolean;
   };
   const entries: Entry[] = [];
 
@@ -80,6 +84,7 @@ export async function renderEmailThreadForSO(args: {
         subject: r.subject,
         body: stripHtml(r.sentBody).slice(0, 1500),
         emailType: r.emailType,
+        hasPdf: false,
       });
     }
     if (r.replyHtml && r.repliedAt) {
@@ -90,6 +95,7 @@ export async function renderEmailThreadForSO(args: {
         subject: `Re: ${r.subject}`,
         body: stripHtml(r.replyHtml).slice(0, 1500),
         emailType: r.emailType,
+        hasPdf: !!r.replyPdfUrl,
       });
     }
   }
@@ -118,7 +124,10 @@ export async function renderEmailThreadForSO(args: {
           : `${e.counterparty} → US`;
       const typeLabel = e.emailType ? ` [type=${e.emailType}]` : '';
       const marker = i === latestInboundIdx ? '   ← LATEST INBOUND (plan for THIS)' : '';
-      return `--- ${turn} [${iso}] ${dirLabel}${typeLabel}${marker} ---\nSubject: ${e.subject}\n${e.body}`;
+      // Make a received PDF unmissable — the LLM otherwise sees only the text
+      // body and assumes no invoice was attached.
+      const pdfTag = e.hasPdf ? '\n[PDF ATTACHMENT RECEIVED]' : '';
+      return `--- ${turn} [${iso}] ${dirLabel}${typeLabel}${marker} ---\nSubject: ${e.subject}\n${e.body}${pdfTag}`;
     })
     .join('\n\n');
 }

@@ -62,7 +62,10 @@ function summarizePayload(type: string, p: Record<string, unknown>): string {
       const from = String(p.from ?? p.sender ?? '?');
       const subject = truncate(String(p.subject ?? ''), 60);
       const excerpt = truncate(String(p.body_excerpt ?? p.replyBody ?? ''), 80);
-      return `from ${from}${subject ? ` — Subject "${subject}"` : ''}${excerpt ? ` — "${excerpt}"` : ''}`;
+      // A received PDF (e.g. a plant invoice) must be visible to the planner —
+      // otherwise it can't tell an invoice arrived and loops on await_plant_invoice.
+      const pdf = p.hasPdfAttachment ? ' [HAS PDF ATTACHMENT]' : '';
+      return `from ${from}${subject ? ` — Subject "${subject}"` : ''}${excerpt ? ` — "${excerpt}"` : ''}${pdf}`;
     }
     case 'classifier_decision': {
       const action = p.action ? String(p.action) : null;

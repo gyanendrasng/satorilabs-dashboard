@@ -259,7 +259,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'process_plant_invoice',
-    description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use when the latest plant reply has a PDF attachment.',
+    description: 'Plant has sent an invoice PDF on a plant_ls reply. Run ZLOAD3+ZSO_Auto via the batch sender. Use WHENEVER the latest plant reply on a plant_ls thread shows "[PDF ATTACHMENT RECEIVED]" in the email thread (or the audit trail shows "[HAS PDF ATTACHMENT]" on its email_received) — that attached PDF IS the plant invoice, regardless of what the reply text says (plants often also ask for the client invoice in the same email; ignore that, the PDF is what matters). Emit this, NOT await_plant_invoice and NOT email_clarify_plant. The batch sender is scoped per (bundle, SO) and only fires ZLOAD3 once every loading slip in that bundle has replied with its PDF, so it is safe to emit on each plant reply.',
     argsSchema: null,
   },
   {
@@ -294,7 +294,7 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'await_plant_invoice',
-    description: 'Sentinel — pause execution until the plant emails an invoice. The next plant reply will resume.',
+    description: 'Sentinel — pause until the plant emails an invoice. Use ONLY when the plant has acknowledged the loading slip but its reply has NO PDF attachment (no "[PDF ATTACHMENT RECEIVED]" in the thread / "[HAS PDF ATTACHMENT]" in the audit trail). If a PDF WAS received, the invoice has ALREADY arrived → emit process_plant_invoice instead. NEVER emit email_clarify_plant asking the plant to send an invoice they already attached.',
     argsSchema: null,
   },
   {
