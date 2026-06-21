@@ -1227,19 +1227,13 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
     return;
   }
 
-  // Load the existing bundle plan EXACTLY as `sendDispatchConfirmationEmail`
-  // loads it for the renderer — same shape, same select set, same ordering.
-  // No bundler call.
+  // Existing bundles on the PO — only id + number are needed now (bundle-number
+  // lookups + new-vehicle numbering). The per-bundle material listing is built
+  // from loading-slip items below, not from these rows.
   const bundlesForEmail = await prisma.bundle.findMany({
     where: { purchaseOrderId },
     orderBy: { bundleNumber: 'asc' },
-    include: {
-      materials: {
-        where: { dispatchQuantity: { gt: 0 } },
-        include: { salesOrder: { select: { soNumber: true, plant: true } } },
-        orderBy: [{ material: 'asc' }],
-      },
-    },
+    select: { id: true, bundleNumber: true },
   });
 
   // Look up Material rows for the placed-portion materials so we can convert
@@ -1339,28 +1333,151 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
     }
   }
 
-  // Totals for the email intro line. Same formula `sendDispatchConfirmationEmail`
-  // uses: sum of per-material itemKg derived from dispatchQuantity / orderQty
-  // * orderWeightKg, across every bundle's materials.
-  let totalKg = 0;
-  for (const b of bundlesForEmail) {
-    for (const m of b.materials) {
-      const dispatchQty = m.dispatchQuantity ?? 0;
-      const orderedQty = m.orderQuantity || 0;
-      const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
-      if (orderedQty > 0 && dispatchQty > 0 && fullWeight > 0) {
-        totalKg += (dispatchQty / orderedQty) * fullWeight;
-      }
+  // ── Build the PROPOSED post-execution per-bundle listing ──
+  // We CANNOT read the grouped listing from Material rows: a Material row has
+  // one bundleId, but an `other_bundle` append splits a material across two
+  // bundles (e.g. 63 stays on Bundle 1, +10 lands on Bundle 3). So derive the
+  // listing from the physical loading-slip items and overlay the pending
+  // allocations — this renders the split correctly on each bundle, keeps the
+  // same_bundle case right (200 LSI + 10 alloc = 210), and makes the header
+  // total exact (no double-count of the delta).
+
+  // (a) Every LSI physically on this PO's bundles (all SOs), with bundle + SO.
+  const lsiAll = await prisma.loadingSlipItem.findMany({
+    where: { loadingSlip: { bundle: { purchaseOrderId } } },
+    select: {
+      material: true,
+      batch: true,
+      orderQuantity: true,
+      salesOrderId: true,
+      loadingSlip: { select: { bundleId: true } },
+    },
+  });
+
+  // (b) Per-(SO, material) metadata: basis qty + full weight (for kgPerUnit) and
+  //     SO labels for the render. Covers both the LSI materials and the
+  //     allocation materials (all on THIS salesOrderId).
+  const metaPairs = Array.from(
+    new Map(
+      [
+        ...lsiAll.map((l) => [`${l.salesOrderId}|${l.material}`, { salesOrderId: l.salesOrderId, material: l.material }] as const),
+        ...allocations.map((a) => [`${salesOrderId}|${a.material}`, { salesOrderId, material: a.material }] as const),
+      ],
+    ).values(),
+  );
+  const metaRows = metaPairs.length > 0
+    ? await prisma.material.findMany({
+        where: { OR: metaPairs.map((p) => ({ salesOrderId: p.salesOrderId, material: p.material })) },
+        select: {
+          salesOrderId: true, material: true, batch: true, orderQuantity: true, orderWeightKg: true,
+          salesOrder: { select: { soNumber: true, plant: true } },
+        },
+      })
+    : [];
+  const metaByKey = new Map<string, { batch: string; orderQuantity: number; orderWeightKg: number; kgPerUnit: number; soNumber: string; plant: string | null }>();
+  for (const m of metaRows) {
+    const oq = m.orderQuantity || 0;
+    const w = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    metaByKey.set(`${m.salesOrderId}|${m.material}`, {
+      batch: m.batch ?? '', orderQuantity: oq, orderWeightKg: w,
+      kgPerUnit: oq > 0 && w > 0 ? w / oq : 0,
+      soNumber: m.salesOrder.soNumber, plant: m.salesOrder.plant,
+    });
+  }
+
+  type ListLine = { material: string; batch: string; soNumber: string; plant: string | null; qty: number; orderQuantity: number; orderWeightKg: number };
+  const linesByBundle = new Map<string, Map<string, ListLine>>(); // bundleId → lineKey → line
+  const lineKeyOf = (soId: string, material: string, batch: string) => `${soId}|${material}|${batch}`;
+  const ensureBundle = (bid: string) => {
+    let m = linesByBundle.get(bid);
+    if (!m) { m = new Map(); linesByBundle.set(bid, m); }
+    return m;
+  };
+  const newLine = (soId: string, material: string, batch: string, qty: number): ListLine => {
+    const meta = metaByKey.get(`${soId}|${material}`);
+    return {
+      material, batch,
+      soNumber: meta?.soNumber ?? '', plant: meta?.plant ?? null,
+      qty,
+      orderQuantity: meta?.orderQuantity ?? qty,
+      orderWeightKg: meta?.orderWeightKg ?? 0,
+    };
+  };
+
+  // Seed from physical LSI (current state).
+  for (const l of lsiAll) {
+    const bid = l.loadingSlip?.bundleId;
+    if (!bid) continue;
+    const m = ensureBundle(bid);
+    const k = lineKeyOf(l.salesOrderId, l.material, l.batch);
+    const existing = m.get(k);
+    if (existing) existing.qty += l.orderQuantity ?? 0;
+    else m.set(k, newLine(l.salesOrderId, l.material, l.batch, l.orderQuantity ?? 0));
+  }
+
+  // Overlay pending allocations (all on THIS salesOrderId).
+  let nextNewBundleNumber = bundlesForEmail.length; // synthetic new vehicles count up from here
+  const syntheticNewBundleNumberById = new Map<string, number>();
+  for (const a of allocations) {
+    const meta = metaByKey.get(`${salesOrderId}|${a.material}`);
+    const kgPerUnit = meta?.kgPerUnit ?? materialByCode.get(a.material)?.kgPerUnit ?? 0;
+    const addedUnits = kgPerUnit > 0 ? Math.round(a.kg / kgPerUnit) : 0;
+    if (addedUnits <= 0) continue;
+    const batch = meta?.batch ?? materialByCode.get(a.material)?.batch ?? '';
+
+    if (a.kind === 'new_bundle') {
+      nextNewBundleNumber += 1;
+      const synthId = `__new_${nextNewBundleNumber}`;
+      syntheticNewBundleNumberById.set(synthId, nextNewBundleNumber);
+      ensureBundle(synthId).set(lineKeyOf(salesOrderId, a.material, batch), newLine(salesOrderId, a.material, batch, addedUnits));
+      continue;
+    }
+    if (!a.bundleId) continue;
+    const m = ensureBundle(a.bundleId);
+    if (a.kind === 'same_bundle') {
+      // Bump the material's existing line on this bundle (match by material).
+      let target: ListLine | undefined;
+      for (const line of m.values()) { if (line.material === a.material) { target = line; break; } }
+      if (target) target.qty += addedUnits;
+      else m.set(lineKeyOf(salesOrderId, a.material, batch), newLine(salesOrderId, a.material, batch, addedUnits));
+    } else {
+      // other_bundle: a NEW LS line lands on the target bundle.
+      const k = lineKeyOf(salesOrderId, a.material, batch);
+      const existing = m.get(k);
+      if (existing) existing.qty += addedUnits;
+      else m.set(k, newLine(salesOrderId, a.material, batch, addedUnits));
     }
   }
-  // Plus the upcoming additions — these aren't on Material.dispatchQuantity yet
-  // (Phase 3 will set that via the ZLOAD callbacks), so add them in for the
-  // header total.
-  for (const a of allocations) totalKg += a.kg;
 
+  // Materialize synthetic BundleForEmail[] (sorted by bundle number).
+  const numberForBundleId = (bid: string): number =>
+    bundleNumberById.get(bid) ?? syntheticNewBundleNumberById.get(bid) ?? 0;
+  const syntheticBundles = Array.from(linesByBundle.entries())
+    .map(([bid, lineMap]) => {
+      const materials = Array.from(lineMap.values())
+        .filter((l) => l.qty > 0)
+        .sort((a, b) => a.material.localeCompare(b.material))
+        .map((l) => ({
+          material: l.material,
+          batch: l.batch,
+          dispatchQuantity: l.qty,
+          orderQuantity: l.orderQuantity,
+          orderWeightKg: l.orderWeightKg,
+          salesOrder: { soNumber: l.soNumber, plant: l.plant },
+        }));
+      const totalWeightKg = materials.reduce(
+        (s, mm) => s + (mm.orderQuantity > 0 ? (mm.dispatchQuantity / mm.orderQuantity) * Number(mm.orderWeightKg) : 0),
+        0,
+      );
+      return { bundleNumber: numberForBundleId(bid), totalWeightKg, materials };
+    })
+    .filter((b) => b.materials.length > 0)
+    .sort((a, b) => a.bundleNumber - b.bundleNumber);
+
+  const totalKg = syntheticBundles.reduce((s, b) => s + Number(b.totalWeightKg), 0);
   const totalTonnes = totalKg / 1000;
   const capacityTonnes = po.weightage ? Number(po.weightage) : 0;
-  const twoVehicles = bundlesForEmail.length > 1;
+  const twoVehicles = syntheticBundles.length > 1;
 
   // pureQtyChange = every allocation stays on the bundle the material already
   // belongs to. When any leg is `other_bundle`, a new LS lands on a different
@@ -1373,7 +1490,7 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
     twoVehicles,
     totalTonnes,
     capacityTonnes,
-    bundles: bundlesForEmail,
+    bundles: syntheticBundles,
     diff,
     pureQtyChange,
   });

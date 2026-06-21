@@ -57,14 +57,20 @@ async function main() {
       dispatchQuantity: 1000, bundleId: bundle.id,
     },
   });
-  // A loading slip carrying the target so findCurrentBundleForMaterial resolves
-  // via LSI → loadingSlip.bundleId (the prod resolution path).
+  // A loading slip carrying BOTH materials so findCurrentBundleForMaterial
+  // resolves via LSI → loadingSlip.bundleId (the prod resolution path) AND the
+  // LSI-based bundle-weight recompute sees the full ~7083 kg. Post-ZLOAD1 every
+  // material physically on a bundle has an LSI — both must be present, or the
+  // weight rollup (now LSI-based) under-counts the bundle.
   const lsNumber = `LS-SI-${Math.floor(Date.now() % 1e7)}`;
   const ls = await prisma.loadingSlip.create({
     data: { salesOrderId: so.id, lsNumber, bundleId: bundle.id, plantEmail: 'plant@example.com', status: 'pending' },
   });
   await prisma.loadingSlipItem.create({
     data: { salesOrderId: so.id, material: TARGET, batch: 'B1', orderQuantity: 200, loadingSlipId: ls.id, lsNumber },
+  });
+  await prisma.loadingSlipItem.create({
+    data: { salesOrderId: so.id, material: FILLER, batch: 'B2', orderQuantity: 1000, loadingSlipId: ls.id, lsNumber },
   });
 
   try {

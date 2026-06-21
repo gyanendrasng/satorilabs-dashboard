@@ -292,6 +292,13 @@ export async function assessPostLsIncrease(
  * LoadingSlip.bundleId because that's authoritative once ZLOAD1 has run.
  * As a fallback we also check `Material.bundleId` (set by the bundler
  * pre-ZLOAD1).
+ *
+ * Once a material has been SPLIT across bundles (an `other_bundle` append), it
+ * has an LSI on each — so we order by bundle number ascending and take the
+ * lowest, making the "current bundle" pick deterministic instead of an
+ * arbitrary findFirst. The assessment packs this bundle first (Step 1) and
+ * spills the rest (Step 2), which is now correct because bundle headroom is
+ * computed LSI-aware.
  */
 async function findCurrentBundleForMaterial(args: {
   salesOrderId: string;
@@ -303,6 +310,7 @@ async function findCurrentBundleForMaterial(args: {
       material: args.material,
       loadingSlipId: { not: null },
     },
+    orderBy: { loadingSlip: { bundle: { bundleNumber: 'asc' } } },
     select: { loadingSlip: { select: { bundleId: true } } },
   });
   if (lsi?.loadingSlip?.bundleId) return lsi.loadingSlip.bundleId;
@@ -316,35 +324,24 @@ async function findCurrentBundleForMaterial(args: {
 
 /**
  * For every Bundle under the PO, compare stored `totalWeightKg` against the
- * live recomputation from `Material` rows linked to the bundle and persist
- * mismatches. Uses the same formula the bundler does on initial creation:
- *   weight = (dispatchQuantity / orderQuantity) * orderWeightKg
- * summed over every Material with `bundleId == bundle.id`. Cheap (one read
- * per PO + per-bundle update only on drift). Idempotent.
+ * live recomputation from the loading-slip items physically on the bundle
+ * (see `bundleWeightFromLsis`) and persist mismatches. Cheap (one read per PO +
+ * per-bundle update only on drift). Idempotent.
  *
  * Why this is needed: `Bundle.totalWeightKg` was historically set once at
- * bundle creation and never updated even when ZLOAD2 changed Material
- * quantities. The new post-plant flow uses this field as the authority for
- * remaining capacity, so we self-heal whenever the helper runs.
+ * bundle creation and never updated even when ZLOAD2 changed quantities. The
+ * post-plant capacity assessment uses this field as the authority for remaining
+ * capacity, so we self-heal whenever the helper runs — and it must be LSI-based
+ * so a material split across bundles is attributed to the right bundle.
  */
 async function backfillStaleBundleWeights(purchaseOrderId: string): Promise<void> {
   const bundles = await prisma.bundle.findMany({
     where: { purchaseOrderId },
-    select: {
-      id: true,
-      totalWeightKg: true,
-      materials: {
-        select: {
-          dispatchQuantity: true,
-          orderQuantity: true,
-          orderWeightKg: true,
-        },
-      },
-    },
+    select: { id: true, totalWeightKg: true },
   });
   for (const b of bundles) {
-    if (b.materials.length === 0) continue; // pre-ZLOAD1 — leave bundler's value alone
-    const liveKg = computeBundleWeightFromMaterials(b.materials);
+    const liveKg = await bundleWeightFromLsis(b.id);
+    if (liveKg === null) continue; // pre-ZLOAD1 — leave bundler's value alone
     const stored = Number(b.totalWeightKg);
     if (Math.abs(stored - liveKg) < 0.5) continue; // < 500 g drift — call it equal
     await prisma.bundle.update({
@@ -358,25 +355,54 @@ async function backfillStaleBundleWeights(purchaseOrderId: string): Promise<void
 }
 
 /**
- * Compute a bundle's live weight from its linked Material rows. Mirrors the
- * formula in bundler.ts `computeBundlesForPo` so the rollup stays consistent
- * with how the initial value was set.
+ * Compute a bundle's live weight from the loading-slip items physically on it
+ * (LSI → LoadingSlip.bundleId), NOT from Material rows.
+ *
+ * Why LSI and not Material: a Material row has ONE bundleId, but after an
+ * `other_bundle` ZLOAD1-append a single material is physically SPLIT across two
+ * bundles (e.g. 63 units on Bundle 1, 10 on Bundle 3). The LSI table records
+ * that split correctly (one LSI per loading slip), so summing LSIs gives each
+ * bundle its true weight; a Material-based sum would put the material's whole
+ * weight on its single linked bundle and miss the spill entirely.
+ *
+ * Per-unit weight still comes from the Material row: `orderWeightKg` is the
+ * FULL-order weight on basis `orderQuantity`, so kgPerUnit = orderWeightKg /
+ * orderQuantity (kept invariant by the VA02 fix that scales orderWeightKg with
+ * orderQuantity). LSI.orderWeight is unreliable (usually null), so we derive it.
+ *
+ * Returns `null` when the bundle has NO loading-slip items yet (pre-ZLOAD1) so
+ * callers leave the bundler's creation-time `totalWeightKg` untouched. For a
+ * NON-split bundle the result equals the old Material-based value (the LSI
+ * quantities sum to dispatchQuantity), so there's no spurious drift.
  */
-export function computeBundleWeightFromMaterials(
-  materials: Array<{
-    dispatchQuantity: number | null;
-    orderQuantity: number;
-    orderWeightKg: { toString(): string } | null;
-  }>,
-): number {
+async function bundleWeightFromLsis(bundleId: string): Promise<number | null> {
+  const lsis = await prisma.loadingSlipItem.findMany({
+    where: { loadingSlip: { bundleId } },
+    select: { salesOrderId: true, material: true, orderQuantity: true },
+  });
+  if (lsis.length === 0) return null; // pre-ZLOAD1 — leave the bundler's value alone
+
+  // kgPerUnit per (salesOrderId, material) from the Material rows.
+  const uniquePairs = Array.from(
+    new Map(
+      lsis.map((l) => [`${l.salesOrderId}|${l.material}`, { salesOrderId: l.salesOrderId, material: l.material }]),
+    ).values(),
+  );
+  const mats = await prisma.material.findMany({
+    where: { OR: uniquePairs },
+    select: { salesOrderId: true, material: true, orderQuantity: true, orderWeightKg: true },
+  });
+  const kgPerUnit = new Map<string, number>();
+  for (const m of mats) {
+    const oq = m.orderQuantity || 0;
+    const w = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    kgPerUnit.set(`${m.salesOrderId}|${m.material}`, oq > 0 && w > 0 ? w / oq : 0);
+  }
+
   let total = 0;
-  for (const m of materials) {
-    const dispatchQty = m.dispatchQuantity ?? 0;
-    const orderedQty = m.orderQuantity || 0;
-    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
-    if (orderedQty > 0 && dispatchQty > 0 && fullWeight > 0) {
-      total += (dispatchQty / orderedQty) * fullWeight;
-    }
+  for (const l of lsis) {
+    const kpu = kgPerUnit.get(`${l.salesOrderId}|${l.material}`) ?? 0;
+    total += (l.orderQuantity ?? 0) * kpu;
   }
   return total;
 }
@@ -390,22 +416,34 @@ export function computeBundleWeightFromMaterials(
  * Returns the number of bundles touched (drift detected and updated).
  */
 export async function recomputeBundleWeightsForSo(salesOrderId: string): Promise<number> {
-  const bundleIds = await prisma.material.findMany({
+  // Discover every bundle this SO touches via BOTH links: Material.bundleId
+  // (set by the bundler / new-bundle path) AND the SO's loading-slip items
+  // (LSI → LoadingSlip.bundleId). The LSI link is essential for the split case
+  // — an `other_bundle` append lands an LSI on the sibling bundle WITHOUT
+  // relinking the Material row, so a Material-only discovery would miss it.
+  const bundleIdSet = new Set<string>();
+  const viaMaterial = await prisma.material.findMany({
     where: { salesOrderId, bundleId: { not: null } },
     select: { bundleId: true },
     distinct: ['bundleId'],
   });
+  for (const r of viaMaterial) if (r.bundleId) bundleIdSet.add(r.bundleId);
+  const viaLsi = await prisma.loadingSlipItem.findMany({
+    where: { salesOrderId, loadingSlipId: { not: null } },
+    select: { loadingSlip: { select: { bundleId: true } } },
+  });
+  for (const r of viaLsi) if (r.loadingSlip?.bundleId) bundleIdSet.add(r.loadingSlip.bundleId);
+
   let touched = 0;
-  for (const row of bundleIds) {
-    if (!row.bundleId) continue;
+  for (const bundleId of bundleIdSet) {
     const before = await prisma.bundle.findUnique({
-      where: { id: row.bundleId },
+      where: { id: bundleId },
       select: { totalWeightKg: true },
     });
-    await recomputeBundleWeight(row.bundleId);
+    await recomputeBundleWeight(bundleId);
     if (before) {
       const after = await prisma.bundle.findUnique({
-        where: { id: row.bundleId },
+        where: { id: bundleId },
         select: { totalWeightKg: true },
       });
       if (after && Math.abs(Number(before.totalWeightKg) - Number(after.totalWeightKg)) >= 0.5) {
@@ -417,22 +455,15 @@ export async function recomputeBundleWeightsForSo(salesOrderId: string): Promise
 }
 
 /**
- * Recompute and persist `Bundle.totalWeightKg` for a single bundle. Call
- * from every callback that mutates a Material row (qty, weight) under the
- * bundle. Idempotent; safe to call repeatedly. No-op when the bundle has
- * no linked materials yet (pre-ZLOAD1) or the value didn't drift.
+ * Recompute and persist `Bundle.totalWeightKg` for a single bundle from the
+ * loading-slip items physically on it (see `bundleWeightFromLsis`). Call from
+ * every callback that changes a bundle's slip quantities (zload1/zload2 data).
+ * Idempotent; safe to call repeatedly. No-op when the bundle has no loading-slip
+ * items yet (pre-ZLOAD1 — the bundler's creation value stands) or didn't drift.
  */
 export async function recomputeBundleWeight(bundleId: string): Promise<void> {
-  const materials = await prisma.material.findMany({
-    where: { bundleId },
-    select: {
-      dispatchQuantity: true,
-      orderQuantity: true,
-      orderWeightKg: true,
-    },
-  });
-  if (materials.length === 0) return;
-  const live = computeBundleWeightFromMaterials(materials);
+  const live = await bundleWeightFromLsis(bundleId);
+  if (live === null) return; // pre-ZLOAD1 — leave the bundler's creation value
   const current = await prisma.bundle.findUnique({
     where: { id: bundleId },
     select: { totalWeightKg: true },
