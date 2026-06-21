@@ -1984,10 +1984,10 @@ export type LoneZmatanaMaterial = string | { material: string; delta?: number };
 export async function triggerLoneZmatana(
   soNumber: string,
   materials: LoneZmatanaMaterial[],
-): Promise<void> {
+): Promise<boolean> {
   if (materials.length === 0) {
     console.log(`[LONE-ZMATANA] No materials provided for SO ${soNumber} — skipping`);
-    return;
+    return false;
   }
   // Normalize to {material, delta?} and dedup by code (last delta wins).
   const byCode = new Map<string, { material: string; delta?: number }>();
@@ -1998,27 +1998,37 @@ export async function triggerLoneZmatana(
   // Sort so the dedup key + instruction are stable regardless of caller ordering.
   const normalizedItems = Array.from(byCode.values()).sort((a, b) => a.material.localeCompare(b.material));
   const normalized = normalizedItems.map((e) => e.material);
-  const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true, purchaseOrder: { select: { dispatchRound: true } } },
+  });
 
-  // Dedup on (soNumber, sorted-material-set) — calling triggerLoneZmatana twice
-  // within a single flow for the same SO + materials is a no-op for an
-  // already-queued / in-flight / done row.
   const materialsKey = normalized.join(',');
+  // Dedup key. It MUST be cycle-aware: a surgical increase re-emits LONE-ZMATANA
+  // for the same (SO, material) each cycle, so a key of (SO, materials) alone
+  // collides with a PRIOR cycle's `done` row and the new fetch is silently
+  // skipped — leaving the engine paused on a callback that never comes. Keying
+  // on the dispatch round + per-material delta lets each cycle fetch fresh stock,
+  // while a genuine re-fire within ONE cycle (same round + same deltas) is still
+  // deduped. (Pre-existing rows have no `dedup_key`, so they never match — the
+  // first run after this change fires cleanly.)
+  const dedupKey =
+    `so:${soNumber}|round:${so?.purchaseOrder?.dispatchRound ?? 0}` +
+    `|mat:${normalizedItems.map((e) => `${e.material}/${e.delta ?? ''}`).join(',')}`;
   const existing = await prisma.workQueue.findFirst({
     where: {
       step: 'lone_zmatana',
       state: { in: ['queued', 'firing', 'done'] },
       AND: [
         { payload: { contains: `"transaction_code":"LONE-ZMATANA"` } },
-        { payload: { contains: `"so_number":"${soNumber}"` } },
-        { payload: { contains: `"materials_key":"${materialsKey}"` } },
+        { payload: { contains: `"dedup_key":${JSON.stringify(dedupKey)}` } },
       ],
     },
     select: { id: true, state: true },
   });
   if (existing) {
-    console.log(`[LONE-ZMATANA] Already exists for SO ${soNumber} materials [${materialsKey}] (${existing.state}) — skipping`);
-    return;
+    console.log(`[LONE-ZMATANA] Already exists for SO ${soNumber} materials [${materialsKey}] round ${so?.purchaseOrder?.dispatchRound ?? 0} (${existing.state}) — skipping`);
+    return false;
   }
 
   const materialList = normalized.join(', ');
@@ -2034,6 +2044,7 @@ export async function triggerLoneZmatana(
         so_number: soNumber,
         materials: normalized,
         materials_key: materialsKey,
+        dedup_key: dedupKey,
         // Per-material delta (units) the SAP agent should look for stock
         // against. The SO line already shows the new total post-VA02, but the
         // original qty is reserved by existing loading slips — so only the
@@ -2049,6 +2060,7 @@ export async function triggerLoneZmatana(
     .map((e) => (e.delta !== undefined ? `${e.material}(Δ${e.delta})` : e.material))
     .join(', ');
   console.log(`[LONE-ZMATANA] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${deltaSummary})`);
+  return true;
 }
 
 /**

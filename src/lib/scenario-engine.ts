@@ -1958,8 +1958,58 @@ async function fireStep(
         .map((i) => (i.delta !== undefined ? `${i.code}(Δ${i.delta})` : i.code))
         .join(', ');
       log(`[ENGINE] lone_zmatana firing for ${items.length} material(s): ${describe}`);
-      await triggerLoneZmatana(soNumber, items.map((i) => ({ material: i.code, delta: i.delta })));
-      await markAwaitingCallback(progress.id);
+      const enqueued = await triggerLoneZmatana(soNumber, items.map((i) => ({ material: i.code, delta: i.delta })));
+      if (enqueued) {
+        await markAwaitingCallback(progress.id);
+        return 'pause';
+      }
+      // Deduped: a LONE-ZMATANA for this (SO, round, delta) already ran, so the
+      // Material rows already carry fresh batch + stock — there is NO callback
+      // coming to advance us. Don't pause (that deadlocks). Instead complete this
+      // fetch segment and re-drive the planner to the next phase ourselves,
+      // exactly as the zmatana-data callback's replanAfterEngineFetch would —
+      // mirroring the stock_precheck `substituted` inline re-plan.
+      log('[ENGINE] lone_zmatana — data already present (deduped); completing segment and re-planning');
+      try {
+        const { emitEvent } = await import('./scenario-events');
+        await emitEvent({
+          salesOrderId: progress.salesOrderId,
+          scenarioProgressId: progress.id,
+          type: 'step_completed',
+          payload: { kind: 'lone_zmatana', scenario_key: 'planner', note: 'deduped — data already fetched' },
+        });
+      } catch {}
+      await prisma.scenarioProgress.update({
+        where: { id: progress.id },
+        data: { state: 'completed' },
+      });
+      const lzTrigger = (
+        await prisma.scenarioProgress.findUnique({
+          where: { id: progress.id },
+          select: { triggerEmailId: true },
+        })
+      )?.triggerEmailId;
+      if (lzTrigger) {
+        const trigger = await prisma.email.findUnique({
+          where: { id: lzTrigger },
+          select: { replyHtml: true, recipientEmail: true },
+        });
+        if (trigger?.replyHtml) {
+          const sender: 'branch' | 'plant' =
+            PLANT_EMAIL && trigger.recipientEmail === PLANT_EMAIL ? 'plant' : 'branch';
+          const r = await handleReplyV2({
+            emailId: lzTrigger,
+            replyHtml: trigger.replyHtml,
+            originalEmailHtml: '',
+            sourceEmailType: sender,
+          });
+          for (const line of r.logs) log(line);
+        } else {
+          log('[ENGINE] lone_zmatana dedup — trigger reply missing replyHtml; cannot re-plan inline');
+        }
+      } else {
+        log('[ENGINE] lone_zmatana dedup — no triggerEmailId on progress; cannot re-plan inline');
+      }
       return 'pause';
     }
 
