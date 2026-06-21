@@ -66,10 +66,15 @@ async function main() {
     data: { purchaseOrderId: po.id, bundleNumber: 1, totalWeightKg: 1900 },
   });
   // TARGET starts at 200 units / 1900 kg, batch already "P" (lone_zmatana ran).
+  // availableStock is the STALE pre-increase value (200) — the original
+  // ZSO-VISIBILITY read it at 200 and nothing refreshed it before VA02. This
+  // mirrors prod: VA02 must NOT clamp dispatchQuantity by this stale stock,
+  // else it pins at 200 while orderQuantity/orderWeightKg go to 210/1995 and
+  // the bundle line renders "200 units, 1.900 t".
   await prisma.material.create({
     data: {
       salesOrderId: so.id, material: TARGET, materialDescription: TARGET_DESC,
-      batch: 'P', orderQuantity: 200, orderWeightKg: 1900, availableStock: 99999,
+      batch: 'P', orderQuantity: 200, orderWeightKg: 1900, availableStock: 200,
       dispatchQuantity: 200, bundleId: bundle.id,
     },
   });

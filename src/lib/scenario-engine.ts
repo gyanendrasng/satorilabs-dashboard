@@ -1821,14 +1821,16 @@ async function fireStep(
       //                     Raising orderQuantity alone made kgPerUnit = 1900/210 =
       //                     9.05 instead of 9.5, so the diff line rendered 211.
       //   - dispatchQuantity : the branch is releasing the new total in this
-      //                     surgical increase, so it tracks orderQuantity (mirrors
-      //                     the normal flow's min(orderQuantity, availableStock)).
-      //                     Leaving it at 200 made the bundle line show "200 units,
-      //                     1.810 t" instead of "210 units, 1.995 t".
+      //                     surgical increase, so it tracks orderQuantity exactly.
+      //                     Do NOT clamp by availableStock — that value is the
+      //                     STALE pre-increase stock; clamping pinned it at 200 and
+      //                     the bundle line showed "200 units, 1.900 t" instead of
+      //                     "210 units, 1.995 t". stock_precheck already validated
+      //                     the released qty before VA02 fired.
       for (const it of items) {
         const rows = await prisma.material.findMany({
           where: { salesOrderId: progress.salesOrderId, material: it.material },
-          select: { id: true, orderQuantity: true, orderWeightKg: true, availableStock: true },
+          select: { id: true, orderQuantity: true, orderWeightKg: true },
         });
         for (const row of rows) {
           // Per-unit weight from the OLD basis (before we overwrite orderQuantity).
@@ -1836,11 +1838,17 @@ async function fireStep(
           const oldWeight = row.orderWeightKg ? Number(row.orderWeightKg) : 0;
           const kgPerUnit = oldQty > 0 && oldWeight > 0 ? oldWeight / oldQty : 0;
           const newWeight = kgPerUnit > 0 ? kgPerUnit * it.orderQuantity : oldWeight;
-          // Dispatch the new total, capped by availability (matches the normal
-          // flow's min(orderQuantity, availableStock) when stock is known).
-          const avail = row.availableStock;
-          const newDispatch =
-            typeof avail === 'number' ? Math.min(it.orderQuantity, avail) : it.orderQuantity;
+          // Dispatch the FULL new total — do NOT clamp by availableStock here.
+          // VA02 only fires after stock_precheck returned `sufficient` for this
+          // increase, so the branch's released total IS available. availableStock
+          // on this row is the STALE pre-increase value (e.g. 200, last refreshed
+          // by the original ZSO-VISIBILITY) — lone_zmatana re-fetches it only in
+          // Phase 2.5, AFTER this write. Clamping against it pinned dispatchQuantity
+          // at 200 while orderQuantity/orderWeightKg moved to 210/1995, so the
+          // bundle-confirmation line rendered "200 units, 1.900 t" (its qty comes
+          // from dispatchQuantity and weight from (dispatchQuantity/orderQuantity)
+          // *orderWeightKg). The increase total is authoritative here.
+          const newDispatch = it.orderQuantity;
           await prisma.material.update({
             where: { id: row.id },
             data: {
