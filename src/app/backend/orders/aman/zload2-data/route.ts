@@ -11,6 +11,56 @@ import { resolvePlantEmailForLoadingSlip } from '@/lib/plant-resolver';
  */
 const MIN_PARSER_CONFIDENCE = 0.85;
 
+/** One indexed Material row for PDF-row → SAP-code resolution. */
+export interface LsiMatEntry {
+  /** Normalised material description (uppercase, single-spaced). */
+  desc: string;
+  /** Individual batch tokens (a multi-batch material splits "RP08, B01"). */
+  batchTokens: string[];
+  /** The real SAP material code. */
+  code: string;
+}
+
+/** Normalise a description for prefix matching: uppercase, single spaces, trimmed. */
+export function normaliseLsiDesc(s: string): string {
+  return s.toUpperCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Resolve a PDF row (description, batch) to a real SAP code against the SO's
+ * indexed Material rows. Pure + exported so it is unit-testable in isolation.
+ *
+ * Two-tier match, both requiring a UNIQUE description hit:
+ *   1. batch-qualified — description prefix-matches (either direction, since the
+ *      PDF text layer truncates long descriptions) AND the PDF batch token is
+ *      one of the Material's batch tokens. Strongest signal.
+ *   2. description-only fallback — when the batch doesn't line up (e.g. the
+ *      Material row still carries a stale 'N/A' batch while the PDF prints the
+ *      real "P"), accept a UNIQUE description match. Far safer than the caller's
+ *      last-resort family-prefix fallback, which yields a wrong code (e.g.
+ *      "OOWJ") and breaks PlantResolver. A description shared by 2+ materials
+ *      stays unresolved (returns undefined) so the caller treats it as ambiguous.
+ */
+export function resolveLsiCode(
+  matEntries: LsiMatEntry[],
+  rawDesc: string,
+  rawBatch: string,
+): string | undefined {
+  const d = normaliseLsiDesc(rawDesc);
+  const b = rawBatch.trim();
+  const batchHits = new Set<string>();
+  const descHits = new Set<string>();
+  for (const e of matEntries) {
+    const descMatch = e.desc === d || e.desc.startsWith(d) || d.startsWith(e.desc);
+    if (!descMatch) continue;
+    descHits.add(e.code);
+    if (e.batchTokens.includes(b)) batchHits.add(e.code);
+  }
+  if (batchHits.size === 1) return [...batchHits][0];
+  if (descHits.size === 1) return [...descHits][0];
+  return undefined;
+}
+
 /**
  * POST /backend/orders/aman/zload2-data
  *
@@ -170,7 +220,6 @@ export async function POST(request: Request) {
 
   if (useParsed && parsed) {
     // Resolve real SAP codes from the SO's Material table by (description, batch).
-    const normaliseDesc = (s: string): string => s.toUpperCase().replace(/\s+/g, ' ').trim();
     const soMaterials = await prisma.material.findMany({
       where: { salesOrderId: loadingSlip.salesOrderId },
       select: { material: true, materialDescription: true, batch: true },
@@ -180,36 +229,21 @@ export async function POST(request: Request) {
     // ("RP08, B01"), but the LS PDF prints one physical row PER batch — index
     // every individual batch token (plus the joined string) so a per-batch PDF
     // row resolves to the real code instead of the family prefix.
-    const matEntries: Array<{ desc: string; batchTokens: string[]; code: string }> = [];
+    const matEntries: LsiMatEntry[] = [];
     for (const m of soMaterials) {
       if (!m.materialDescription) continue;
-      const desc = normaliseDesc(m.materialDescription);
+      const desc = normaliseLsiDesc(m.materialDescription);
       const batchTokens = String(m.batch ?? '')
         .split(',')
         .map((b) => b.trim())
         .filter((b) => b.length > 0);
-      matEntries.push({ desc, batchTokens: [...batchTokens, normaliseDesc(m.batch ?? '')], code: m.material });
+      matEntries.push({ desc, batchTokens: [...batchTokens, normaliseLsiDesc(m.batch ?? '')], code: m.material });
     }
-
-    // Resolve a PDF row (description, batch) to a real SAP code. The PDF
-    // description is sometimes TRUNCATED relative to the Material row's (e.g.
-    // "…SPDR" vs "…SPDR-P"), so match on description PREFIX in either direction
-    // then require the batch token to match. Only a unique match wins.
-    const resolveCode = (rawDesc: string, rawBatch: string): string | undefined => {
-      const d = normaliseDesc(rawDesc);
-      const b = rawBatch.trim();
-      const hits = new Set<string>();
-      for (const e of matEntries) {
-        const descMatch = e.desc === d || e.desc.startsWith(d) || d.startsWith(e.desc);
-        if (descMatch && e.batchTokens.includes(b)) hits.add(e.code);
-      }
-      return hits.size === 1 ? [...hits][0] : undefined;
-    };
 
     // Build the set of (material, batch) the regenerated PDF reports.
     const keptKeys = new Set<string>();
     for (const item of parsed.items) {
-      const realMaterialCode = resolveCode(item.description, item.batch);
+      const realMaterialCode = resolveLsiCode(matEntries, item.description, item.batch);
       const materialForLsi = realMaterialCode ?? item.material;
       if (!realMaterialCode) {
         console.warn(
