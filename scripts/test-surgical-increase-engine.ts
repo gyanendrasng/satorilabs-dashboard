@@ -99,6 +99,14 @@ async function main() {
     const afterVa02 = await prisma.material.findFirst({ where: { salesOrderId: so.id, material: TARGET } });
     if (afterVa02?.orderQuantity === 210) pass('Fix A1: VA02 increase persists Material.orderQuantity=210');
     else fail(`Fix A1: orderQuantity after va02 = ${afterVa02?.orderQuantity} (expected 210)`);
+    // orderWeightKg must scale with orderQuantity (kgPerUnit stays 9.5) → 1995,
+    // else kgPerUnit = 1900/210 = 9.05 and the diff line renders 211 not 210.
+    const owk = afterVa02?.orderWeightKg ? Number(afterVa02.orderWeightKg) : 0;
+    if (owk === 1995) pass('Fix A1: orderWeightKg scaled to 1995 (kgPerUnit stays 9.5)');
+    else fail(`Fix A1: orderWeightKg after va02 = ${owk} (expected 1995 = 210×9.5)`);
+    // dispatchQuantity tracks the new total (branch releases all 210).
+    if (afterVa02?.dispatchQuantity === 210) pass('Fix A1: dispatchQuantity bumped to 210');
+    else fail(`Fix A1: dispatchQuantity after va02 = ${afterVa02?.dispatchQuantity} (expected 210)`);
 
     // ── Step 2: zmatana-data callback for the delta with a bare-string echo. ──
     // batch should STAY "P" (Fix B1), not be clobbered to "N/A".

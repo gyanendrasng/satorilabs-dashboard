@@ -1251,12 +1251,27 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
     where: { salesOrderId, material: { in: materialCodes } },
     select: { material: true, batch: true, orderQuantity: true, orderWeightKg: true },
   });
-  const materialByCode = new Map<string, { batch: string; kgPerUnit: number }>();
+  const materialByCode = new Map<string, { batch: string; kgPerUnit: number; orderQuantity: number }>();
   for (const m of materialRows) {
     const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
     const ordered = m.orderQuantity || 0;
     const kgPerUnit = ordered > 0 && fullWeight > 0 ? fullWeight / ordered : 0;
-    materialByCode.set(m.material, { batch: m.batch ?? '', kgPerUnit });
+    materialByCode.set(m.material, { batch: m.batch ?? '', kgPerUnit, orderQuantity: ordered });
+  }
+
+  // Physical CURRENT quantity per material from the loading-slip items. ZLOAD2
+  // hasn't run yet when this email renders, so the LSI still holds the pre-change
+  // qty (e.g. 200). The diff's "current" must come from HERE — NOT from
+  // Material.dispatchQuantity, which the VA02 step already bumped to the new
+  // total (e.g. 210). Reading dispatchQuantity as "current" double-counted the
+  // increase and rendered "200 → 211" (also via a stale kgPerUnit).
+  const lsiRows = await prisma.loadingSlipItem.findMany({
+    where: { salesOrderId, material: { in: materialCodes } },
+    select: { material: true, orderQuantity: true },
+  });
+  const lsiQtyByCode = new Map<string, number>();
+  for (const r of lsiRows) {
+    lsiQtyByCode.set(r.material, (lsiQtyByCode.get(r.material) ?? 0) + (r.orderQuantity ?? 0));
   }
 
   // Bundle number lookup keyed by id, so the diff block can name bundles by
@@ -1281,16 +1296,18 @@ export async function sendDispatchConfirmationWithUpcomingChanges(args: {
     if (a.kind === 'same_bundle') {
       // The existing LS on this bundle (which already carries `material`) will
       // be ZLOAD2'd to a new total. Render the diff as a qty bump on the same
-      // bundle.
-      const existingForMaterial = bundlesForEmail
-        .find((b) => b.id === a.bundleId)?.materials
-        .find((m) => m.material === a.material);
-      const currentQty = existingForMaterial?.dispatchQuantity ?? 0;
+      // bundle: CURRENT = the LS's physical qty (LSI, pre-ZLOAD2, e.g. 200),
+      // PROPOSED = the new SO-line total (Material.orderQuantity, e.g. 210).
+      // We use orderQuantity directly rather than `currentQty + addedUnits` —
+      // the kg→units conversion of the allocation is lossy (rounding) and would
+      // re-introduce off-by-one errors like "211".
+      const currentQty = lsiQtyByCode.get(a.material) ?? 0;
+      const proposedQty = md?.orderQuantity ?? currentQty + addedUnits;
       diff.push({
         material: a.material,
         batch,
         currentQty,
-        proposedQty: currentQty + addedUnits,
+        proposedQty,
         currentBundleNumber: targetBundleNumber,
         proposedBundleNumber: targetBundleNumber,
       });

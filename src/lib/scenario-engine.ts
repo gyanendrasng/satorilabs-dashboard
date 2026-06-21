@@ -1796,16 +1796,48 @@ async function fireStep(
 
       // Persist the INCREASE targets onto the SO line. `coerceVa02Args` returns
       // the new ABSOLUTE total per material (e.g. 210), which is exactly what we
-      // just sent to SAP — so the DB Material.orderQuantity must match. Without
-      // this, the surgical-increase flow left orderQuantity stuck at the old
-      // value (e.g. 200) because nothing else writes it: visibility-data isn't
-      // called in this flow and zmatana-data deliberately skips orderQuantity.
-      // Mirrors the pending-dec flush write below.
+      // just sent to SAP — so the DB Material must match. Without this, the
+      // surgical-increase flow left orderQuantity stuck at the old value (e.g.
+      // 200) because nothing else writes it: visibility-data isn't called in this
+      // flow and zmatana-data deliberately skips orderQuantity.
+      //
+      // CRITICAL — keep all THREE related fields on the same basis, or every
+      // downstream weight/qty calc breaks:
+      //   - orderQuantity : the new SO-line total (the value sent to SAP).
+      //   - orderWeightKg : the FULL-order weight; its basis IS orderQuantity, so
+      //                     it must scale proportionally (kgPerUnit stays constant).
+      //                     Raising orderQuantity alone made kgPerUnit = 1900/210 =
+      //                     9.05 instead of 9.5, so the diff line rendered 211.
+      //   - dispatchQuantity : the branch is releasing the new total in this
+      //                     surgical increase, so it tracks orderQuantity (mirrors
+      //                     the normal flow's min(orderQuantity, availableStock)).
+      //                     Leaving it at 200 made the bundle line show "200 units,
+      //                     1.810 t" instead of "210 units, 1.995 t".
       for (const it of items) {
-        await prisma.material.updateMany({
+        const rows = await prisma.material.findMany({
           where: { salesOrderId: progress.salesOrderId, material: it.material },
-          data: { orderQuantity: it.orderQuantity },
+          select: { id: true, orderQuantity: true, orderWeightKg: true, availableStock: true },
         });
+        for (const row of rows) {
+          // Per-unit weight from the OLD basis (before we overwrite orderQuantity).
+          const oldQty = row.orderQuantity || 0;
+          const oldWeight = row.orderWeightKg ? Number(row.orderWeightKg) : 0;
+          const kgPerUnit = oldQty > 0 && oldWeight > 0 ? oldWeight / oldQty : 0;
+          const newWeight = kgPerUnit > 0 ? kgPerUnit * it.orderQuantity : oldWeight;
+          // Dispatch the new total, capped by availability (matches the normal
+          // flow's min(orderQuantity, availableStock) when stock is known).
+          const avail = row.availableStock;
+          const newDispatch =
+            typeof avail === 'number' ? Math.min(it.orderQuantity, avail) : it.orderQuantity;
+          await prisma.material.update({
+            where: { id: row.id },
+            data: {
+              orderQuantity: it.orderQuantity,
+              orderWeightKg: newWeight,
+              dispatchQuantity: newDispatch,
+            },
+          });
+        }
       }
 
       // Optimistically reconcile the DB + clear the pending flags. There is no
