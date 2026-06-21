@@ -568,42 +568,46 @@ export async function sendCombinedVehicleDetailsEmailForPo(
   // send a fresh one.
   //
   // Rule: an existing vehicle_details email is considered "still current"
-  // ONLY if its sentAt is newer than the latest done zload1 work_queue row
-  // on this PO. If a ZLOAD1 has completed AFTER the email was sent, the
-  // email is stale and we send a new one.
+  // ONLY if its sentAt is newer than the latest done LS-mutation work_queue row
+  // (ZLOAD1 OR ZLOAD2) on this PO. If any LS mutation completed AFTER the email
+  // was sent, the email is stale and we send a fresh one.
+  //
+  // Both steps matter: a fresh bundle / re-bundle is a ZLOAD1, but a surgical
+  // same_bundle increase (Rule 6e preserve) revises the existing LS via ZLOAD2
+  // and fires NO ZLOAD1. Gating on ZLOAD1 alone wrongly treated that email as
+  // current and skipped it — so the branch was never asked for vehicle details
+  // for the updated plan. Consider the latest of either step.
   const existing = await prisma.email.findFirst({
     where: { purchaseOrderId, emailType: 'vehicle_details', status: { in: ['sent', 'replied'] } },
     orderBy: { sentAt: 'desc' },
     select: { id: true, sentAt: true },
   });
   if (existing) {
-    // Find the most recent done ZLOAD1 work on any SO of this PO. If it's
-    // newer than the email, the email is stale → fall through and send.
-    const latestZload1 = await prisma.workQueue.findFirst({
+    const latestMutation = await prisma.workQueue.findFirst({
       where: {
-        step: 'zload1',
+        step: { in: ['zload1', 'zload2'] },
         state: 'done',
         salesOrder: { purchaseOrderId },
       },
       orderBy: { finishedAt: 'desc' },
-      select: { finishedAt: true, id: true },
+      select: { finishedAt: true, id: true, step: true },
     });
 
     const emailSentAt = existing.sentAt.getTime();
-    const lastZload1At = latestZload1?.finishedAt?.getTime() ?? 0;
+    const lastMutationAt = latestMutation?.finishedAt?.getTime() ?? 0;
 
-    if (lastZload1At <= emailSentAt) {
+    if (lastMutationAt <= emailSentAt) {
       log(
         `[VehicleDetails] PO ${purchaseOrderId} already has a current vehicle_details email ` +
-          `(sentAt=${existing.sentAt.toISOString()}, latest ZLOAD1 finishedAt=${latestZload1?.finishedAt?.toISOString() ?? 'none'}) — skipping`,
+          `(sentAt=${existing.sentAt.toISOString()}, latest LS mutation finishedAt=${latestMutation?.finishedAt?.toISOString() ?? 'none'}) — skipping`,
       );
       return { sent: false, logs };
     }
 
     log(
       `[VehicleDetails] PO ${purchaseOrderId} has a STALE vehicle_details email ` +
-        `(sentAt=${existing.sentAt.toISOString()}, but ZLOAD1 ${latestZload1?.id} finished at ` +
-        `${latestZload1?.finishedAt?.toISOString()} after that — likely a pre-plant_ls modify cycle just completed). Sending fresh email.`,
+        `(sentAt=${existing.sentAt.toISOString()}, but ${latestMutation?.step?.toUpperCase()} ${latestMutation?.id} finished at ` +
+        `${latestMutation?.finishedAt?.toISOString()} after that — an LS modify cycle just completed). Sending fresh email.`,
     );
   }
 
