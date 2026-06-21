@@ -765,8 +765,13 @@ async function sendPlannerQuestionEmail(args: {
   options?: string[];
   emailType: 'branch_clarify' | 'plant_clarify' | 'supervisor_question';
   log: (msg: string) => void;
+  /** Force a fresh thread (do NOT anchor on the per-PO stakeholder thread).
+   *  Used when fanning out to MULTIPLE plants: the per-PO "plant" anchor is a
+   *  single thread, so anchoring would funnel every plant's clarification into
+   *  one plant's thread. A fresh email per plant keeps them correctly separate. */
+  freshThread?: boolean;
 }): Promise<{ messageId: string; threadId: string } | null> {
-  const { recipient, recipientRole, salesOrderId, triggerEmailId, question, options, emailType, log } = args;
+  const { recipient, recipientRole, salesOrderId, triggerEmailId, question, options, emailType, log, freshThread } = args;
 
   if (!recipient) {
     log(`[PlannerQ:${recipientRole}] no recipient address configured — skipping`);
@@ -809,7 +814,7 @@ async function sendPlannerQuestionEmail(args: {
   const stakeholder: 'branch' | 'plant' | null =
     recipientRole === 'branch' ? 'branch' : recipientRole === 'plant' ? 'plant' : null;
   const anchor =
-    stakeholder && so.purchaseOrderId
+    stakeholder && so.purchaseOrderId && !freshThread
       ? await resolvePoThreadAnchor(so.purchaseOrderId, stakeholder)
       : null;
   let sent: { messageId: string; threadId: string };
@@ -823,7 +828,10 @@ async function sendPlannerQuestionEmail(args: {
     log(`[PlannerQ:${recipientRole}] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
     sent = await sendPlainEmail(recipient, subject, body);
   }
-  if (stakeholder && so.purchaseOrderId && !anchor) {
+  // Don't claim the shared per-PO anchor for a fresh-thread (multi-plant) send —
+  // otherwise the first plant's thread would become THE plant thread and later
+  // anchored sends would reply into it.
+  if (stakeholder && so.purchaseOrderId && !anchor && !freshThread) {
     const rfc822 = await getMessageRfc822Id(sent.messageId);
     if (rfc822) await capturePoThreadAnchor(so.purchaseOrderId, stakeholder, sent.threadId, rfc822);
   }
@@ -3045,33 +3053,61 @@ async function fireStep(
           })
         : null;
 
-      let recipient: string;
+      let recipients: string[];
       let recipientRole: 'branch' | 'plant' | 'supervisor';
       let emailType: 'branch_clarify' | 'plant_clarify' | 'supervisor_question';
       if (step.kind === 'email_clarify_branch') {
-        recipient = process.env.BRANCH_EMAIL || '';
+        recipients = [process.env.BRANCH_EMAIL || ''];
         recipientRole = 'branch';
         emailType = 'branch_clarify';
       } else if (step.kind === 'email_clarify_plant') {
-        recipient = process.env.PLANT_EMAIL || '';
         recipientRole = 'plant';
         emailType = 'plant_clarify';
+        // An SO/PO can span MULTIPLE plants (each loading slip has its own
+        // plantEmail). A clarification must reach EVERY distinct plant, not
+        // just the env fallback — mirror the per-plant fan-out that
+        // email_modified_ls_to_plant / sendLSEmail already do. Fall back to
+        // PLANT_EMAIL only when no loading slips exist yet (pre-LS clarify).
+        const so = await prisma.salesOrder.findUnique({
+          where: { id: progress.salesOrderId },
+          select: { purchaseOrderId: true },
+        });
+        const lsRows = so?.purchaseOrderId
+          ? await prisma.loadingSlip.findMany({
+              where: { salesOrder: { purchaseOrderId: so.purchaseOrderId } },
+              select: { plantEmail: true },
+            })
+          : [];
+        const distinctPlants = [
+          ...new Set(lsRows.map((r) => r.plantEmail).filter((e): e is string => !!e)),
+        ];
+        recipients = distinctPlants.length > 0 ? distinctPlants : [process.env.PLANT_EMAIL || ''];
+        if (distinctPlants.length > 1) {
+          log(`[ENGINE] email_clarify_plant — fanning out to ${distinctPlants.length} distinct plants`);
+        }
       } else {
-        recipient = process.env.SUPERVISOR_EMAIL || 'amanrai369@gmail.com';
+        recipients = [process.env.SUPERVISOR_EMAIL || 'amanrai369@gmail.com'];
         recipientRole = 'supervisor';
         emailType = 'supervisor_question';
       }
 
-      await sendPlannerQuestionEmail({
-        recipient,
-        recipientRole,
-        salesOrderId: progress.salesOrderId,
-        triggerEmailId: triggerEmail?.id ?? '',
-        question,
-        options: _plannedStep?.options,
-        emailType,
-        log,
-      });
+      // When fanning out to >1 plant, each must get its own fresh thread — the
+      // per-PO "plant" anchor is a single thread and would otherwise funnel them
+      // all into one plant's conversation.
+      const multiPlant = recipientRole === 'plant' && recipients.length > 1;
+      for (const recipient of recipients) {
+        await sendPlannerQuestionEmail({
+          recipient,
+          recipientRole,
+          salesOrderId: progress.salesOrderId,
+          triggerEmailId: triggerEmail?.id ?? '',
+          question,
+          options: _plannedStep?.options,
+          emailType,
+          log,
+          freshThread: multiPlant,
+        });
+      }
 
       // Pause until the recipient replies. The cron's reply-checker will
       // pick up their reply (status='sent', workflowState='awaiting_reply')
