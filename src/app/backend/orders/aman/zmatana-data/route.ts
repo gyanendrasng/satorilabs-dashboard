@@ -102,7 +102,12 @@ export async function POST(request: Request) {
         console.warn(`[ZmatanaData] Skipping material row missing code:`, m);
         continue;
       }
-      const batch = (m.batch || m.batch_number || '') || 'N/A';
+      // Only treat a NON-EMPTY value as a real batch. auto_gui2 sometimes echoes
+      // entries as bare code strings (no batch) — see the normalization above —
+      // which previously became 'N/A' and OVERWROTE an already-fetched real
+      // batch (e.g. "P") on update, breaking the downstream ZLOAD2 PDF reconcile.
+      const rawBatch = (m.batch || m.batch_number || '').trim();
+      const batch = rawBatch || 'N/A';
 
       // Description from the product DB; payload value wins when SAP supplies
       // one, else fall back to the static DB (null when neither has it).
@@ -129,7 +134,9 @@ export async function POST(request: Request) {
         },
         update: {
           materialDescription,
-          batch,
+          // Only overwrite batch when SAP actually returned one — never clobber
+          // an existing real batch with the 'N/A' fallback from a bare-string echo.
+          ...(rawBatch ? { batch } : {}),
           availableStock: m.available_stock_for_so ?? null,
         },
         create: {
