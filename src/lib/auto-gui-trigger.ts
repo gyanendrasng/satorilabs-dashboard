@@ -1815,9 +1815,13 @@ export async function fanOutZload1ForPo(
         });
         stockApprovedSoIds.add(slot.salesOrderId);
       }
-      await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
-      fired++;
-      log(`[ZLOAD1-Fanout] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
+      const enqueued = await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
+      if (enqueued) {
+        fired++;
+        log(`[ZLOAD1-Fanout] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
+      } else {
+        log(`[ZLOAD1-Fanout] ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber} already enqueued — skipped`);
+      }
     }
   }
 
@@ -1876,7 +1880,15 @@ export async function fanOutZload1AppendToBundle(args: {
     quantity: m.quantity,
   }));
 
-  await triggerZload1(so.soNumber, payloadItems, bundle.id, bundle.bundleNumber, true);
+  const enqueued = await triggerZload1(so.soNumber, payloadItems, bundle.id, bundle.bundleNumber, true);
+  if (!enqueued) {
+    // Deduped — this exact append (same round + materials) already ran. Report
+    // 0 so the engine advances instead of waiting on a callback that won't come.
+    log(
+      `[ZLOAD1-Append] Append-mode ZLOAD1 for SO ${so.soNumber} onto Bundle ${bundle.bundleNumber} (id=${bundle.id}) was a duplicate — already enqueued; nothing fired`,
+    );
+    return { fired: 0 };
+  }
   log(
     `[ZLOAD1-Append] Fired append-mode ZLOAD1 for SO ${so.soNumber} onto Bundle ${bundle.bundleNumber} (id=${bundle.id}): ${payloadItems.length} material(s)`,
   );
@@ -2720,7 +2732,7 @@ async function triggerZload1(
    * WorkQueue row.
    */
   appendMode?: boolean,
-): Promise<void> {
+): Promise<boolean> {
   const materialsList = materials
     .map(
       (m) =>
@@ -2731,23 +2743,44 @@ async function triggerZload1(
   const bundleSuffix = bundleNumber ? ` (Bundle ${bundleNumber})` : '';
   const instruction = `VPN is connected, SAP is logged in. Execute ZLOAD1 for sales order ${soNumber}${bundleSuffix}. Materials to dispatch:\n${materialsList}`;
 
-  // Idempotency: ZLOAD1's natural key is (SO, bundleNumber). The bundle
-  // cuid changes when computeBundlesForPo re-plans, but bundleNumber is
-  // stable within a PO. If a queued/firing/done row already exists for
-  // this (SO, bundleNumber), skip — re-firing produces duplicate LSs in
-  // SAP and orphaned work_queue rows after a re-plan.
+  // Resolve the SO (+ its PO's current dispatch round) up front — the round is
+  // part of the append-mode dedup key below, and the id is needed for enqueue.
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true, purchaseOrder: { select: { dispatchRound: true } } },
+  });
+
+  // Idempotency key.
   //
-  // When bundleNumber is absent (legacy callers / single-bundle pre-refactor
-  // path) we fall back to dedup on (SO + sorted materials). This is the
-  // same shape triggerZload2/triggerZloadingClose use.
+  // INITIAL mode (no appendMode): natural key is (SO, bundleNumber). The bundle
+  // cuid changes when computeBundlesForPo re-plans, but bundleNumber is stable
+  // within a PO. If a queued/firing/done row already exists for this
+  // (SO, bundleNumber), skip — re-firing produces duplicate LSs in SAP and
+  // orphaned work_queue rows after a re-plan. When bundleNumber is absent
+  // (legacy callers) we fall back to (SO + sorted materials).
+  //
+  // APPEND mode: an append adds a NEW LS to a bundle that the INITIAL fan-out
+  // already fired ZLOAD1 for — so it MUST NOT share the initial (SO, bundle)
+  // key, or it dedup-collides with that bundle's `done` row and is silently
+  // skipped (the caller still reports fired:1 → engine waits forever). The
+  // append key therefore also carries the dispatch round and the exact
+  // materials+qty, so: it never matches the initial key; two different appends
+  // to one bundle in a cycle both fire; the same material can be appended again
+  // in a LATER cycle (higher round); but a genuine retry (same round, same
+  // materials) is still deduped.
   const sortedMaterials = [...materials].sort((a, b) =>
     a.material_code === b.material_code
       ? (a.batch || '').localeCompare(b.batch || '')
       : a.material_code.localeCompare(b.material_code)
   );
-  const dedupKey = bundleNumber
-    ? `so:${soNumber}|bundle:${bundleNumber}`
-    : `so:${soNumber}|materials:${JSON.stringify(sortedMaterials.map((m) => `${m.material_code}/${m.batch}/${m.quantity}`))}`;
+  const materialsSig = JSON.stringify(
+    sortedMaterials.map((m) => `${m.material_code}/${m.batch}/${m.quantity}`)
+  );
+  const dedupKey = appendMode && bundleNumber
+    ? `so:${soNumber}|bundle:${bundleNumber}|append|round:${so?.purchaseOrder?.dispatchRound ?? 0}|mat:${materialsSig}`
+    : bundleNumber
+      ? `so:${soNumber}|bundle:${bundleNumber}`
+      : `so:${soNumber}|materials:${materialsSig}`;
 
   const existing = await prisma.workQueue.findFirst({
     where: {
@@ -2764,10 +2797,8 @@ async function triggerZload1(
     console.log(
       `[ZLOAD1] Skipping duplicate for SO ${soNumber}${bundleSuffix} — existing row ${existing.id} (${existing.state})`
     );
-    return;
+    return false;
   }
-
-  const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
 
   await enqueueWork({
     salesOrderId: so?.id ?? null,
@@ -2787,6 +2818,7 @@ async function triggerZload1(
   });
   await pumpQueue();
   console.log(`[ZLOAD1] Enqueued for SO ${soNumber}${bundleSuffix}${appendMode ? ' (APPEND mode)' : ''} (${materials.length} material(s))`);
+  return true;
 }
 
 /**
