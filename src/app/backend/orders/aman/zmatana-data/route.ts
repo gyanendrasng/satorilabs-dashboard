@@ -133,7 +133,15 @@ export async function POST(request: Request) {
           },
         },
         update: {
-          materialDescription,
+          // Only overwrite the description when we actually resolved one. A
+          // delta-scoped LONE-ZMATANA carries no material_description, and a SAP
+          // code absent from the static product DB (e.g. YAFPLNA00000043P)
+          // resolves to null here — writing that would WIPE the real description
+          // set by ZSO-VISIBILITY. The downstream ZLOAD1/ZLOAD2 PDF reconcile
+          // matches LSI rows by (description, batch); a nulled description makes
+          // it skip the row and fall back to the family prefix, mangling the LSI
+          // material code (YAFPLNA00000043P → "OAFFJ"). Same guard as `batch`.
+          ...(materialDescription ? { materialDescription } : {}),
           // Only overwrite batch when SAP actually returned one — never clobber
           // an existing real batch with the 'N/A' fallback from a bare-string echo.
           ...(rawBatch ? { batch } : {}),
