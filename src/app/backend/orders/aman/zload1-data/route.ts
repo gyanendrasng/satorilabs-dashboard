@@ -3,6 +3,7 @@ import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { checkAndSendCombinedVehicleEmailForPo } from '@/lib/auto-gui-trigger';
 import { parseLoadingSlipPdf, type ParsedLoadingSlip } from '@/lib/ls-pdf-parser';
+import { resolveLsiCode, normaliseLsiDesc, type LsiMatEntry } from '../zload2-data/route';
 // linkLsiToBundle was removed in the LoadingSlip refactor — LSIs reach a
 // bundle via their parent LoadingSlip now.
 
@@ -241,9 +242,6 @@ export async function POST(request: Request) {
       // (description, batch) against that table. Whitespace is normalised
       // because the visibility payload sometimes carries double spaces
       // ("ALMITOS LT  GL REC-P") that the PDF prints as single spaces.
-      const normaliseDesc = (s: string): string =>
-        s.toUpperCase().replace(/\s+/g, ' ').trim();
-
       const soMaterials = await prisma.material.findMany({
         where: { salesOrderId: salesOrder.id },
         select: { material: true, materialDescription: true, batch: true },
@@ -254,38 +252,28 @@ export async function POST(request: Request) {
       // we index every individual batch token (plus the joined string) so a
       // per-batch PDF row resolves to the real code instead of falling back
       // to the family prefix and creating a mangled LSI per batch.
-      const matEntries: Array<{ desc: string; batchTokens: string[]; code: string }> = [];
+      //
+      // Matching uses the SHARED resolveLsiCode (same as zload2-data): a
+      // batch-qualified prefix match first, then a description-only fallback so
+      // a stale 'N/A' batch on the Material row still resolves by a unique
+      // description. The old inline matcher here was batch-only, so an append
+      // whose Material batch had drifted fell straight to the family prefix.
+      const matEntries: LsiMatEntry[] = [];
       for (const m of soMaterials) {
         if (!m.materialDescription) continue;
-        const desc = normaliseDesc(m.materialDescription);
+        const desc = normaliseLsiDesc(m.materialDescription);
         const batchTokens = String(m.batch ?? '')
           .split(',')
           .map((b) => b.trim())
           .filter((b) => b.length > 0);
-        matEntries.push({ desc, batchTokens: [...batchTokens, normaliseDesc(m.batch ?? '')], code: m.material });
+        matEntries.push({ desc, batchTokens: [...batchTokens, normaliseLsiDesc(m.batch ?? '')], code: m.material });
       }
-
-      // Resolve a PDF row (description, batch) to a real SAP code. The PDF
-      // description is sometimes TRUNCATED relative to the Material row's
-      // (e.g. "…SPDR" vs "…SPDR-P"), so we match on description PREFIX in
-      // either direction, then require the batch token to match. Only a unique
-      // match wins; ambiguous matches return undefined and fall back below.
-      const resolveCode = (rawDesc: string, rawBatch: string): string | undefined => {
-        const d = normaliseDesc(rawDesc);
-        const b = rawBatch.trim();
-        const hits = new Set<string>();
-        for (const e of matEntries) {
-          const descMatch = e.desc === d || e.desc.startsWith(d) || d.startsWith(e.desc);
-          if (descMatch && e.batchTokens.includes(b)) hits.add(e.code);
-        }
-        return hits.size === 1 ? [...hits][0] : undefined;
-      };
 
       for (const item of parsed.items) {
         // Look up the real SAP code by (description, batch). If no unique
         // Material row matches, fall back to the PDF's family prefix and log —
         // that's a recoverable miss but worth attention.
-        const realMaterialCode = resolveCode(item.description, item.batch);
+        const realMaterialCode = resolveLsiCode(matEntries, item.description, item.batch);
 
         const materialForLsi = realMaterialCode ?? item.material;
         if (!realMaterialCode) {
