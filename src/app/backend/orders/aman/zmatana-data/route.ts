@@ -206,7 +206,9 @@ export async function POST(request: Request) {
       // Audit emission must never break the primary flow.
     }
 
-    // Mark the WorkQueue row done + nudge the planner to advance.
+    // Mark the WorkQueue row done (fast, awaited — it's part of accepting this
+    // callback). pumpQueue nudges the next queued work; keep it awaited too,
+    // it's cheap (DB + a fire-and-forget /chat).
     if (body.work_id) {
       try {
         const { markDone, pumpQueue } = await import('@/lib/work-queue');
@@ -217,22 +219,35 @@ export async function POST(request: Request) {
           `[ZmatanaData] markDone failed for work_id=${body.work_id}: ${workErr instanceof Error ? workErr.message : String(workErr)}`,
         );
       }
-      try {
-        const { maybeAdvanceScenario, replanAfterEngineFetch } = await import('@/lib/scenario-engine');
-        // Advance any in-flight plan first (no-op for a single-step lone_zmatana
-        // plan, which completes on fire). Then re-enter the planner: lone_zmatana
-        // is an engine-only fetch step that ends a plan WITHOUT an outbound email,
-        // and the branch has already replied — so nothing else would re-drive the
-        // planner to emit the next phase (Rule 6e Phase 2.75). This bridges that.
-        await maybeAdvanceScenario(salesOrder.id);
-        await replanAfterEngineFetch(salesOrder.id);
-      } catch (advErr) {
-        console.error(
-          `[ZmatanaData] advance/replan failed for SO ${soNumber}: ${advErr instanceof Error ? advErr.message : String(advErr)}`,
-        );
-      }
+
+      // Re-plan WITHOUT blocking this callback's HTTP response.
+      // replanAfterEngineFetch re-enters the LLM planner (10s+ per call), and
+      // when the planner re-emits lone_zmatana it re-plans again — together that
+      // can exceed auto_gui2's 30s send timeout, so auto_gui2 marks the POST
+      // failed even though we've already persisted the SAP data and marked the
+      // work done above. The planner advance is independent of the ACK, so fire
+      // it in the background. This process is long-lived (PM2), so the promise
+      // runs to completion after the response is sent.
+      // NOTE: on a serverless host, swap this for waitUntil() so it isn't killed.
+      void (async () => {
+        try {
+          const { maybeAdvanceScenario, replanAfterEngineFetch } = await import('@/lib/scenario-engine');
+          // Advance any in-flight plan first (no-op for a single-step lone_zmatana
+          // plan, which completes on fire). Then re-enter the planner: lone_zmatana
+          // is an engine-only fetch step that ends a plan WITHOUT an outbound email,
+          // and the branch has already replied — so nothing else would re-drive the
+          // planner to emit the next phase (Rule 6e Phase 2.75). This bridges that.
+          await maybeAdvanceScenario(salesOrder.id);
+          await replanAfterEngineFetch(salesOrder.id);
+        } catch (advErr) {
+          console.error(
+            `[ZmatanaData] background advance/replan failed for SO ${soNumber}: ${advErr instanceof Error ? advErr.message : String(advErr)}`,
+          );
+        }
+      })();
     }
 
+    // Respond immediately — the SAP data is persisted and the work row is done.
     return NextResponse.json({
       success: true,
       so_number: soNumber,
