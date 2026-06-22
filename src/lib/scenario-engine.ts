@@ -1667,14 +1667,40 @@ async function fireStep(
       // step path (Rule 11). Mirrors the stock_precheck → substituted re-plan
       // pattern.
 
-      // Loop guard: count recent bundle_capacity_assessment completions for
-      // this SO. If the planner keeps re-emitting the assessment (i.e. it's
-      // ignoring the verdicts in the audit trail — a Gemini/GPT confusion
-      // mode we've seen), fail loudly so an operator can intervene rather
-      // than burning tokens in an infinite loop.
+      // Resolve the trigger email for THIS branch reply once — used both to
+      // scope the loop guard below and to re-enter handleReplyV2 afterwards.
+      const triggerEmailId = (
+        await prisma.scenarioProgress.findUnique({
+          where: { id: progress.id },
+          select: { triggerEmailId: true },
+        })
+      )?.triggerEmailId ?? null;
+
+      // Loop guard — SCOPED TO THE CURRENT BRANCH REPLY (triggerEmailId), NOT
+      // all-time. A genuine loop is the planner re-emitting the assessment over
+      // and over WITHIN one branch reply (ignoring the verdicts already in the
+      // audit trail — a Gemini/GPT confusion mode). Distinct branch-driven
+      // cycles are NOT a loop: e.g. the branch increases material A (assessment
+      // runs), the stock precheck comes back short, then the branch asks to
+      // increase material B (assessment runs again). Each is a fresh, legitimate
+      // request arriving on its OWN trigger email and must start the count from
+      // zero. Every re-plan within one reply re-enters handleReplyV2 with the
+      // same triggerEmailId, so all its ScenarioProgress rows share it; a new
+      // reply gets a new one. Counting only assessment completions under THIS
+      // reply's progress rows resets the guard per cycle while still catching a
+      // real same-reply loop.
+      const cycleProgressIds = triggerEmailId
+        ? (
+            await prisma.scenarioProgress.findMany({
+              where: { triggerEmailId },
+              select: { id: true },
+            })
+          ).map((p) => p.id)
+        : [progress.id];
       const recentAssessments = await prisma.scenarioEvent.count({
         where: {
           salesOrderId: progress.salesOrderId,
+          scenarioProgressId: { in: cycleProgressIds },
           type: 'step_completed',
           payload: { contains: '"kind":"bundle_capacity_assessment"' },
         },
@@ -1682,9 +1708,9 @@ async function fireStep(
       const LOOP_THRESHOLD = 3;
       if (recentAssessments >= LOOP_THRESHOLD) {
         const errMsg =
-          `bundle_capacity_assessment loop guard tripped: this SO already has ` +
-          `${recentAssessments} prior assessment completions in audit. The planner is ` +
-          `re-emitting the assessment instead of routing per-item per Rule 6e. ` +
+          `bundle_capacity_assessment loop guard tripped: this branch reply already ` +
+          `has ${recentAssessments} prior assessment completions in audit. The planner ` +
+          `is re-emitting the assessment instead of routing per-item per Rule 6e. ` +
           `Likely cause: the planner is not reading the \`verdicts:\` summary off ` +
           `the latest step_completed line. Marking scenario failed for supervisor review.`;
         log(`[ENGINE] ${errMsg}`);
@@ -1769,12 +1795,7 @@ async function fireStep(
         where: { id: progress.id },
         data: { state: 'completed' },
       });
-      const triggerEmailId = (
-        await prisma.scenarioProgress.findUnique({
-          where: { id: progress.id },
-          select: { triggerEmailId: true },
-        })
-      )?.triggerEmailId;
+      // triggerEmailId was resolved at the top of this case (loop-guard scope).
       if (triggerEmailId) {
         const trigger = await prisma.email.findUnique({
           where: { id: triggerEmailId },
