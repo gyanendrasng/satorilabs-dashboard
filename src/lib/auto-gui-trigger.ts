@@ -2070,7 +2070,17 @@ export async function triggerLoneZmatana(
       transaction_code: 'LONE-ZMATANA',
       meta: {
         so_number: soNumber,
-        materials: normalized,
+        // The requested material codes — deliberately named `materials_codes`,
+        // NOT `materials`. auto_gui POSTs the policy-optimiser JSON file back to
+        // /zmatana-data and merges this meta OVER the file content
+        // (json_data.update(meta) in send_to_endpoint). A key named `materials`
+        // would overwrite the file's RICH materials array (objects with
+        // material_description / batch / stock) with these bare codes — which
+        // nulled materialDescription and mangled the LSIs into the family prefix
+        // (the SO 3382184 bug). The file only defines `email_body` + `materials`,
+        // so any other key name rides along harmlessly. ZSO-VISIBILITY's meta is
+        // just { so_number } for the same reason.
+        materials_codes: normalized,
         materials_key: materialsKey,
         dedup_key: dedupKey,
         // Per-material delta (units) the SAP agent should look for stock
