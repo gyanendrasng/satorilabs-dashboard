@@ -639,10 +639,23 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     return { sent: false, logs };
   }
 
-  // Build one section per bundle. Each bundle has ≥1 LSs (one per plant);
-  // each LS has its SKU lines.
+  // Ask ONLY for bundles that don't already have vehicle details. Once the
+  // branch has given transport for a bundle we never re-ask for it: a
+  // post-plant_ls modification that appends an LS to an EXISTING bundle keeps
+  // that bundle's vehicle, so there's nothing to collect. We email only when a
+  // bundle still lacks details (e.g. a brand-new vehicle/bundle was added), and
+  // then only for those bundles. This is what stops the spurious "vehicle
+  // details already sent" re-ask after an other_bundle append.
+  const needDetails = po.bundles.filter((b) => !b.vehicleNumber);
+  if (needDetails.length === 0) {
+    log(`[VehicleDetails] PO ${po.poNumber} — every bundle already has vehicle details; nothing to ask, skipping`);
+    return { sent: false, logs };
+  }
+
+  // Build one section per bundle that still needs details. Each bundle has ≥1
+  // LSs (one per plant); each LS has its SKU lines.
   const bundleBlocks: string[] = [];
-  for (const bundle of po.bundles) {
+  for (const bundle of needDetails) {
     const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
     // One line per (SO, LS, material) — collapse the per-batch LSI rows of a
     // multi-batch material (batch is not shown in the vehicle-details email).
@@ -669,15 +682,19 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     );
   }
 
-  const subject = `Vehicle Details Required - PO ${po.poNumber} (${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'})`;
+  const askingForAll = needDetails.length === po.bundles.length;
+  const subject = `Vehicle Details Required - PO ${po.poNumber} (${needDetails.length} bundle${needDetails.length === 1 ? '' : 's'})`;
+  const intro = askingForAll
+    ? `Loading slips for Purchase Order ${po.poNumber} are now ready in SAP. The PO is split into ${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'}:`
+    : `An additional vehicle is needed for Purchase Order ${po.poNumber}. Please provide transport details for the following new bundle${needDetails.length === 1 ? '' : 's'} (the other bundles are already arranged):`;
   const body = [
     `Dear Branch Team,`,
     ``,
-    `Loading slips for Purchase Order ${po.poNumber} are now ready in SAP. The PO is split into ${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'}:`,
+    intro,
     ``,
     ...bundleBlocks.map((b) => b + '\n'),
     `Please reply with vehicle/transport details for each bundle in the format below:`,
-    ...po.bundles.map(
+    ...needDetails.map(
       (b) =>
         `  Bundle ${b.bundleNumber}: <Vehicle Number>, <Driver Mobile>, <Container Number>`
     ),
