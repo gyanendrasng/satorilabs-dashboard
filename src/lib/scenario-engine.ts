@@ -2766,14 +2766,22 @@ async function fireStep(
         }
         log(`[ENGINE] email_modified_ls_to_plant — FIRST SEND (no prior plant_ls): forwarding ALL ${modifiedSlips.length} LS(s) to plant.`);
       } else {
-        // Follow-up — only the LSs touched in this scenario.
+        // Follow-up — the LSs changed in THIS scenario, which is BOTH:
+        //   (a) existing LSs revised by zload2 / zloading_close (keyed by the
+        //       planner-supplied meta.ls_number on those work rows), AND
+        //   (b) brand-NEW LSs created by a ZLOAD1-APPEND leg (other_bundle /
+        //       new_bundle). The append's LS number is assigned by SAP and
+        //       returned in the zload1-data callback — it's NOT on the work row
+        //       — so we find those by creation time within this scenario.
+        // Missing (b) was the bug: an other_bundle increase created a new LS the
+        // plant was never told about (only the zload2-revised LS got forwarded).
         const modWork = await prisma.workQueue.findMany({
           where: {
             salesOrderId: progress.salesOrderId,
             step: { in: ['zload2', 'zloading_close'] },
             createdAt: { gte: scenarioStartedAt },
           },
-          select: { id: true, step: true, payload: true },
+          select: { payload: true },
           orderBy: { createdAt: 'asc' },
         });
 
@@ -2789,15 +2797,14 @@ async function fireStep(
           }
         }
 
-        if (touchedLsNumbers.size === 0) {
-          log('[ENGINE] email_modified_ls_to_plant — no zload2/zloading_close work rows found in this scenario; nothing to forward.');
-          return 'advance_now';
-        }
-
         modifiedSlips = await prisma.loadingSlip.findMany({
           where: {
             salesOrderId: progress.salesOrderId,
-            lsNumber: { in: [...touchedLsNumbers] },
+            OR: [
+              ...(touchedLsNumbers.size > 0 ? [{ lsNumber: { in: [...touchedLsNumbers] } }] : []),
+              // (b) ZLOAD1-append LS(s) created during this scenario.
+              { createdAt: { gte: scenarioStartedAt } },
+            ],
           },
           include: {
             bundle: { select: { vehicleNumber: true, driverMobile: true, containerNumber: true } },
@@ -2805,7 +2812,7 @@ async function fireStep(
         });
 
         if (modifiedSlips.length === 0) {
-          log(`[ENGINE] email_modified_ls_to_plant — no LoadingSlip rows for [${[...touchedLsNumbers].join(', ')}]; nothing to forward.`);
+          log('[ENGINE] email_modified_ls_to_plant — no revised or newly-appended LS in this scenario; nothing to forward.');
           return 'advance_now';
         }
       }

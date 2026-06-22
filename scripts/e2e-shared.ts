@@ -126,6 +126,15 @@ const GMAIL_STUBS: Record<string, any> = {
     RECORDED_EMAILS.push({ fn: 'sendEmail', args, ts: Date.now() });
     return nextGmailIds();
   },
+  // Attachment senders (LS forwards via sendLSEmail).
+  sendEmailWithAttachment: async (...args: unknown[]) => {
+    RECORDED_EMAILS.push({ fn: 'sendEmailWithAttachment', args, ts: Date.now() });
+    return nextGmailIds();
+  },
+  sendReplyEmailWithAttachment: async (...args: unknown[]) => {
+    RECORDED_EMAILS.push({ fn: 'sendReplyEmailWithAttachment', args, ts: Date.now() });
+    return nextGmailIds();
+  },
   // RFC822 id stub — always returns a synthetic id so reply-in-thread works.
   getMessageRfc822Id: async (messageId: string) => {
     RECORDED_EMAILS.push({ fn: 'getMessageRfc822Id', args: [messageId], ts: Date.now() });
