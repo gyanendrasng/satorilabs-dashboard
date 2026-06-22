@@ -501,6 +501,13 @@ RULES:
      - If the latest inbound IS itself a reply on a tonnage_inquiry thread and contains tonnage, emit process_tonnage_reply (per rule 14) — that's the unblock.
      - You MAY still emit non-bundle, non-truck steps that don't depend on tonnage (e.g. process_plant_invoice on a separate flow, email_order_status for a status question).
 1. Plan up to and including the NEXT outbound email. STOP at that email. The next inbound email will trigger a fresh plan call.
+   A generated plan MUST end with an outbound email step (an \`email_*\` kind). It must NEVER end on a SAP / engine-fetch step
+   (zso_visibility, lone_zmatana, va02, zload1, zload2, zloading_close). If a fetch step is needed, include its consequent email
+   in the SAME plan so the plan ends on the email — e.g. \`[lone_zmatana, email_confirm_product_details]\` (preserve flow) or
+   \`[va02, lone_zmatana, email_2nd_release]\` (substitution flow). The engine fires the SAP step(s), waits for each callback, then
+   advances to the email and pauses for the reply — do NOT split the fetch into its own step-less plan and rely on a re-plan.
+   (ONLY exception: \`bundle_capacity_assessment\` and \`stock_precheck\` choose the next step from their own result and so may end
+   a plan; the engine bridges exactly one re-plan for those.)
 2. Pick step kinds ONLY from the AVAILABLE STEP KINDS list. Out-of-vocab values are rejected.
 3. EVERY step that has an argsSchema in AVAILABLE STEP KINDS MUST include an \`args\` object matching that schema. The args you emit are passed VERBATIM to the executor — no downstream LLM re-extracts them from the email body. You have the full email thread above; read it and fill the args in. Use the SAME material codes / LS numbers / vehicle numbers the email thread uses (do not invent or normalise). If a step's argsSchema is null/none, omit \`args\` entirely.
    For SAP-mutating steps (va02, zload2, zloading_close, stock_precheck) the args drive REAL transactions. If you would have to guess to fill them in, do NOT emit the step — emit email_clarify_branch / email_clarify_plant instead (see rule 15).
@@ -746,24 +753,30 @@ trigger email type, to decide whose intent this is.
         just replied on the 2nd_release email confirming. (Rule 8 routes
         a post-plant_ls 2nd_release ack to here.) DO NOT emit
         zso_visibility — its visibility-data callback would fan out into
-        an unwanted ls_dispatch email. Instead emit:
-            lone_zmatana with materials = [{ code, delta }, ...] for the
-            placed-portion material list from the bundle_capacity_assessment
-            verdicts (the same list VA02 just bumped). delta = the ADDED
-            units per material (shipKg converted to units via
-            Material.orderWeightKg — the same delta you used for the va02
-            target minus the prior SO qty). Loading slips already exist
-            here, so ZMatana only needs stock for the delta, NOT the new
-            total.
-        STOP. zmatana-data writes batch + availableStock onto Material
-        rows for those codes, emits step_completed lone_zmatana, and
-        re-enters this planner.
+        an unwanted ls_dispatch email. Emit BOTH steps in ONE plan, ending
+        on the outbound email (NEVER emit lone_zmatana alone — a plan must
+        not end on a SAP fetch step; see rule 1):
+            (1) lone_zmatana with materials = [{ code, delta }, ...] for the
+                placed-portion material list from the bundle_capacity_assessment
+                verdicts (the same list VA02 just bumped). delta = the ADDED
+                units per material (shipKg converted to units via
+                Material.orderWeightKg — the same delta you used for the va02
+                target minus the prior SO qty). Loading slips already exist
+                here, so ZMatana only needs stock for the delta, NOT the new
+                total.
+            (2) email_confirm_product_details
+        STOP at the email. The engine fires lone_zmatana, its zmatana-data
+        callback writes batch + availableStock onto the Material rows and then
+        ADVANCES to email_confirm_product_details (which reads those freshly
+        written rows) and pauses for the branch reply — so there is NO separate
+        re-plan after the fetch. Set stop_after_index to the email's index (1).
 
-      - PHASE 2.75 — \`step_completed lone_zmatana\` exists AFTER the
+      - PHASE 2.75 (fallback) — \`step_completed lone_zmatana\` exists AFTER the
         latest inbound modification email_received, AND NO
         \`email_sent ls_dispatch\` exists at the current PO dispatchRound.
-        The branch needs to re-confirm the material list (now post-VA02 +
-        post-zmatana batches). Emit:
+        This only arises if lone_zmatana was emitted ALONE (it should have been
+        paired with the email in Phase 2.5). The branch still needs the re-confirm
+        of the material list (now post-VA02 + post-zmatana batches). Emit:
             email_confirm_product_details
         STOP. The engine handler will detect that no ls_dispatch is on
         file for this round and actively send one

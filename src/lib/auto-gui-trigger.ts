@@ -1998,13 +1998,24 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
  */
 export type LoneZmatanaMaterial = string | { material: string; delta?: number };
 
+/**
+ * Result of attempting to fire LONE-ZMATANA. `existingState` is the state of the
+ * matching work row when `fired` is false (a dedup) — the engine uses it to tell
+ * a still-RUNNING transaction (`queued`/`firing` → wait for the callback) from an
+ * already-FINISHED one (`done` → stop; don't re-run/re-plan).
+ */
+export interface TriggerLoneZmatanaResult {
+  fired: boolean;
+  existingState: 'queued' | 'firing' | 'done' | null;
+}
+
 export async function triggerLoneZmatana(
   soNumber: string,
   materials: LoneZmatanaMaterial[],
-): Promise<boolean> {
+): Promise<TriggerLoneZmatanaResult> {
   if (materials.length === 0) {
     console.log(`[LONE-ZMATANA] No materials provided for SO ${soNumber} — skipping`);
-    return false;
+    return { fired: false, existingState: null };
   }
   // Normalize to {material, delta?} and dedup by code (last delta wins).
   const byCode = new Map<string, { material: string; delta?: number }>();
@@ -2045,7 +2056,7 @@ export async function triggerLoneZmatana(
   });
   if (existing) {
     console.log(`[LONE-ZMATANA] Already exists for SO ${soNumber} materials [${materialsKey}] round ${so?.purchaseOrder?.dispatchRound ?? 0} (${existing.state}) — skipping`);
-    return false;
+    return { fired: false, existingState: existing.state as 'queued' | 'firing' | 'done' };
   }
 
   const materialList = normalized.join(', ');
@@ -2077,7 +2088,7 @@ export async function triggerLoneZmatana(
     .map((e) => (e.delta !== undefined ? `${e.material}(Δ${e.delta})` : e.material))
     .join(', ');
   console.log(`[LONE-ZMATANA] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${deltaSummary})`);
-  return true;
+  return { fired: true, existingState: null };
 }
 
 /**

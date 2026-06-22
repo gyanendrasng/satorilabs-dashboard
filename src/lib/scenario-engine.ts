@@ -22,6 +22,7 @@ import {
 } from './gmail';
 import {
   deriveStage,
+  planEndsWithOutboundEmail,
   type Step,
   type StepKind,
 } from './dispatch-scenarios';
@@ -1958,59 +1959,28 @@ async function fireStep(
         .map((i) => (i.delta !== undefined ? `${i.code}(Δ${i.delta})` : i.code))
         .join(', ');
       log(`[ENGINE] lone_zmatana firing for ${items.length} material(s): ${describe}`);
-      const enqueued = await triggerLoneZmatana(soNumber, items.map((i) => ({ material: i.code, delta: i.delta })));
-      if (enqueued) {
+      const lz = await triggerLoneZmatana(soNumber, items.map((i) => ({ material: i.code, delta: i.delta })));
+
+      // Newly fired OR an identical transaction is still RUNNING (queued/firing):
+      // WAIT for the response. The transaction's /zmatana-data callback drives the
+      // single re-plan once the data is back. Do NOT re-invoke the planner here —
+      // re-planning mid-transaction (or re-firing) is what produced the re-run loop.
+      if (lz.fired || lz.existingState === 'queued' || lz.existingState === 'firing') {
+        if (!lz.fired) {
+          log(`[ENGINE] lone_zmatana — identical transaction already ${lz.existingState}; waiting for its response (not re-planning)`);
+        }
         await markAwaitingCallback(progress.id);
         return 'pause';
       }
-      // Deduped: a LONE-ZMATANA for this (SO, round, delta) already ran, so the
-      // Material rows already carry fresh batch + stock — there is NO callback
-      // coming to advance us. Don't pause (that deadlocks). Instead complete this
-      // fetch segment and re-drive the planner to the next phase ourselves,
-      // exactly as the zmatana-data callback's replanAfterEngineFetch would —
-      // mirroring the stock_precheck `substituted` inline re-plan.
-      log('[ENGINE] lone_zmatana — data already present (deduped); completing segment and re-planning');
-      try {
-        const { emitEvent } = await import('./scenario-events');
-        await emitEvent({
-          salesOrderId: progress.salesOrderId,
-          scenarioProgressId: progress.id,
-          type: 'step_completed',
-          payload: { kind: 'lone_zmatana', scenario_key: 'planner', note: 'deduped — data already fetched' },
-        });
-      } catch {}
-      await prisma.scenarioProgress.update({
-        where: { id: progress.id },
-        data: { state: 'completed' },
-      });
-      const lzTrigger = (
-        await prisma.scenarioProgress.findUnique({
-          where: { id: progress.id },
-          select: { triggerEmailId: true },
-        })
-      )?.triggerEmailId;
-      if (lzTrigger) {
-        const trigger = await prisma.email.findUnique({
-          where: { id: lzTrigger },
-          select: { replyHtml: true, recipientEmail: true },
-        });
-        if (trigger?.replyHtml) {
-          const sender: 'branch' | 'plant' =
-            PLANT_EMAIL && trigger.recipientEmail === PLANT_EMAIL ? 'plant' : 'branch';
-          const r = await handleReplyV2({
-            emailId: lzTrigger,
-            replyHtml: trigger.replyHtml,
-            originalEmailHtml: '',
-            sourceEmailType: sender,
-          });
-          for (const line of r.logs) log(line);
-        } else {
-          log('[ENGINE] lone_zmatana dedup — trigger reply missing replyHtml; cannot re-plan inline');
-        }
-      } else {
-        log('[ENGINE] lone_zmatana dedup — no triggerEmailId on progress; cannot re-plan inline');
-      }
-      return 'pause';
+
+      // existingState === 'done' (or no row): the response already came back and
+      // the callback already re-planned once — the planner is re-emitting a step
+      // that has already finished this cycle. STOP: do not re-fire, do not
+      // re-invoke the planner (no loop). Complete this no-op segment. With real
+      // SAP data the planner emits the NEXT step instead of re-emitting, so this
+      // is the rare safety net, not the happy path.
+      log('[ENGINE] lone_zmatana — already completed this cycle; not re-generating (stop, no re-plan)');
+      return 'advance_now';
     }
 
     case 'mb51': {
@@ -3528,9 +3498,34 @@ export async function replanAfterEngineFetch(
   const latest = await prisma.scenarioProgress.findFirst({
     where: { salesOrderId },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, state: true },
+    select: { id: true, state: true, generatedSteps: true, stopAfterIndex: true },
   });
   if (!latest || latest.state !== 'completed') return;
+
+  // Don't re-plan while a SAP transaction for this SO is still in-flight — WAIT
+  // for its response (its own callback drives the re-plan once the data lands).
+  // Re-planning mid-transaction is what re-generated the same step in a loop.
+  const inFlightWork = await prisma.workQueue.findFirst({
+    where: { salesOrderId, state: { in: ['queued', 'firing'] } },
+    select: { id: true, step: true, state: true },
+  });
+  if (inFlightWork) {
+    console.log(
+      `[ENGINE] replanAfterEngineFetch — SAP work ${inFlightWork.step} still ${inFlightWork.state} for SO ${salesOrderId}; waiting for its response (not re-planning)`,
+    );
+    return;
+  }
+
+  // Don't re-plan if the just-completed plan ENDED with an outbound email — the
+  // engine is correctly paused for the branch/plant reply, which will re-drive
+  // the planner. Only bridge a re-plan when the plan ended on a (completed)
+  // non-email SAP/engine-fetch step — the case this function exists for.
+  if (planEndsWithOutboundEmail(readPlanFromProgress(latest).steps)) {
+    console.log(
+      `[ENGINE] replanAfterEngineFetch — last plan ended with an outbound email for SO ${salesOrderId}; waiting for the reply (not re-planning)`,
+    );
+    return;
+  }
 
   const trigger = await loadTriggerReply(latest.id);
   if (!trigger) {

@@ -107,6 +107,37 @@ export interface Step {
   awaitsBranchReply?: boolean;  // email step — pause until branch/plant replies
 }
 
+// -----------------------------------------------------------------------------
+// Outbound-email step kinds — the steps that send a message to branch/plant and
+// then pause for a reply. The engine's segmented model assumes every generated
+// plan ENDS on one of these (so the next inbound re-drives the planner). Used to
+// decide, after an engine-fetch step completes, whether to re-plan (plan ended
+// on a non-email fetch step → bridge a re-plan) or wait for a reply (plan ended
+// on an email → do nothing). See replanAfterEngineFetch in scenario-engine.ts.
+// -----------------------------------------------------------------------------
+export const OUTBOUND_EMAIL_KINDS: ReadonlySet<StepKind> = new Set<StepKind>([
+  'email_2nd_release',
+  'email_confirm_product_details',
+  'email_confirm_bundle_details',
+  'email_to_branch_for_vehicle',
+  'email_to_plant',
+  'email_modified_ls_to_plant',
+  'email_to_branch_notifying_plant_change',
+  'email_order_status',
+  'email_clarify_branch',
+  'email_clarify_plant',
+  'email_supervisor_question',
+  'email_branch_overflow_request',
+  'email_branch_request_new_so',
+]);
+
+/** True when the plan's LAST step sends an outbound email (a wait-for-reply
+ *  boundary). Empty plans → false. */
+export function planEndsWithOutboundEmail(steps: ReadonlyArray<{ kind: StepKind }>): boolean {
+  if (steps.length === 0) return false;
+  return OUTBOUND_EMAIL_KINDS.has(steps[steps.length - 1].kind);
+}
+
 export interface Scenario {
   key: string;
   description: string;

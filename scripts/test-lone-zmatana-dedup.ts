@@ -66,14 +66,14 @@ async function main() {
     const rows = await loneRows(so1.id);
     const freshEnqueued = rows.some((r) => r.state !== 'done' && r.payload.includes('"dedup_key":"so:') && r.payload.includes('round:3'));
 
-    if (fired1 === true) pass('fires despite a prior done row from another cycle (no cross-cycle collision)');
-    else fail('triggerLoneZmatana returned false — collided with the prior-cycle done row (the deadlock cause)');
+    if (fired1.fired === true) pass('fires despite a prior done row from another cycle (no cross-cycle collision)');
+    else fail('triggerLoneZmatana did not fire — collided with the prior-cycle done row (the deadlock cause)');
 
     if (freshEnqueued) pass('a fresh round-3 LONE-ZMATANA work row was enqueued');
     else fail(`no fresh round-3 work row enqueued; rows=${JSON.stringify(rows)}`);
 
     const fired2 = await triggerLoneZmatana(so1.soNumber, [{ material: MAT, delta: 10 }]);
-    if (fired2 === false) pass('identical retry (same round + delta) is deduped → false');
+    if (fired2.fired === false) pass('identical retry (same round + delta) is deduped → not fired');
     else fail('retry fired again — dedup not protecting against a true re-fire');
   } finally {
     await prisma.workQueue.deleteMany({ where: { salesOrderId: so1.id } });
