@@ -2122,29 +2122,52 @@ async function fireStep(
         await triggerZload2(bucket.lsNumber, bucket.items);
       }
 
-      // Record the SO-line decrease as PENDING — but ONLY for a GENUINE decrease.
-      // ZLOAD2 also carries the new LS total for a surgical INCREASE (Rule 6e
-      // same_bundle: qty = existing LSI qty + added units, e.g. 210). For an
-      // increase the SO line was already raised to that total by the Phase 2
-      // va02 (persisted above), so stamping pendingSoOp='dec' here was wrong — it
-      // mislabeled the increase as a pending decrease and a later unrelated va02
-      // would flush the SO line back down. Only stamp pending-dec when the
-      // revision is strictly below the current SO line.
+      // Record a PENDING SO-line decrease — but ONLY for a GENUINE decrease.
+      // A decrease LOWERS an existing LS line; the SO line (orderQuantity) is
+      // then flushed down to match on the next va02 (va02 itself only applies
+      // increases directly). Two NON-decrease cases must be excluded:
+      //   1. same-bundle increase (Rule 6e): zload2 carries the new LS total
+      //      (e.g. 210), already written to the SO line by the Phase-2 va02, so
+      //      qty == cur — excluded by the `< cur` test.
+      //   2. split-across-bundles increase: zload2 carries only the portion that
+      //      fits THIS bundle (e.g. 213 of a 250 SO line) while a sibling zload1
+      //      appends the overflow (37) to a NEW LS. Here qty (213) < cur (250)
+      //      even though it is an INCREASE — so `< cur` ALONE wrongly flags a
+      //      decrease, which a later va02 then flushes onto the SO line
+      //      (orderQuantity 250 → 213; the SO 3382184 / YAFPLNA bug, which also
+      //      made SAP try to lower the SO line).
+      // The reliable discriminator: an increase RAISES the revised LS line; a
+      // decrease LOWERS it. So additionally require the new qty to be BELOW the
+      // LS's PRIOR quantity. LSI rows still hold their pre-zload2 quantities here
+      // (the /zload2-data callback updates them later), so this read is the prior.
+      const priorLsiRows = await prisma.loadingSlipItem.findMany({
+        where: { salesOrderId: progress.salesOrderId },
+        select: { lsNumber: true, material: true, batch: true, orderQuantity: true },
+      });
+      const priorQtyByKey = new Map<string, number>();
+      for (const l of priorLsiRows) {
+        priorQtyByKey.set(`${l.lsNumber}|${l.material}|${l.batch}`, l.orderQuantity ?? 0);
+      }
       const curRows = await prisma.material.findMany({
         where: { salesOrderId: progress.salesOrderId, material: { in: requested.map((r) => r.material) } },
         select: { material: true, orderQuantity: true },
       });
       const curByCode = new Map(curRows.map((m) => [m.material, m.orderQuantity]));
-      for (const r of requested) {
-        const cur = curByCode.get(r.material);
-        if (cur !== undefined && r.orderQuantity < cur) {
-          // Genuine decrease: LS revised now, SO line flushed on the next va02.
-          await prisma.material.updateMany({
-            where: { salesOrderId: progress.salesOrderId, material: r.material },
-            data: { pendingSoOp: 'dec', pendingSoQty: r.orderQuantity },
-          });
+      for (const bucket of byLs.values()) {
+        for (const item of bucket.items) {
+          const cur = curByCode.get(item.material);
+          const priorOnThisLs = priorQtyByKey.get(`${bucket.lsNumber}|${item.material}|${item.batch}`) ?? 0;
+          // Genuine decrease only when BOTH hold: the result is below the SO line
+          // AND this existing LS line actually shrank. A split-increase portion
+          // raises the LS line (overflow routes to a NEW LS), so it is skipped.
+          if (cur !== undefined && item.orderQuantity < cur && item.orderQuantity < priorOnThisLs) {
+            // LS revised down now; SO line flushed to match on the next va02.
+            await prisma.material.updateMany({
+              where: { salesOrderId: progress.salesOrderId, material: item.material },
+              data: { pendingSoOp: 'dec', pendingSoQty: item.orderQuantity },
+            });
+          }
         }
-        // equal / increase → SO line already at (or above) target; no pending dec.
       }
 
       await markAwaitingCallback(progress.id);
