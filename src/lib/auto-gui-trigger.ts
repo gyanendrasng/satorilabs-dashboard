@@ -2281,18 +2281,21 @@ export type PendingSoChange = {
 };
 
 /**
- * Merge the planner's INCREASE list with any PENDING decreases/deletes into the
- * single material list a VA02 call will carry. Pure — no DB, no side effects;
- * unit-tested directly.
+ * Merge the planner's VA02 items (inc / dec / del) with any PENDING
+ * decreases/deletes into the single material list a VA02 call will carry. Pure —
+ * no DB, no side effects; unit-tested directly.
  *
  * Rules:
  *   - Seed from pending: 'dec' → set to pendingSoQty; 'del' → delete the line.
- *   - An increase for the SAME material SUPERSEDES its pending entry (a fresh
- *     increase is the live truth; the stale dec/del is dropped).
+ *   - A planner item for the SAME material SUPERSEDES its pending entry (the
+ *     fresh op is the live truth; the stale dec/del is dropped).
+ *   - A planner 'del' deletes the line; inc AND dec both SET the line to the new
+ *     absolute total (SAP set-quantity handles both directions). Items with no
+ *     `op` are treated as increases (legacy callers).
  *   - A pending 'dec' with a null/invalid qty is skipped defensively.
  */
 export function mergeVa02Flush(
-  increases: Array<{ material: string; orderQuantity: number }>,
+  plannerItems: Array<{ material: string; op?: 'inc' | 'dec' | 'del'; orderQuantity?: number }>,
   pending: PendingSoChange[],
 ): Va02Material[] {
   const byMaterial = new Map<string, Va02Material>();
@@ -2303,9 +2306,13 @@ export function mergeVa02Flush(
       byMaterial.set(p.material, { material: p.material, orderQuantity: p.pendingSoQty });
     }
   }
-  // Increases win over any pending entry for the same code.
-  for (const inc of increases) {
-    byMaterial.set(inc.material, { material: inc.material, orderQuantity: inc.orderQuantity });
+  // Planner items win over any pending entry for the same code.
+  for (const it of plannerItems) {
+    if (it.op === 'del') {
+      byMaterial.set(it.material, { material: it.material, op: 'del' });
+    } else if (typeof it.orderQuantity === 'number') {
+      byMaterial.set(it.material, { material: it.material, orderQuantity: it.orderQuantity });
+    }
   }
   return Array.from(byMaterial.values());
 }

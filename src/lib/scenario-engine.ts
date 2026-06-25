@@ -1819,17 +1819,24 @@ async function fireStep(
 
     // -------- SAP transactions --------
     case 'va02': {
-      // VA02 in SAP changes SO line quantities. The planner emits ONLY
-      // increases (coerceVa02Args enforces qty > 0). On top of those, this
-      // handler FLUSHES any pending branch decreases/deletes onto the SO line
-      // in the SAME VA02 call: a decrease/delete is applied to the loading slip
-      // immediately (zload2 / zloading_close set Material.pendingSoOp), but the
-      // SO line is only reconciled here, when a VA02 runs anyway.
+      // VA02 in SAP changes SO line quantities. V3.0 lets the planner emit
+      // inc / dec / del directly here — but ONLY in the no-loading-slips window
+      // (pre-LS, or the recreate path where a zloading_close all earlier in the
+      // SAME plan wiped the slips). In the preserve / post-plant windows the
+      // planner emits increases only; decreases/deletes are applied to the
+      // loading slips (zload2 / zloading_close set Material.pendingSoOp) and the
+      // SO line is reconciled HERE, when a VA02 runs anyway. So this handler
+      // applies BOTH the planner's inc/dec/del AND any pending dec/del flush.
       const { coerceVa02Args } = await import('./planner-step-args');
-      const items = coerceVa02Args(_plannedStep); // increases only, qty > 0
+      const items = coerceVa02Args(_plannedStep);
+      const setItems = items.filter(
+        (it): it is { material: string; op: 'inc' | 'dec'; orderQuantity: number } =>
+          it.op !== 'del' && typeof it.orderQuantity === 'number',
+      );
+      const delItems = items.filter((it) => it.op === 'del');
       const soNumber = await soNumberFor(progress.salesOrderId);
 
-      // Load pending dec/del for THIS SO and merge them with the increases.
+      // Load pending dec/del for THIS SO and merge them with the planner items.
       const pendingRows = await prisma.material.findMany({
         where: { salesOrderId: progress.salesOrderId, pendingSoOp: { not: null } },
         select: { material: true, pendingSoOp: true, pendingSoQty: true },
@@ -1846,31 +1853,30 @@ async function fireStep(
       const describe = merged
         .map((m) => ('op' in m ? `${m.material}→DELETE` : `${m.material}→${m.orderQuantity}`))
         .join(', ');
-      log(`[ENGINE] va02 firing for ${merged.length} line(s) (${items.length} increase, ${pending.length} pending dec/del): ${describe}`);
+      log(`[ENGINE] va02 firing for ${merged.length} line(s) (planner: ${setItems.length} inc/dec + ${delItems.length} del; ${pending.length} pending dec/del): ${describe}`);
       await triggerVa02(soNumber, merged);
 
-      // Persist the INCREASE targets onto the SO line. `coerceVa02Args` returns
-      // the new ABSOLUTE total per material (e.g. 210), which is exactly what we
-      // just sent to SAP — so the DB Material must match. Without this, the
-      // surgical-increase flow left orderQuantity stuck at the old value (e.g.
-      // 200) because nothing else writes it: visibility-data isn't called in this
-      // flow and zmatana-data deliberately skips orderQuantity.
+      // Persist the planner's inc/dec targets onto the SO line. coerceVa02Args
+      // returns the new ABSOLUTE total per material (e.g. 210 up, or 150 down),
+      // which is exactly what we just sent to SAP — so the DB Material must match.
+      // Without this, the surgical flow left orderQuantity stuck at the old value
+      // because nothing else writes it: visibility-data isn't called in this flow
+      // and zmatana-data deliberately skips orderQuantity.
       //
       // CRITICAL — keep all THREE related fields on the same basis, or every
       // downstream weight/qty calc breaks:
       //   - orderQuantity : the new SO-line total (the value sent to SAP).
       //   - orderWeightKg : the FULL-order weight; its basis IS orderQuantity, so
       //                     it must scale proportionally (kgPerUnit stays constant).
-      //                     Raising orderQuantity alone made kgPerUnit = 1900/210 =
-      //                     9.05 instead of 9.5, so the diff line rendered 211.
-      //   - dispatchQuantity : the branch is releasing the new total in this
-      //                     surgical increase, so it tracks orderQuantity exactly.
-      //                     Do NOT clamp by availableStock — that value is the
-      //                     STALE pre-increase stock; clamping pinned it at 200 and
-      //                     the bundle line showed "200 units, 1.900 t" instead of
-      //                     "210 units, 1.995 t". stock_precheck already validated
-      //                     the released qty before VA02 fired.
-      for (const it of items) {
+      //                     Moving orderQuantity alone would skew kgPerUnit and the
+      //                     diff/bundle lines (the SO 3382184 inflation bug).
+      //   - dispatchQuantity : the branch is releasing the new total, so it tracks
+      //                     orderQuantity exactly. Do NOT clamp by availableStock —
+      //                     that value is the STALE pre-change stock; stock_precheck
+      //                     already validated the released qty before VA02 fired.
+      // A decrease (op:'dec') uses the SAME math downward — set to the new total
+      // and rescale weight so kgPerUnit stays constant.
+      for (const it of setItems) {
         const rows = await prisma.material.findMany({
           where: { salesOrderId: progress.salesOrderId, material: it.material },
           select: { id: true, orderQuantity: true, orderWeightKg: true },
@@ -1881,26 +1887,22 @@ async function fireStep(
           const oldWeight = row.orderWeightKg ? Number(row.orderWeightKg) : 0;
           const kgPerUnit = oldQty > 0 && oldWeight > 0 ? oldWeight / oldQty : 0;
           const newWeight = kgPerUnit > 0 ? kgPerUnit * it.orderQuantity : oldWeight;
-          // Dispatch the FULL new total — do NOT clamp by availableStock here.
-          // VA02 only fires after stock_precheck returned `sufficient` for this
-          // increase, so the branch's released total IS available. availableStock
-          // on this row is the STALE pre-increase value (e.g. 200, last refreshed
-          // by the original ZSO-VISIBILITY) — lone_zmatana re-fetches it only in
-          // Phase 2.5, AFTER this write. Clamping against it pinned dispatchQuantity
-          // at 200 while orderQuantity/orderWeightKg moved to 210/1995, so the
-          // bundle-confirmation line rendered "200 units, 1.900 t" (its qty comes
-          // from dispatchQuantity and weight from (dispatchQuantity/orderQuantity)
-          // *orderWeightKg). The increase total is authoritative here.
-          const newDispatch = it.orderQuantity;
           await prisma.material.update({
             where: { id: row.id },
             data: {
               orderQuantity: it.orderQuantity,
               orderWeightKg: newWeight,
-              dispatchQuantity: newDispatch,
+              dispatchQuantity: it.orderQuantity,
             },
           });
         }
+      }
+
+      // Planner-emitted deletes remove the SO line entirely.
+      for (const it of delItems) {
+        await prisma.material.deleteMany({
+          where: { salesOrderId: progress.salesOrderId, material: it.material },
+        });
       }
 
       // Optimistically reconcile the DB + clear the pending flags. There is no
@@ -1909,10 +1911,11 @@ async function fireStep(
       // apply at fire time. If VA02 fails in SAP the WorkQueue row retries; the
       // LS already reflects the change, so the bounded inconsistency is the SO
       // line briefly showing the intended value before SAP confirms.
-      const increasedCodes = new Set(items.map((i) => i.material));
+      const plannerCodes = new Set(items.map((i) => i.material));
       for (const p of pending) {
-        if (increasedCodes.has(p.material)) {
-          // Superseded by a fresh increase — drop the stale pending change.
+        if (plannerCodes.has(p.material)) {
+          // Superseded by a fresh planner op this cycle (applied above) — drop
+          // the stale pending change so it isn't double-applied.
           await prisma.material.updateMany({
             where: { salesOrderId: progress.salesOrderId, material: p.material },
             data: { pendingSoOp: null, pendingSoQty: null },

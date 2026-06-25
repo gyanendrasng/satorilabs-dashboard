@@ -71,7 +71,10 @@ function asOptionalString(value: unknown): string | undefined {
 
 export interface Va02Item {
   material: string;
-  orderQuantity: number; // Int
+  /** 'inc'|'dec' set the SO line to a new absolute total; 'del' removes the line. */
+  op: MaterialOpSummary;
+  /** New absolute total (Int) for inc/dec. Absent for del. */
+  orderQuantity?: number;
 }
 
 export function coerceVa02Args(step: PlannedStep | undefined): Va02Item[] {
@@ -80,11 +83,26 @@ export function coerceVa02Args(step: PlannedStep | undefined): Va02Item[] {
   return materials.map((raw, i) => {
     const m = raw as Record<string, unknown>;
     const code = asString(m.code, `materials[${i}].code`, 'va02');
+    // `op` defaults to 'inc' for backward-compat (older plans emitted increases
+    // with no explicit op). V3.0 always sends op; dec/del are valid only in the
+    // no-loading-slips window (the engine enforces where they're allowed).
+    const rawOp = m.op === undefined ? 'inc' : m.op;
+    if (rawOp !== 'inc' && rawOp !== 'dec' && rawOp !== 'del') {
+      throw new PlannerArgsError(
+        `va02.args.materials[${i}].op must be one of inc|dec|del, got ${JSON.stringify(m.op)}`,
+      );
+    }
+    const op: MaterialOpSummary = rawOp;
+    if (op === 'del') {
+      return { material: code, op };
+    }
     const qty = asInt(m.qty, `materials[${i}].qty`, 'va02');
     if (qty <= 0) {
-      throw new PlannerArgsError(`va02.args.materials[${i}].qty must be positive, got ${qty}`);
+      throw new PlannerArgsError(
+        `va02.args.materials[${i}].qty must be positive for ${op}, got ${qty}`,
+      );
     }
-    return { material: code, orderQuantity: qty };
+    return { material: code, op, orderQuantity: qty };
   });
 }
 
