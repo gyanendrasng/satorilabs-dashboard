@@ -2,7 +2,7 @@
  * LLM planner — the single decision-maker for every inbound email.
  *
  * On every inbound email, planNextSteps() reads:
- *   - the manager prompt (ManagerV2.1.txt at repo root)
+ *   - the manager prompt (ManagerV3.0.txt at repo root)
  *   - the SO's audit trail (renderAuditTrailForSO)
  *   - the SO's email thread (renderEmailThreadForSO)
  *   - the SO's current DB state (status, materials, plant_ls sent?, invoice?)
@@ -129,22 +129,43 @@ export interface PlanResult {
 
 // -----------------------------------------------------------------------------
 // Manager prompt loader (cached at module load)
+//
+// ManagerV3.0.txt holds the whole planner prompt — process guide, OUTPUT FORMAT,
+// and the change-order rules — with {{TOKEN}} placeholders that buildPlannerPrompt()
+// fills in: {{AVAILABLE_STEP_KINDS}} (built on the fly from the STEP_KINDS array,
+// the same source that drives Zod validation) and the per-call DB sections
+// (sender, SO state, audit, thread). The rendered result is sent as ONE system
+// message (see planNextSteps).
 // -----------------------------------------------------------------------------
 
-const MANAGER_PROMPT_PATH = path.join(process.cwd(), 'ManagerV2.1.txt');
-let cachedManagerPrompt: string | null = null;
+const MANAGER_PROMPT_PATH = path.join(process.cwd(), 'ManagerV3.0.txt');
+let cachedPromptTemplate: string | null = null;
 
-function loadManagerPrompt(): string {
-  if (cachedManagerPrompt !== null) return cachedManagerPrompt;
+/**
+ * Read ManagerV3.0.txt and return the LLM-facing template (still holding the
+ * {{TOKEN}} placeholders). The file's leading `#` change-log header and the
+ * `=== SYSTEM ===` / `=== USER ===` dividers are organisational only and are
+ * stripped here so they never reach the model. Cached at module load.
+ */
+function loadPromptTemplate(): string {
+  if (cachedPromptTemplate !== null) return cachedPromptTemplate;
+  let raw: string;
   try {
-    cachedManagerPrompt = fs.readFileSync(MANAGER_PROMPT_PATH, 'utf8');
+    raw = fs.readFileSync(MANAGER_PROMPT_PATH, 'utf8');
   } catch (err) {
     throw new Error(
-      `[llm-planner] Could not read ManagerV2.1.txt at ${MANAGER_PROMPT_PATH}: ${err instanceof Error ? err.message : String(err)}. ` +
+      `[llm-planner] Could not read ManagerV3.0.txt at ${MANAGER_PROMPT_PATH}: ${err instanceof Error ? err.message : String(err)}. ` +
         `This file is required for the planner to run.`,
     );
   }
-  return cachedManagerPrompt;
+  // Everything up to and including `=== SYSTEM ===` is the change-log comment
+  // header — drop it. Then remove the lone `=== USER ===` divider line. What
+  // remains is the full prompt with {{TOKEN}} placeholders.
+  const sysMarker = '=== SYSTEM ===';
+  const sysIdx = raw.indexOf(sysMarker);
+  const body = sysIdx >= 0 ? raw.slice(sysIdx + sysMarker.length) : raw;
+  cachedPromptTemplate = body.replace(/^[ \t]*=== USER ===[ \t]*\r?\n/m, '').trimStart();
+  return cachedPromptTemplate;
 }
 
 // -----------------------------------------------------------------------------
@@ -183,8 +204,13 @@ const STEP_KINDS: Array<{ kind: StepKind; description: string; argsSchema: strin
   },
   {
     kind: 'va02',
-    description: 'Modify SO line items in SAP. Emit ONLY increases here (one entry per material being increased). You do NOT list decreases/deletes — the engine automatically flushes any pending branch decreases/deletes onto the SO line on this same VA02 run.',
-    argsSchema: '{ materials: [{ code: "<material code>", op: "inc", qty: <new total quantity, integer> }, ...] }',
+    description:
+      'Modify SO line items in SAP.\n' +
+      '  • INCREASES — always list every increased material as { op: "inc", qty: <new total quantity, integer> }.\n' +
+      '  • DECREASES / DELETES — list these ({ op: "dec", qty: <new total quantity, integer> } / { op: "del" }, omit qty for del) ONLY when NO loading slips exist at the moment this VA02 runs. That is: the plain pre-LS modify (WINDOW 1), and the RECREATE path where a zloading_close (args.all=true) EARLIER IN THIS SAME PLAN has already wiped the slips. In that no-slips window VA02 is the only thing that writes the dec/del to the SO line, so it MUST be listed here.\n' +
+      '  • When loading slips EXIST and remain (the preserve / surgical path, and post-plant_ls) — do NOT list dec/del on VA02. They are applied to the slips via zload2 / zloading_close, and the engine flushes the pending SO-line change automatically on the NEXT VA02. In that window list ONLY increases here (the engine still auto-flushes any already-recorded pending dec/del onto the SO line on this same run).\n' +
+      '  • EVERY va02 — increase, decrease, or delete — is followed by an email_2nd_release (the SO must be re-released for the change to take effect). A va02 carrying ONLY dec/del still takes a 2nd release. It skips only the increase-only steps: NO stock_precheck. (zso_visibility is still re-run on resume, since stock may have moved.)',
+    argsSchema: '{ materials: [{ code: "<material code>", op: "inc"|"dec"|"del", qty?: <integer — new total for inc/dec; omit for del> }, ...] }',
   },
   {
     kind: 'zso_visibility',
@@ -333,6 +359,10 @@ interface SoStateSnapshot {
    *  this point (the preserve/recreate fork keys on this). */
   loadingSlipsExist: boolean;
   plantLsSent: boolean;
+  /** True once the branch has shared vehicle details (any Bundle on the PO has a
+   *  vehicleNumber) OR plant_ls has been sent. Drives the VEHICLE GATE (Rule V):
+   *  reuse on-file details instead of re-asking. */
+  vehicleDetailsReceived: boolean;
   invoiceReceived: boolean;
   shipmentCreated: boolean;
   materialLines: string[];
@@ -367,6 +397,17 @@ async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapsh
     where: { salesOrderId, emailType: 'plant_ls', status: { in: ['sent', 'replied'] } },
     select: { id: true },
   });
+
+  // Vehicle details are captured per-Bundle on the parent PO (Bundle.vehicleNumber).
+  // Any populated bundle — or a sent plant_ls — means the branch has shared
+  // transport, so the VEHICLE GATE reuses it instead of re-asking. Mirrors the
+  // `after_vehicle_placement` check in deriveStage.
+  const vehiclePlaced = so.purchaseOrder
+    ? await prisma.bundle.findFirst({
+        where: { purchaseOrderId: so.purchaseOrder.id, vehicleNumber: { not: null } },
+        select: { id: true },
+      })
+    : null;
 
   const stage = await deriveStage(salesOrderId);
 
@@ -403,6 +444,7 @@ async function buildSoStateSnapshot(salesOrderId: string): Promise<SoStateSnapsh
     lsCount: so.loadingSlips.length,
     loadingSlipsExist: so.loadingSlips.length > 0,
     plantLsSent: !!plantLs,
+    vehicleDetailsReceived: !!plantLs || !!vehiclePlaced,
     invoiceReceived: !!so.invoice,
     shipmentCreated: so.shipments.length > 0,
     materialLines,
@@ -430,6 +472,7 @@ function renderSoState(s: SoStateSnapshot): string {
     `- loading slips exist (bundles frozen): ${s.loadingSlipsExist ? 'yes' : 'no'}`,
     tonnageLine,
     `- plant_ls email sent: ${s.plantLsSent ? 'yes' : 'no'}`,
+    `- vehicle details received: ${s.vehicleDetailsReceived ? 'yes' : 'no'}`,
     `- plant invoice received: ${s.invoiceReceived ? 'yes' : 'no'}`,
     `- shipment created: ${s.shipmentCreated ? 'yes' : 'no'}`,
     '',
@@ -442,6 +485,9 @@ function renderSoState(s: SoStateSnapshot): string {
 // Output JSON schema (Zod)
 // -----------------------------------------------------------------------------
 
+// Single source of truth for the kind vocabulary: STEP_KINDS drives BOTH the
+// AVAILABLE STEP KINDS block injected into the prompt (renderStepVocabulary) AND
+// this Zod validation tuple — so the prompt and the validator can never drift.
 const VALID_STEP_KINDS = STEP_KINDS.map((s) => s.kind) as [StepKind, ...StepKind[]];
 
 // Args schema is shape-only — we trust the planner to emit the right fields
@@ -467,665 +513,13 @@ const PlanResultSchema = z.object({
 // Prompt construction
 // -----------------------------------------------------------------------------
 
-const OUTPUT_FORMAT_BLOCK = `
-OUTPUT FORMAT — RETURN STRICT JSON. NO MARKDOWN. NO PROSE OUTSIDE THE JSON.
-
-{
-  "rationale": "Short explanation of what the latest email is asking for and why these steps follow.",
-  "steps": [
-    { "kind": "<step_kind from vocab above>", "rationale": "why this step", "args": { /* per the step's argsSchema, omit if the step has no args */ } }
-  ],
-  "stop_after_index": <integer — the LAST index in steps that fires before we pause; usually points at the last outbound email step>,
-  "escalate": false,
-  "escalation_question": null
-}
-
-Examples of step objects with args (shape per AVAILABLE STEP KINDS argsSchema):
-  { "kind": "va02", "rationale": "branch asked to bump M-A to 257", "args": { "materials": [{ "code": "M-A", "op": "inc", "qty": 257 }] } }
-  { "kind": "zload2", "rationale": "decrease M-B to 80 on LS 12345", "args": { "revisions": [{ "lsNumber": "12345", "material": "M-B", "qty": 80 }] } }
-  { "kind": "email_to_plant", "rationale": "branch shared truck details", "args": { "vehicles": [{ "vehicleNumber": "MH12AB1234", "driverMobile": "9999999999", "containerNumber": "" }] } }
-  { "kind": "process_tonnage_reply", "rationale": "branch shared 35 t", "args": { "tonnage": { "value": 35, "unit": "t" } } }
-  { "kind": "zso_visibility", "rationale": "branch confirmed 2nd release" }  // no args
-
-For the three question-asking step kinds — email_clarify_branch, email_clarify_plant, email_supervisor_question — the step object MUST also include:
-{ "kind": "email_clarify_branch", "rationale": "...", "question": "<exact text to send>" }
-{ "kind": "email_supervisor_question", "rationale": "...", "question": "<situation>", "options": ["option A", "option B", ...] }
-Omit "question" / "options" for any other step kind.
-
-RULES:
-0. **PO TONNAGE GATE (check this FIRST, before any other rule).**
-   Vehicle tonnage is a per-PO fact that controls bundle/truck packing for every SO of the PO. The CURRENT SO STATE block above tells you whether it's known. While "PO vehicle tonnage" is NOT SHARED YET:
-     - DO NOT emit any of: email_confirm_bundle_details, zload1, email_to_branch_for_vehicle, email_to_plant. Bundling is impossible without a truck capacity.
-     - If the state line says "tonnage_inquiry sent, awaiting branch reply" → return steps=[] with rationale "waiting on tonnage_inquiry reply before bundling; resume on next inbound". The branch will reply on the tonnage_inquiry thread; that reply will trigger process_tonnage_reply and unblock the flow automatically.
-     - If the state line says "no tonnage_inquiry on file" → emit a single email_clarify_branch step asking for the vehicle tonnage. STOP. Example question: "Could you share the vehicle/truck tonnage (capacity) for this dispatch? We need it to plan the bundle/truck split."
-     - If the latest inbound IS itself a reply on a tonnage_inquiry thread and contains tonnage, emit process_tonnage_reply (per rule 14) — that's the unblock.
-     - You MAY still emit non-bundle, non-truck steps that don't depend on tonnage (e.g. process_plant_invoice on a separate flow, email_order_status for a status question).
-1. Plan up to and including the NEXT outbound email. STOP at that email. The next inbound email will trigger a fresh plan call.
-   A generated plan MUST end with an outbound email step (an \`email_*\` kind). It must NEVER end on a SAP / engine-fetch step
-   (zso_visibility, lone_zmatana, va02, zload1, zload2, zloading_close). If a fetch step is needed, include its consequent email
-   in the SAME plan so the plan ends on the email — e.g. \`[lone_zmatana, email_confirm_product_details]\` (preserve flow) or
-   \`[va02, lone_zmatana, email_2nd_release]\` (substitution flow). The engine fires the SAP step(s), waits for each callback, then
-   advances to the email and pauses for the reply — do NOT split the fetch into its own step-less plan and rely on a re-plan.
-   (ONLY exception: \`bundle_capacity_assessment\` and \`stock_precheck\` choose the next step from their own result and so may end
-   a plan; the engine bridges exactly one re-plan for those.)
-2. Pick step kinds ONLY from the AVAILABLE STEP KINDS list. Out-of-vocab values are rejected.
-3. EVERY step that has an argsSchema in AVAILABLE STEP KINDS MUST include an \`args\` object matching that schema. The args you emit are passed VERBATIM to the executor — no downstream LLM re-extracts them from the email body. You have the full email thread above; read it and fill the args in. Use the SAME material codes / LS numbers / vehicle numbers the email thread uses (do not invent or normalise). If a step's argsSchema is null/none, omit \`args\` entirely.
-   For SAP-mutating steps (va02, zload2, zloading_close, stock_precheck) the args drive REAL transactions. If you would have to guess to fill them in, do NOT emit the step — emit email_clarify_branch / email_clarify_plant instead (see rule 15).
-4. If you are unsure what the email means, or the right action requires authority you don't have, set escalate=true and put the question in escalation_question. Leave steps as [].
-5. Re-read the audit trail. The trail lists every step that has already completed on this SO (step_completed events). DO NOT re-emit a step the trail shows as completed unless the latest inbound is explicitly asking for a re-do. The engine no longer suppresses duplicates for you — YOU are the suppression. If the latest inbound looks like one you have already handled (e.g. a dispatch_confirmation was already sent this round and the branch's reply is "ok, confirmed"), either (i) continue forward to the next stage, (ii) emit nothing and STOP (steps=[], stop_after_index=-1), or (iii) emit email_clarify_* if you can't tell why we're being re-triggered.
-   Example: if ZLOAD1 already fired (step_completed zload1 in audit) AND plant_ls has been sent, modifying qty post-plant_ls uses zload2 (per Rule 6e/Rule 11). If ZLOAD1 has fired but plant_ls has NOT been sent, modifying qty wipes the LSs first via zloading_close (args.all=true) and re-fires zload1 fresh — NEVER zload2 (per Rule 6b / Rule 9c / Rule 10b path b).
-
-THE STANDARD DISPATCH SEQUENCE (memorise this — every order goes through it):
-
-  STAGE A — Product confirmation
-    inbound: NEW ORDER  → (cron-driven) zso_visibility → email_confirm_product_details auto-sent
-    inbound: branch replies on ls_dispatch → emit email_confirm_bundle_details. STOP.
-  STAGE B — Bundle confirmation
-    inbound: branch confirms dispatch_confirmation → emit zload1, then email_to_branch_for_vehicle. STOP at vehicle email.
-  STAGE C — Vehicle + plant
-    inbound: branch sends vehicle details → emit email_to_plant. STOP.
-  STAGE D — Plant invoice
-    inbound: plant replies with invoice PDF → emit process_plant_invoice. STOP.
-    The downstream VT01N is operator-driven; await_vt01n is only emitted if you want to mark the wait explicitly.
-
-CRITICAL: The branch MUST confirm the bundle plan before ZLOAD1 fires. Even when the branch's ls_dispatch reply says "release everything, proceed" — that confirms PRODUCT details. We still need to send email_confirm_bundle_details (dispatch_confirmation) so the branch can confirm the BUNDLE / truck split. Do NOT skip directly from ls_dispatch reply to zload1. The two-confirmation pattern (product, then bundle) is a hard rule of the process — see ManagerV2.1, section 1E.
-
-MODIFICATIONS (deviations from the standard sequence):
-
-A modification flow happens across MANY plans, one per inbound email. Each
-of the segments below is a SEPARATE plan triggered by a SEPARATE inbound.
-
-CRITICAL — WHO IS ASKING FOR THE CHANGE:
-The "SENDER OF LATEST EMAIL" field at the top of this prompt tells you who
-sent the reply (branch / plant / production). The TRIGGER email type tells
-you which thread the reply landed on, not who sent it. A reply on a
-plant_ls email may come FROM the branch (asking to modify the LS) OR
-FROM the plant (responding with invoice / shortage). Read SENDER, not
-trigger email type, to decide whose intent this is.
-
-  - SENDER=branch + reply asks to modify quantities/lines → BRANCH-side
-    modification. Branch IS the customer authorizing changes. Fire SAP
-    transactions directly (zload2 / zloading_close / va02). Do NOT emit
-    email_to_branch_notifying_plant_change — that's only when the PLANT
-    is proposing changes that the branch needs to approve.
-  - SENDER=plant + reply asks to modify quantities/lines → PLANT-side
-    proposal. Emit email_to_branch_notifying_plant_change first (branch
-    must approve before we touch SAP).
-  - SENDER=branch + reply is a confirmation/acknowledgment on a 2nd_release
-    email ("yes", "done", "released", "ok"). This is NOT a modification —
-    it's the branch confirming they performed the requested second release
-    in SAP. Apply rule 8 (emit zso_visibility), NOT zload2 /
-    email_modified_ls_to_plant. The presence of an existing LSI does not
-    change this: rule 8 wins because the trigger email is 2nd_release.
-    **EXCEPTION — surgical / preserve flow (Rule 6e).** If loading slips
-    exist (bundles frozen: yes) AND a \`step_completed bundle_capacity_assessment\`
-    exists after the latest inbound, this 2nd_release ack belongs to Rule 6e,
-    NOT Rule 8. Do NOT emit zso_visibility — its callback fans out an unwanted
-    ls_dispatch and re-runs full visibility, which the bundle-freeze flow
-    deliberately replaces with lone_zmatana. Route by Rule 6e Phase instead
-    (typically Phase 2.5 → lone_zmatana, or Phase 2.75 → email_confirm_product_details
-    once lone_zmatana is done). Rule 8 wins ONLY in the normal pre-LS cycle.
-
-  6. INBOUND: branch MODIFY-INCREASE on ls_dispatch (pre-LS, no LSs yet).
-     EMIT: stock_precheck → va02 → email_2nd_release. STOP.
-     No loading slips exist yet → stock_precheck.qty = the FULL new target
-     quantity (e.g. 200 → 220 ⇒ check 220), since nothing is reserved yet.
-     va02.qty is also the full new total here, so the two match in this case.
-
-  6b. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL — LOADING SLIPS
-      EXIST (CURRENT SO STATE shows \`loading slips exist (bundles frozen): yes\`,
-      i.e. ZLOAD1 has run) but plant_ls NOT yet sent. THE BRANCH CHOOSES how to
-      handle this — we do NOT decide for them. Two-step rule:
-
-      6b-FORK — NO \`email_sent branch_preserve_choice\` (or \`branch_clarify\`
-        asking the preserve question) exists AFTER the latest \`email_received\`.
-        EMIT a single email_clarify_branch with question =
-          "The loading slips for this order have already been created. To apply
-           your change, should we PRESERVE the existing loading slips (we'll add
-           the extra quantity onto them, creating an extra vehicle only if
-           needed), or DELETE and RECREATE them from scratch? Reply 'preserve'
-           or 'recreate'." STOP. Wait for the branch's reply.
-
-      6b-ROUTE — the branch has REPLIED to the preserve question (a new
-        \`email_received\` after that email_clarify_branch). Read their reply:
-        (a) "recreate" / "delete" / "fresh" / "redo" → PATH [A] (Rule 6b-A).
-        (b) "preserve" / "keep" / "add on" → PATH [B] = Rule 6e (the surgical
-            flow). Treat the SO exactly as Rule 6e and proceed from its Phase 1.
-        (c) ambiguous → email_clarify_branch re-asking the same question.
-
-  6b-A. PATH [A] — DON'T PRESERVE (delete & recreate). The branch chose to wipe.
-      Bundles are re-composed by wiping every existing LS first so the bundler
-      can re-pack optimally for the new quantities.
-      EMIT: zloading_close (args.all=true) → stock_precheck → va02 →
-      email_2nd_release. STOP.
-      Do NOT emit zload2 in this path — recreate NEVER uses zload2.
-      LOADING SLIPS EXIST here (bundles frozen: yes), so stock_precheck.qty =
-      the DELTA being added, NOT the new total (e.g. 200 → 220 ⇒ check 20). The
-      original quantity is still reserved by the existing loading slips at the
-      moment the precheck runs — the precheck is sequenced BEFORE the wipe takes
-      effect — so only the added delta needs fresh stock. va02.qty stays the
-      absolute new total (220), so the two numbers differ.
-      Downstream: after the branch acks 2nd_release, Rule 8 fires zso_visibility,
-      the visibility callback auto-sends a round-2 ls_dispatch, the branch
-      accepts the new material list (Rule 9 case a → email_confirm_bundle_details
-      which calls the bundler to wipe + recreate Bundle rows), the branch
-      accepts the new bundle plan (Rule 10b path a → zload1 fresh →
-      email_to_branch_for_vehicle).
-
-      THREE-WAY STOCK BRANCH (read \`step_completed stock_precheck — availability:\`
-      from the trail; each material is \`fully\`/\`partial\`/\`none\` at the SO's
-      own plant; cross-plant substitution, when it fully covers a line, already
-      resolved it before this point and that line counts as available):
-        A1 — every increased material is \`fully\` available (or substituted):
-             proceed with va02 → email_2nd_release as above.
-        A2 — a material is \`partial\` (0 < avail < requested) and no substitute
-             covers it: the engine has already emailed the branch a shortage
-             inquiry and paused. On the branch's reply — if they give a REVISED
-             (smaller) qty → re-run from stock_precheck/va02 with the new qty;
-             if they say "drop"/"skip" → treat like A3.
-        A3 — a material is \`none\` (avail == 0) and no substitute: the engine
-             emailed the branch. On their reply — if they REVISE qty → re-run;
-             if "proceed with existing"/"no change" → emit NO further SAP txns
-             for that material; continue to vehicle details.
-
-  6e. INBOUND: branch MODIFY-INCREASE / MODIFY-ADD-MATERIAL where LOADING SLIPS
-      EXIST and the surgical (preserve) flow applies. This fires in TWO cases:
-        (i)  plant_ls has already been sent (CURRENT SO STATE shows
-             \`plant_ls email sent: yes\`), OR
-        (ii) loading slips exist but plant_ls NOT sent AND the branch chose
-             "preserve" at the Rule 6b fork.
-      In BOTH cases \`loading slips exist (bundles frozen): yes\`.
-      Bundles are FROZEN: loading slips cannot migrate between bundles.
-
-      DIFFERENCES between (i) and (ii), and they are the ONLY differences:
-        - OVERFLOW RESOLUTION. Case (i): overflow → branch raises a new SO
-          (email_branch_overflow_request with NO resolution arg / default;
-          Phase 3 ends with email_branch_request_new_so). Case (ii): overflow →
-          we add an EXTRA VEHICLE (new bundle) on the same PO — emit
-          email_branch_overflow_request with args.resolution="new_bundle", and
-          in Phase 3 emit the overflow leg as zload1 with
-          args.createNewBundle=true (NOT a new-SO request).
-        - TERMINAL PLANT EMAIL. Case (i): plant already intimated → Phase 3's
-          email_modified_ls_to_plant forwards only the touched LSs. Case (ii):
-          plant never intimated → the SAME email_modified_ls_to_plant step is
-          emitted, and the engine automatically forwards the FULL LS set (first
-          send). Emit email_modified_ls_to_plant in both cases; the engine
-          decides full-vs-touched.
-      To tell the cases apart, read \`plant_ls email sent\` from SO state.
-
-      **CRITICAL — MULTI-PHASE RULE. Check the audit trail before
-      emitting.** The state of the modify cycle is read off the audit
-      trail by looking for these markers, scanning from the LATEST
-      \`email_received\` (the inbound that triggered this plan call)
-      forward.
-
-      Definitions used below:
-        placedAllocations = the union of every \`same_bundle\` and
-          \`other_bundle\` leg across every verdict.
-        placedKgTotal = sum of allocations.kg across all materials.
-        overflowKgTotal = sum of verdicts.overflowKg across all materials.
-
-      - PHASE 1 — NO \`step_completed bundle_capacity_assessment\` exists
-        after the latest \`email_received\`.
-        Emit ONLY bundle_capacity_assessment with one items[] entry per
-        material being increased / added. deltaKg = additional kilograms
-        this material is gaining (read it from the email — branch usually
-        states units; convert via the material's Material.orderWeightKg if
-        shown, otherwise read the email's weight figure directly).
-        For CASE (ii) (plant_ls NOT sent, branch chose preserve), ALSO set
-        args.overflowMode="new_bundle" so the assessment packs any residual
-        into new bundle(s) (verdict \`allocated_with_new_bundle\`) instead of
-        flagging it as overflow-to-new-SO. For CASE (i), omit overflowMode
-        (default new_so). STOP. The engine emits step_completed with verdicts
-        and re-enters this planner.
-
-      - PHASE 1.5 — OVERFLOW GATE. Applies to BOTH cases when the assessment
-        shows kg that didn't fit existing bundles, AND NO \`email_sent
-        overflow_request\` exists AFTER that assessment. The branch must opt in
-        BEFORE we touch SAP — this is a WAIT point.
-        CASE (i): trigger on overflowKgTotal > 0 (partial_overflow /
-          needs_new_so verdicts). Emit email_branch_overflow_request with
-          args.items = [{material, placedKg, overflowKg}, ...]; do NOT set
-          resolution (default new_so). The overflow becomes a new SO.
-        CASE (ii): trigger on any verdict being \`allocated_with_new_bundle\`
-          (the residual went to a new vehicle). Emit
-          email_branch_overflow_request with args.resolution="new_bundle" and
-          args.items = [{material, placedKg, overflowKg}, ...] where placedKg =
-          sum of same_bundle+other_bundle allocation kg and overflowKg = sum of
-          the new_bundle allocation kg for that material (the kg headed to the
-          extra vehicle). This INFORMS the branch an extra vehicle is needed.
-        STOP. Wait for the branch to reply (Phase 1.6 handles the reply: a
-        plain confirmation → Phase 2; a revised qty → re-emit Phase 1; a
-        rejection → for case (i) email_branch_request_new_so, for case (ii)
-        drop the overflow / re-assess per the reply).
-
-      - PHASE 1.6 — \`email_sent overflow_request\` exists AND a new
-        \`email_received\` AFTER it (the branch's reply to the overflow
-        prompt). Decide based on the reply body:
-          (a) PLAIN CONFIRMATION ("confirm", "proceed", "yes", "go
-              ahead") → branch opts in to the partial dispatch. Fall
-              through to PHASE 2 (treat the existing verdict as
-              authoritative; do NOT re-emit bundle_capacity_assessment).
-          (b) REVISED QUANTITY (branch asks for a different qty) → this
-              is a NEW modify request. The new email_received resets
-              the Phase 1 gate, so re-emit bundle_capacity_assessment
-              with the new deltaKg per material.
-          (c) REJECTION / "skip this material" / "drop it" → emit
-              email_branch_request_new_so with args.items =
-              [{material, deltaKg: overflowKg}, ...] to formally close
-              the overflow ask, and STOP. Do NOT proceed with VA02 for
-              the partial.
-          (d) UNCLEAR / AMBIGUOUS → email_clarify_branch.
-
-      - PHASE 2 — EITHER no overflow gate was needed (case i: overflowKgTotal
-        == 0; case ii: no \`allocated_with_new_bundle\` verdict) OR Phase 1.6
-        (a) "PLAIN CONFIRMATION" applies (branch acked the partial dispatch /
-        the extra vehicle). AND \`step_completed bundle_capacity_assessment\`
-        exists with verdicts, AND NO \`step_completed va02\` exists
-        AFTER that assessment.
-        Read the verdicts off the latest assessment line. Each verdict has
-        the form
-          \`material=fully_allocated|partial_overflow|needs_new_so|allocated_with_new_bundle(assessedDeltaKg=N; alloc=[same_bundle:Akg + other_bundle:Bkg + new_bundle:Ckg + ...]; overflowKg=O)\`
-        Define shipKg(material) = sum of allocation kg that ships from THIS SO:
-          - CASE (i): same_bundle + other_bundle kg only (overflow → new SO).
-          - CASE (ii): same_bundle + other_bundle + new_bundle kg (the new
-            bundle is on THIS PO/SO, so its kg ships from this SO too).
-        - If total shipKg > 0, emit IN ORDER:
-            (1) stock_precheck for each material with shipKg > 0
-                (qty = shipKg converted to units using Material.orderWeightKg).
-            (2) va02 with materials = those materials. Target qty for each =
-                current SO qty + (shipKg(material) converted to units).
-                CASE (i): do NOT add overflowKg — it goes to a new SO.
-                CASE (ii): the new_bundle kg IS included (it ships from this
-                SO via the extra vehicle).
-            (3) email_2nd_release  (branch acks the increase).
-          STOP. Wait for the branch to confirm 2nd_release.
-        - If placedKgTotal == 0 for ALL materials (every verdict is
-          needs_new_so), Phase 1.5 has already routed: the overflow
-          gate's email IS the new-SO request in that degenerate case,
-          and Phase 1.6 (c) closes the loop with email_branch_request_new_so
-          if the branch confirms. Phase 2 should not fire when there is
-          nothing to place.
-
-      - PHASE 2.5 — \`step_completed bundle_capacity_assessment\`,
-        \`step_completed va02\`, AND \`email_sent 2nd_release\` all exist
-        AFTER the latest inbound modification email_received. The branch
-        just replied on the 2nd_release email confirming. (Rule 8 routes
-        a post-plant_ls 2nd_release ack to here.) DO NOT emit
-        zso_visibility — its visibility-data callback would fan out into
-        an unwanted ls_dispatch email. Emit BOTH steps in ONE plan, ending
-        on the outbound email (NEVER emit lone_zmatana alone — a plan must
-        not end on a SAP fetch step; see rule 1):
-            (1) lone_zmatana with materials = [{ code, delta }, ...] for the
-                placed-portion material list from the bundle_capacity_assessment
-                verdicts (the same list VA02 just bumped). delta = the ADDED
-                units per material (shipKg converted to units via
-                Material.orderWeightKg — the same delta you used for the va02
-                target minus the prior SO qty). Loading slips already exist
-                here, so ZMatana only needs stock for the delta, NOT the new
-                total.
-            (2) email_confirm_product_details
-        STOP at the email. The engine fires lone_zmatana, its zmatana-data
-        callback writes batch + availableStock onto the Material rows and then
-        ADVANCES to email_confirm_product_details (which reads those freshly
-        written rows) and pauses for the branch reply — so there is NO separate
-        re-plan after the fetch. Set stop_after_index to the email's index (1).
-
-      - PHASE 2.75 (fallback) — \`step_completed lone_zmatana\` exists AFTER the
-        latest inbound modification email_received, AND NO
-        \`email_sent ls_dispatch\` exists at the current PO dispatchRound.
-        This only arises if lone_zmatana was emitted ALONE (it should have been
-        paired with the email in Phase 2.5). The branch still needs the re-confirm
-        of the material list (now post-VA02 + post-zmatana batches). Emit:
-            email_confirm_product_details
-        STOP. The engine handler will detect that no ls_dispatch is on
-        file for this round and actively send one
-        (assembleAndSendCombinedEmail). The branch reads the updated
-        material list and replies confirming.
-
-      - PHASE 2.875 — \`email_sent ls_dispatch\` exists at the current
-        dispatchRound AFTER the lone_zmatana, AND the branch has replied
-        on the ls_dispatch with a plain confirmation (\"yes\" / \"ok\" /
-        \"confirm\"), AND NO \`email_sent dispatch_confirmation\` exists
-        at the current dispatchRound. Branch acked the material list;
-        time to send them the bundle plan. Emit:
-            email_confirm_bundle_details
-        STOP. The engine handler detects the assessment marker + any existing
-        LoadingSlip and routes to the upcoming-changes renderer (no bundler
-        call). The branch reads the bundle plan with the upcoming ZLOAD2 /
-        ZLOAD1-append annotations (and the extra vehicle, for case ii) and
-        replies confirming.
-        (If the branch reply on the round-N ls_dispatch is NOT a plain
-        confirmation — e.g. they ask for further changes — this is
-        Rule 9 territory: route per Rule 9's branches.)
-
-      - PHASE 3 — \`email_sent dispatch_confirmation\` exists at the
-        current dispatchRound AFTER the bundle_capacity_assessment, AND
-        the branch has replied on the dispatch_confirmation with a plain
-        confirmation. All prior milestones are visible:
-        bundle_capacity_assessment ✓, va02 ✓, email_sent 2nd_release,
-        lone_zmatana ✓, email_sent ls_dispatch (round=R), email_sent
-        dispatch_confirmation (round=R), email_received from branch on
-        the dispatch_confirmation.
-        Emit the SLICING plan IN ORDER:
-          (1) For each \`same_bundle\` allocation across all materials:
-              EMIT zload2 with revisions=[{lsNumber, material, batch,
-              qty}] where qty = the LS's NEW TOTAL dispatch quantity for
-              that material (existing LSI qty for this material on this
-              LS + the allocation-kg portion converted to units; NOT a
-              delta). batch comes from the Material row written by
-              lone_zmatana. Group multiple revisions on the same LS into
-              one zload2 call when possible.
-          (2) For each \`other_bundle\` allocation across all materials:
-              EMIT zload1 in APPEND mode with
-              args.appendToBundleId = the allocation's bundleId and
-              args.materials = [{code: material, batch, qty: allocation-kg
-              in units}]. ONE zload1 per allocation (one new LS per leg).
-              batch comes from the Material row written by lone_zmatana.
-              The zload1 step MUST include args; without them the engine
-              treats it as initial-mode which would re-bundle and fail
-              with BundlesFrozenError.
-          (2b) CASE (ii) ONLY — for each \`new_bundle\` allocation across all
-              materials (verdict \`allocated_with_new_bundle\`): EMIT zload1
-              with args.createNewBundle=true (NO appendToBundleId) and
-              args.materials = [{code: material, batch, qty: allocation-kg in
-              units}]. ONE zload1 per new_bundle leg. The engine creates a
-              fresh bundle (extra vehicle), links the material, and appends the
-              LS. batch comes from the lone_zmatana Material row.
-          (3) PLANT INTIMATION — differs by case:
-              CASE (i) (plant_ls ALREADY sent): EMIT email_modified_ls_to_plant.
-                The engine forwards ONLY the touched LSs (the plant already has
-                the rest).
-              CASE (ii) (plant_ls NOT yet sent): the plant has NEVER seen these
-                loading slips, and vehicle details must be gathered from the
-                branch BEFORE the first plant intimation. So do NOT send the
-                plant email yet — instead EMIT email_to_branch_for_vehicle to
-                collect vehicle details for the (now-final) bundle plan. STOP.
-                When the branch replies with vehicle details, that reply routes
-                to email_to_plant, which forwards the FULL LS set to the plant
-                (first intimation). Order for case (ii): zload2/zload1 legs →
-                email_to_branch_for_vehicle → (on reply) email_to_plant (full set).
-          (4) CASE (i) ONLY — if overflowKgTotal > 0:
-              EMIT email_branch_request_new_so with args.items =
-              [{material, deltaKg: overflowKg}, ...] for ONLY the
-              overflow legs. Items that were fully allocated do not
-              appear in this list. STOP after this email.
-              CASE (ii) does NOT emit this — its overflow already became a new
-              bundle in step (2b), so there is nothing to send to a new SO.
-
-      Multiple materials in one reply share the same Phase 2 / Phase 3
-      plans — collect every material's allocations into one va02 call,
-      one or more zload2 calls (grouped by LS), one or more zload1-append
-      calls (one per other_bundle leg), and ONE consolidated
-      email_modified_ls_to_plant.
-
-      Do NOT skip bundle_capacity_assessment when loading slips exist — Rule 6
-      applies only BEFORE bundles/LSs exist; Rule 6b's recreate (Path [A]) only
-      when the branch explicitly chose "recreate". Otherwise (plant_ls sent, OR
-      branch chose preserve) this surgical Rule 6e flow applies.
-      Do NOT re-fire a SECOND va02 in Phase 3 to "correct" the SO line
-      down. The SO line ceiling set in Phase 2 already matches the placed
-      qty; for case (i) the overflow lives on a separate (new) SO the branch
-      raises; for case (ii) the overflow rides a new bundle on THIS SO/PO, so
-      the SO line ceiling must include the new-bundle kg too (Phase 2's va02
-      target for case ii = current qty + placed kg + new_bundle kg, since all
-      of it ships from this SO).
-      Do NOT emit zso_visibility in this entire flow — its visibility-data
-      callback sends an unwanted round-N ls_dispatch. lone_zmatana
-      replaces it (Phase 2.5); Phase 2.75 emits ls_dispatch itself via
-      email_confirm_product_details so the branch sees the post-VA02
-      material list at the proper moment, without an automatic fan-out.
-
-  6c. RE-PLAN AFTER CROSS-PLANT SUBSTITUTION. If the audit trail shows a
-      step_completed for stock_precheck with a \`substitutions\` payload like
-      \`substitutions: [{ originalMaterial, substituteMaterial, substitutePlant, requested, ... }, ...]\`,
-      the stock_precheck engine swapped one or more short materials with
-      cross-plant equivalents. This means VA02 has NOT yet fired — the
-      previous plan was terminated after stock_precheck so a fresh plan
-      could emit VA02 with the correct substitute material codes. You must:
-        - EMIT va02 with materials = the SUBSTITUTE codes (NOT the originals).
-          For each substitutions row, the va02 step's \`args.materials\` entry
-          uses \`code: substituteMaterial\` and the same \`qty\` as \`requested\`
-          (the substitute fully replaces the original line).
-        - EMIT lone_zmatana with materials = the SAME substitute codes (one
-          entry per substitution). This fetches batch + availableStock for
-          the substitute Material rows so downstream steps can ship them.
-        - EMIT email_2nd_release to the branch (existing semantics — the
-          branch confirms the swap). Its materials args carry the substitute
-          codes and qty (op="inc"), so the branch sees what they're confirming.
-      EMIT order: va02 → lone_zmatana → email_2nd_release. STOP.
-      Do NOT re-emit stock_precheck — it has already run and the
-      substitutions are recorded in the audit trail; re-emitting it would
-      re-do the lookup needlessly.
-
-  7. INBOUND: branch MODIFY-DECREASE or MODIFY-DELETE on ls_dispatch (pre-LS).
-     EMIT: email_confirm_bundle_details. STOP.
-
-  8. INBOUND: BRANCH confirms the 2nd release ("yes", "done", "released", etc.)
-     on a 2nd_release email. (SENDER=branch. Audit trail shows va02 ✓ +
-     email_2nd_release already sent.) NOTE: the 2nd_release email is sent
-     to the BRANCH — they perform the second release — so the reply comes
-     from sender=branch. This is the only correct path for a 2nd_release reply.
-
-     Branch on what KIND of modify cycle this 2nd_release belongs to. Check in
-     THIS ORDER — the surgical/preserve checks come FIRST and take precedence:
-
-     (a0) SURGICAL / PRESERVE — lone_zmatana ALREADY DONE. The audit trail
-         shows \`step_completed lone_zmatana\` AND loading slips exist
-         (bundles frozen: yes), and NO \`email_sent ls_dispatch\` at the
-         current dispatchRound after it. The 2nd_release leg of Rule 6e is
-         finished; the fetch is done. DO NOT re-fire anything from Rule 8 —
-         in particular DO NOT emit zso_visibility (it fans out an unwanted
-         ls_dispatch + redoes full visibility, which the bundle-freeze flow
-         replaced with lone_zmatana). Defer to Rule 6e Phase 2.75 and emit
-         email_confirm_product_details. STOP.
-
-     (a) SURGICAL / PRESERVE — lone_zmatana NOT yet run. The audit trail shows
-         loading slips exist (bundles frozen: yes) AND a
-         \`step_completed bundle_capacity_assessment\` ANYWHERE after the start
-         of this modify cycle (it may be in an earlier segment for Case (ii),
-         where plant_ls was never sent). EMIT lone_zmatana with args.materials =
-         [{ code, delta }, ...] for every material the bundle_capacity_assessment
-         placed allocations on (see Rule 6e Phase 2.5). STOP. Do NOT emit
-         zso_visibility — its callback would send an unwanted ls_dispatch.
-
-     (b) NORMAL MODIFY CYCLE — loading slips DO NOT exist yet (bundles frozen:
-         no), OR there is no bundle_capacity_assessment anywhere in this cycle
-         (the plain pre-plant_ls modify, or the cross-plant substitution Rule 6c
-         flow). EMIT zso_visibility. STOP. The /visibility-data callback
-         auto-sends round-2 ls_dispatch.
-         CRITICAL: if loading slips exist (bundles frozen: yes), you are NOT in
-         this branch — never emit zso_visibility for a frozen-bundle SO.
-
-     For BOTH branches:
-     Do NOT chain to email_confirm_bundle_details here.
-     Do NOT emit zload2 / email_modified_ls_to_plant — the branch
-     confirmation is a green-light for the next step in the cycle, not a
-     request to modify loading slips (rule 11 covers branch-requested LS
-     modifications on a plant_ls thread, which is a different scenario).
-
-  9. INBOUND: branch reply on a round-2-or-later ls_dispatch (modification
-     cycle in progress — material list re-confirmation stage).
-     TRIGGER: the planner is invoked because the branch replied on an
-     ls_dispatch email AND the audit trail shows AT LEAST one prior va02 ✓
-     AND AT LEAST one prior 2nd_release email_sent AND at least two
-     email_sent ls_dispatch events.
-
-     **The order of approval is STRICT: materials first (this rule),
-     bundles second (Rule 10), ZLOAD1 fresh third (Rule 10b path b). The
-     branch must accept the material list before they see the bundle plan;
-     they must accept the bundle plan before any loading slips are touched.
-     Pre-plant_ls modifications NEVER use zload2 — they use a full
-     wipe-and-recreate cycle so the bundler can re-pack optimally.**
-
-     Decide by reading the branch's reply body:
-
-     (a) PLAIN CONFIRMATION ("ok", "yes", "confirmed", "proceed",
-         "release as available", "looks good") → the branch has accepted
-         the updated material list. EMIT email_confirm_bundle_details to
-         move on to bundle re-approval. STOP.
-         (The engine renders this differently in the post-plant_ls
-         partial-allocation cycle — Rule 6e Phase 2.875 — by reading
-         the existing Bundle/LS rows and annotating the upcoming changes.
-         The planner just emits the same step kind; the engine routes
-         based on audit markers.)
-
-     (b) REPLY CARRIES VEHICLE DETAILS (truck no, driver, container) but
-         is NOT a further modification → treat as PLAIN CONFIRMATION on
-         the material list. IGNORE the vehicle details (they reference
-         the PRE-modification bundle plan, which the branch has not yet
-         re-approved). EMIT email_confirm_bundle_details. The planner
-         will re-ask for vehicle details later (Rule 10c) against the
-         finalised post-modification plan.
-
-     (c) FURTHER MODIFICATION REQUEST (another qty change, add or
-         remove a material) → DO NOT advance to bundle confirmation.
-         The material list itself is not yet accepted. RESTART the
-         modify cycle by re-applying Rule 6 / 6b. EMIT:
-           - For an INCREASE: zloading_close (args.all=true) →
-             stock_precheck → va02 → email_2nd_release.
-           - For a DECREASE / DELETE: zloading_close (args.all=true) →
-             email_2nd_release (the materials args summarise the
-             decrease/delete so the branch can still do 2nd release on
-             the unchanged lines; no va02 because decreases don't
-             change the SO).
-         The cycle will eventually return to this Rule 9 on the next
-         round-N ls_dispatch, and the branch can keep iterating on the
-         material list until they accept it.
-         Do NOT emit zload2 here — pre-plant_ls modifications NEVER
-         use zload2. The wipe-all path lets the bundler re-pack
-         optimally for the new quantities.
-
-     (d) GENUINELY UNCLEAR / AMBIGUOUS reply → emit
-         email_clarify_branch with a short, specific question.
-
-     Tie-break heuristics for case (a) vs (c) vs (d):
-       - If the reply names a material code + a number (and that
-         number differs from the current SO qty) → case (c).
-       - If the reply names ONLY a truck / driver / container / LR
-         number → case (b).
-       - If the reply is a short affirmative phrase OR an affirmative
-         phrase plus vehicle details → case (a) or (b).
-       - When in genuine doubt between (a) and (c), prefer (d) —
-         clarify rather than guess. Wrong VA02 args are destructive.
-     Do NOT emit email_to_plant or email_modified_ls_to_plant here —
-     LSs in DB still reflect pre-modification quantities and would
-     ship stale to the plant. The pre-plant_ls re-bundle cycle
-     (zloading_close all → … → zload1 fresh) is what eventually
-     syncs them; the plant receives the final LSs via email_to_plant
-     only after Rule 10b path (a) fires zload1 fresh.
-
- 10. INBOUND: branch reply on a round-2-or-later dispatch_confirmation
-     (modification cycle in progress — bundle plan re-confirmation stage).
-     (Audit trail shows va02 ✓ + zso_visibility ✓ ≥ 2 + ls_dispatch ✓ ≥ 2 + dispatch_confirmation ✓ ≥ 2,
-     OR — post-plant_ls partial-allocation cycle — bundle_capacity_assessment ✓ + va02 ✓ +
-     email_sent 2nd_release + lone_zmatana ✓ + ls_dispatch ✓ + dispatch_confirmation ✓.)
-
-     **The branch has already accepted the new material list (Rule 9 case
-     a/b fired). Now they're reacting to the bundle / truck plan.**
-
-     **POST-PLANT_LS PARTIAL-ALLOCATION FORK.** If the audit trail also
-     shows \`step_completed bundle_capacity_assessment\` AFTER the latest
-     \`email_received\` for the original modify request AND any LS is
-     \`sent_to_plant\`, this is Rule 6e Phase 3 — emit the slicing plan
-     defined there (zload2 per same_bundle leg + zload1-append per
-     other_bundle leg + email_modified_ls_to_plant + email_branch_request_new_so
-     if overflow). Do NOT emit zload1 initial-mode here — that would
-     re-bundle and fail with BundlesFrozenError.
-
-     Otherwise (pre-plant_ls modify or non-assessment post-plant_ls), the
-     normal Rule 10 branches below apply:
-
-     Decide by reading the branch's reply body:
-
-     **PLAIN CONFIRMATION** on the bundle plan ("yes", "confirm",
-     "proceed", "go ahead") → EMIT zload1 → email_to_branch_for_vehicle.
-     STOP.
-       NOTE: pre-plant_ls modifications MUST have wiped the prior LSs
-       upstream (Rule 6b / Rule 9c emit zloading_close args.all=true at
-       the top of the modify cycle). By the time this rule runs there
-       are no LSIs on the SO, so zload1 fires in initial mode (no args)
-       and the engine fans out across the freshly re-bundled Bundles.
-       The bundler call inside the email_confirm_bundle_details step
-       (the one that just generated the bundle plan the branch confirmed)
-       has already wiped+recreated the DB Bundle rows.
-       If you find audit trail evidence that suggests LSIs still exist
-       at this point (a prior step_completed zload1 with no subsequent
-       zloading_close args.all=true between it and the current point),
-       this is a bug in an earlier plan — emit email_supervisor_question
-       describing the inconsistency rather than emitting zload2 (which
-       is forbidden pre-plant_ls).
-
-     **FURTHER MODIFICATION REQUEST** on the bundle plan (another qty
-     change or a request to redistribute) → DO NOT fire zload1. The
-     bundle plan is not yet accepted. RESTART the modify cycle from
-     Rule 6/6b (for an increase) or apply the decrease/delete branch
-     of Rule 9c. The cycle will return through Rule 9 (material list
-     re-confirm) then Rule 10 (bundle re-confirm) again. The branch
-     can keep iterating on either approval until they're satisfied.
-
-     **UNCLEAR / AMBIGUOUS** → email_clarify_branch.
-
-     **VEHICLE DETAILS in the reply** → treat as PLAIN CONFIRMATION on
-     the bundle plan: EMIT zload1 → email_to_branch_for_vehicle.
-     IGNORE the vehicle details supplied in this reply — they
-     reference the PRE-modification plan, which is no longer current.
-     Rule 10c below will collect fresh vehicle details after zload1
-     finishes against the new bundles.
-
- 10c. STALE-VEHICLE-DETAILS DETECTION (runs after Rule 10b).
-      After Rule 10b emits zload1 fresh, the email_to_branch_for_vehicle
-      step naturally collects fresh vehicle details — no separate
-      stale-detection is needed in the pre-plant_ls path. (This rule
-      remains relevant only for the post-plant_ls Rule 11 path, where
-      zload2 / zloading_close can leave stale vehicle_details on file.)
-      For post-plant_ls modifications:
-        - If the audit trail's MOST RECENT "email_sent vehicle_details"
-          event is OLDER than the most recent "step_completed va02"
-          (or step_completed zload2 / zloading_close), EMIT
-          email_to_branch_for_vehicle to collect fresh vehicle details
-          against the now-stable plan.
-        - If vehicle_details is NEWER, the details on file are valid —
-          do not re-ask.
-
- 11. INBOUND: branch MODIFY-DECREASE / MODIFY-DELETE / MODIFY-DEC-DEL reply on a plant_ls email.
-     (Audit trail: zload1 ✓ and plant_ls ✓ already happened. SENDER=branch.)
-     The BRANCH is requesting the change — they are the customer authority.
-     EMIT: zload2 (decrease/inc-dec) AND/OR zloading_close (delete) AND email_modified_ls_to_plant — ALL IN THE SAME PLAN (steps array MUST end with email_modified_ls_to_plant). Do NOT emit just zload2/zloading_close alone; the plant must always be notified of the change. STOP after the email step.
-     Do NOT emit email_to_branch_notifying_plant_change — that's for PLANT-proposed changes.
-     Do NOT emit plain email_to_plant here — it would send EVERY LS to the plant, including unmodified ones. Use email_modified_ls_to_plant which sends only the touched LSs.
-     No va02, no 2nd release here. Decreases / deletes revise the LS now; the
-     SO line is brought down (decrease) or removed (delete) automatically on the
-     NEXT va02 run — the engine records the pending change and flushes it then.
-     You still do NOT emit va02 for a decrease/delete.
-
-ANYTIME / OTHER:
- 12. For a "Seeking Order Update" inquiry: emit a single email_order_status step. STOP.
- 13. When the plant has sent an invoice PDF on a plant_ls reply, emit process_plant_invoice. STOP.
- 14. When the branch replies on a tonnage_inquiry thread with the vehicle tonnage (e.g. "35 t", "35000 kg", "vehicle is 40 tonnes"), emit a single process_tonnage_reply step. STOP. The executor writes po.weightage and the next inbound (or the cron's natural retry) resumes the normal dispatch flow.
-
-WHEN A REPLY IS UNCLEAR / INCOMPLETE — ASK A CLARIFYING QUESTION:
- 15. If the latest inbound is ambiguous, contradictory, or only partially answers what we asked, emit a single email_clarify_branch (or email_clarify_plant if the sender was the plant) step. STOP. Provide the exact question on the step as the "question" field. The reply will trigger a fresh plan.
-     - **Clarify-on-guess (hard rule).** If filling in the \`args\` for a SAP-mutating step (va02, zload2, zloading_close, stock_precheck) would require you to GUESS — material code not clearly stated, quantity ambiguous or missing, batch unclear, vehicle number partial, bundle assignment unclear — you MUST emit email_clarify_* instead. Confidence threshold is HIGH: only proceed if the reply explicitly names the material AND the new quantity (or material AND delete). Wrong args land in SAP unchecked, so when in doubt, ask.
-     - Example: we asked for vehicle tonnage AND truck number; the branch replied only with the truck number → emit email_clarify_branch with question="You shared the truck number. Could you also confirm the vehicle tonnage (in tonnes)?".
-     - Example: branch replied "modify the order" with no material code or quantity → emit email_clarify_branch asking for the specific material + new quantity.
-     - Example: branch replied "increase M-A" with no number → emit email_clarify_branch asking for the new total quantity.
-     - Keep the question SHORT (1–3 sentences). Quote back the part of their message you understood so they know you read it. Do not invent details. Do not ask more than one question per email unless they are tightly linked.
-     - Do NOT use clarification as a stalling move. If the reply is clearly actionable AND the args can be filled in unambiguously from the thread, ACT. Use clarification only when proceeding without the missing fact would be wrong or destructive.
-
-WHEN YOU ARE STUCK — ASK THE SUPERVISOR:
- 16. If you genuinely cannot decide what step to take next — for example the audit trail looks inconsistent, two rules above seem to conflict, or the email asks for something outside the standard process — emit a single email_supervisor_question step. STOP. On the step provide:
-     - "question": one or two sentences stating the situation in your own words. Include the SO number and what the inbound is asking for. Do NOT paste the full email — the supervisor sees the rendered thread already.
-     - "options": 2–4 short candidate next-actions you are weighing (each a short phrase like "Fire zload2 for material X" or "Send 2nd_release email to confirm with branch"). The supervisor will reply with which one to take, or with custom instructions.
-     - Do not use this as an escape hatch. Try to apply rules 1–15 first. The supervisor's reply will be picked up as a normal inbound and re-planned, so a vague "please advise" wastes time. Be specific.
-     - This step is for in-band confusion only. For PARSER / SYSTEM failures (planner errors, malformed inputs) leave steps=[] and set escalate=true with escalation_question instead.
-
-FORMATTING:
- 17. stop_after_index is 0-based. If steps has 3 entries and you want to pause after firing all 3, set stop_after_index=2.
- 18. If you have nothing to do (e.g. the email is "thanks"): set steps=[] and stop_after_index=-1.
-`;
-
-async function buildUserPrompt(args: {
+/**
+ * Render the full V3.0 planner prompt: load the ManagerV3.0.txt template and
+ * substitute its {{TOKEN}} placeholders — {{AVAILABLE_STEP_KINDS}} (built from
+ * STEP_KINDS) plus the four per-call DB sections. The returned string is sent
+ * verbatim as a single system message.
+ */
+export async function buildPlannerPrompt(args: {
   salesOrderId: string;
   triggerEmailId: string;
   sender: 'branch' | 'plant' | 'production';
@@ -1136,25 +530,19 @@ async function buildUserPrompt(args: {
     buildSoStateSnapshot(args.salesOrderId),
   ]);
 
-  const sections = [
-    `SENDER OF LATEST EMAIL: ${args.sender}`,
-    '',
-    soSnapshot ? renderSoState(soSnapshot) : '(SO snapshot unavailable)',
-    '',
-    'PRIOR ACTIONS ON THIS SO (chronological, oldest first):',
-    auditTrail,
-    '',
-    'EMAIL THREAD (chronological, oldest first):',
-    emailThread,
-    '',
-    renderStepVocabulary(),
-    '',
-    OUTPUT_FORMAT_BLOCK,
-    '',
-    'Now produce the JSON plan for the latest inbound email.',
-  ];
+  const soState = soSnapshot ? renderSoState(soSnapshot) : '(SO snapshot unavailable)';
 
-  return sections.join('\n');
+  // Use FUNCTION replacers (not string replacers) so a literal `$` in the
+  // rendered content can't trigger `$&` / `$1` special-pattern substitution.
+  // {{AVAILABLE_STEP_KINDS}} is built on the fly from the STEP_KINDS array (the
+  // single source that also drives Zod validation); the per-call DB sections
+  // fill the rest.
+  return loadPromptTemplate()
+    .replace('{{AVAILABLE_STEP_KINDS}}', () => renderStepVocabulary())
+    .replace('{{SENDER}}', () => args.sender)
+    .replace('{{SO_STATE}}', () => soState)
+    .replace('{{AUDIT_TRAIL}}', () => auditTrail)
+    .replace('{{EMAIL_THREAD}}', () => emailThread);
 }
 
 // -----------------------------------------------------------------------------
@@ -1178,8 +566,7 @@ async function buildUserPrompt(args: {
 async function dumpPromptToFile(
   salesOrderId: string,
   triggerEmailId: string,
-  systemPrompt: string,
-  userPrompt: string,
+  prompt: string,
 ): Promise<void> {
   if ((process.env.PLANNER_DUMP_PROMPTS ?? 'false').toLowerCase() !== 'true') return;
   try {
@@ -1192,9 +579,7 @@ async function dumpPromptToFile(
     const dir = path.join(process.cwd(), 'test_artifacts', 'planner-prompts');
     fs.mkdirSync(dir, { recursive: true });
     const filePath = path.join(dir, `${ts}__${soNumber}__${triggerEmailId}.txt`);
-    const content =
-      `=== SYSTEM ===\n${systemPrompt}\n\n=== USER ===\n${userPrompt}\n`;
-    fs.writeFileSync(filePath, content, 'utf8');
+    fs.writeFileSync(filePath, `${prompt}\n`, 'utf8');
   } catch (err) {
     console.warn(
       `[llm-planner] PLANNER_DUMP_PROMPTS write failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
@@ -1207,10 +592,9 @@ export async function planNextSteps(args: {
   triggerEmailId: string;
   sender: 'branch' | 'plant' | 'production';
 }): Promise<PlanResult> {
-  const systemPrompt = loadManagerPrompt();
-  const userPrompt = await buildUserPrompt(args);
+  const prompt = await buildPlannerPrompt(args);
 
-  await dumpPromptToFile(args.salesOrderId, args.triggerEmailId, systemPrompt, userPrompt);
+  await dumpPromptToFile(args.salesOrderId, args.triggerEmailId, prompt);
 
   // All LLM calls in the dashboard go through getLlmService(), which selects
   // the provider/model from env vars (LLM_PROVIDER / LLM_MODEL / *_API_KEY).
@@ -1237,9 +621,14 @@ export async function planNextSteps(args: {
   for (let attempt = 1; attempt <= PLANNER_LLM_ATTEMPTS; attempt++) {
     try {
       result = await llm.chat({
+        // V3.0 sends the ENTIRE rendered prompt as one system message. The user
+        // turn is a content-free trigger only — required because the Gemini
+        // provider maps `system` to systemInstruction and would otherwise be
+        // left with empty `contents` (see llm-service.ts). All prompt content
+        // lives in `system`.
         messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
+          { role: 'system', content: prompt },
+          { role: 'user', content: 'Produce the JSON plan for the latest inbound email now.' },
         ],
         requireJson: true,
         // Planner output is a structured JSON plan (rationale + steps[] with
