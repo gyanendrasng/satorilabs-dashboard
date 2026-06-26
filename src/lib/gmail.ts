@@ -448,6 +448,33 @@ export async function getMessageSubject(messageId: string): Promise<string> {
 }
 
 /**
+ * Pure predicate: a message is a REPLY (not a freshly-composed thread root) when
+ * it carries an `In-Reply-To` or `References` header. Split out from the Gmail
+ * fetch so it can be unit-tested.
+ */
+export function hasReplyHeaders(inReplyTo: string | null | undefined, references: string | null | undefined): boolean {
+  return !!(inReplyTo && inReplyTo.trim()) || !!(references && references.trim());
+}
+
+/**
+ * Is this Gmail message a reply (carries In-Reply-To / References) rather than a
+ * freshly-composed message? Used by `checkForNewEmails` to avoid treating a
+ * branch REPLY as a brand-new order — replies now share the unified
+ * "Re: New Order - <id>" subject, so subject alone can't tell them apart.
+ */
+export async function isReplyMessage(messageId: string): Promise<boolean> {
+  const message = await gmail.users.messages.get({
+    userId: 'me',
+    id: messageId,
+    format: 'metadata',
+    metadataHeaders: ['In-Reply-To', 'References'],
+  });
+  const headers = message.data.payload?.headers ?? [];
+  const get = (name: string) => headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? '';
+  return hasReplyHeaders(get('In-Reply-To'), get('References'));
+}
+
+/**
  * Get messages in a thread
  */
 export async function getThreadMessages(threadId: string) {

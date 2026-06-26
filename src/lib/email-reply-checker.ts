@@ -6,7 +6,7 @@
 // If you change anything in this file, also update that doc's change log.
 
 import { prisma } from './prisma';
-import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject, markMessagesAsRead } from './gmail';
+import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject, markMessagesAsRead, isReplyMessage } from './gmail';
 import {
   triggerZsoVisibility,
   assembleAndSendCombinedEmail,
@@ -553,6 +553,19 @@ export async function checkForNewEmails(): Promise<{
     const processedThreadIds = new Set(processedEmails.map((e) => e.gmailThreadId));
 
     for (const msg of messages) {
+      // A genuine NEW ORDER is composed fresh (thread root, no In-Reply-To /
+      // References). A REPLY carries those headers. Since every branch outbound
+      // now shares the "Re: New Order - <id>" subject, branch replies match this
+      // query too — so subject can't distinguish them. Skip replies here and let
+      // checkForReplies own them (it reads the whole thread by label, not unread,
+      // so marking read is safe and frees the is:unread query budget). This is
+      // robust even after an SO teardown wiped the dedup rows.
+      if (await isReplyMessage(msg.id)) {
+        log(`[NewEmail] Skipping message ${msg.id} — it's a reply (In-Reply-To/References present), not a new order; checkForReplies will handle it`);
+        await markMessagesAsRead([msg.id]);
+        continue;
+      }
+
       // Skip if already processed. Mark-read anyway so the same message
       // doesn't keep matching `is:unread` and pollute every cron tick.
       if (processedMessageIds.has(msg.id) || processedThreadIds.has(msg.threadId)) {

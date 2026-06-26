@@ -588,3 +588,10 @@ sqlite3 prisma/dev.db "
   subject. (Touched: `po-thread.ts`, `email-service.ts`, `stock-shortage-email.ts`,
   `email-reply-checker.ts`, `scenario-engine.ts`, `auto-gui-trigger.ts`,
   `branch-*-email.ts`, `ask-vehicle-details/route.ts`.)
+- **2026-06-26 (followup)** — `checkForNewEmails` now skips messages carrying
+  `In-Reply-To` / `References` headers (`isReplyMessage` → `hasReplyHeaders`)
+  and marks them read, leaving them to `checkForReplies`. Needed because the
+  unified threading above made branch REPLIES share the `Re: New Order - <id>`
+  subject, so the `is:unread` NEW ORDER scan could no longer tell a fresh order
+  from a reply by subject alone. The reply matcher is unchanged.
+  (Touched: `email-reply-checker.ts`, `gmail.ts`.)
