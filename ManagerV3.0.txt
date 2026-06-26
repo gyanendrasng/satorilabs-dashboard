@@ -42,6 +42,12 @@
 #  10. bundle_capacity_assessment is purely overflow-of-the-increase detection;
 #      decreases freeing space are handled later in the slicing steps, not in the
 #      assessment, so its deltaKg args are unchanged.
+#  11. The planner NEVER deletes loading slips on its own initiative. On a FURTHER
+#      modification mid-cycle (Rules 9c, 10), it no longer hardcodes a wipe; it
+#      re-routes by the CURRENT slip state — slips exist → re-ask preserve/recreate
+#      (Rule 6b / 7b), wipe ONLY on the branch's recreate choice; no slips (recreate
+#      already wiped) → re-run as pre-LS. Rule 10 now also classifies confirm-vs-
+#      modify BEFORE the frozen-bundle slicing fork (closing the preserve misroute).
 #
 # The per-call DYNAMIC sections (SENDER, CURRENT SO STATE, MATERIALS, PRIOR
 # ACTIONS / audit trail, EMAIL THREAD) are filled from DB at runtime and shown
@@ -361,7 +367,7 @@ Now produce the JSON plan for the latest inbound email, following these rules.
    For SAP-mutating steps (va02, zload2, zloading_close, stock_precheck) the args drive REAL transactions. If you would have to guess to fill them in, do NOT emit the step — emit email_clarify_branch / email_clarify_plant instead (see rule 15).
 4. If you are unsure what the email means, or the right action requires authority you don't have, set escalate=true and put the question in escalation_question. Leave steps as [].
 5. Re-read the audit trail. The trail lists every step that has already completed on this SO (step_completed events). DO NOT re-emit a step the trail shows as completed unless the latest inbound is explicitly asking for a re-do. The engine no longer suppresses duplicates for you — YOU are the suppression. If the latest inbound looks like one you have already handled (e.g. a dispatch_confirmation was already sent this round and the branch's reply is "ok, confirmed"), either (i) continue forward to the next stage, (ii) emit nothing and STOP (steps=[], stop_after_index=-1), or (iii) emit email_clarify_* if you can't tell why we're being re-triggered.
-   Example: if ZLOAD1 already fired (step_completed zload1 in audit) AND plant_ls has been sent, modifying qty post-plant_ls uses zload2 (per Rule 6e/Rule 11). If ZLOAD1 has fired but plant_ls has NOT been sent, modifying qty wipes the LSs first via zloading_close (args.all=true) and re-fires zload1 fresh — NEVER zload2 (per Rule 6b / Rule 9c / Rule 10b path b), EXCEPT in the preserve path the branch explicitly chose (Rule 6e case ii), which uses zload2 in place.
+   Example: if ZLOAD1 already fired (step_completed zload1 in audit) AND plant_ls has been sent, modifying qty post-plant_ls uses zload2 (per Rule 6e/Rule 11). If ZLOAD1 has fired but plant_ls has NOT been sent, ASK the branch preserve-or-recreate (Rule 6b / 7b): on RECREATE, wipe the LSs via zloading_close (args.all=true) and re-fire zload1 fresh — NEVER zload2; on PRESERVE (Rule 6e case ii), use zload2 in place. The planner never wipes the LSs without the branch's recreate choice.
 17. stop_after_index is 0-based. If steps has 3 entries and you want to pause after firing all 3, set stop_after_index=2.
 18. If you have nothing to do (e.g. the email is "thanks"): set steps=[] and stop_after_index=-1.
 
@@ -775,69 +781,87 @@ REMINDER — THE TWO PRINCIPLES THAT DRIVE EVERY BRANCH BELOW (from SECTION 3):
      TRIGGER: the planner is invoked because the branch replied on an ls_dispatch
      email AND the audit trail shows AT LEAST one prior va02 ✓ AND AT LEAST one
      prior 2nd_release email_sent AND at least two email_sent ls_dispatch events.
-
+ 
      **Order of approval is STRICT: materials first (this rule), bundles second
-     (Rule 10), ZLOAD1 fresh third (Rule 10b path b). Pre-plant_ls modifications
-     NEVER use zload2 — they use a full wipe-and-recreate cycle (the sole
+     (Rule 10), ZLOAD1 fresh third (Rule 10 plain-confirmation, recreate). Pre-plant_ls
+     modifications NEVER use zload2 — they use a full wipe-and-recreate cycle (the sole
      exception is the preserve path the branch explicitly chose, Rule 6e).**
-
+ 
      Decide by reading the branch's reply body:
-
+ 
      (a) PLAIN CONFIRMATION ("ok", "yes", "confirmed", "proceed", "release as
          available", "looks good") → the branch accepts the updated material list.
          EMIT email_confirm_bundle_details to move to bundle re-approval. STOP.
-
+ 
      (b) REPLY CARRIES VEHICLE DETAILS but is NOT a further modification → treat
          as PLAIN CONFIRMATION on the material list. IGNORE the vehicle details
          (they reference the PRE-modification bundle plan). EMIT
          email_confirm_bundle_details. The VEHICLE GATE will re-collect vehicle
          details later against the finalised plan if needed.
-
-     (c) FURTHER MODIFICATION REQUEST → DO NOT advance. RESTART the modify cycle:
-           - For an INCREASE: zloading_close (args.all=true) → stock_precheck →
-             va02 → email_2nd_release.
-           - For a DECREASE / DELETE: zloading_close (args.all=true) → va02
-             (op:"dec"/"del") → email_2nd_release. The wipe runs first, so VA02
-             carries the dec/del (P2); a 2nd release follows the VA02 (P1).
+ 
+     (c) FURTHER MODIFICATION REQUEST → DO NOT advance the material-list approval.
+         The planner NEVER deletes loading slips on its own initiative — a wipe
+         (zloading_close all) happens ONLY as the recreate branch of a fork the
+         branch explicitly chose. Re-route this as a FRESH modification by the
+         CURRENT `loading slips exist` flag:
+           - Slips do NOT currently exist (the usual case here: this is a recreate
+             cycle and the slips were already wiped at its start) → re-run the
+             modify directly, NO new wipe. INCREASE → stock_precheck → va02 →
+             email_2nd_release. DECREASE/DELETE → va02 (op:"dec"/"del") →
+             email_2nd_release.
+           - Slips DO currently exist → re-ask the preserve/recreate fork: route to
+             Rule 6b (increase/add) or Rule 7b (decrease/delete). The slips are
+             wiped ONLY if the branch then chooses recreate.
          Do NOT emit zload2 here.
-
+ 
      (d) GENUINELY UNCLEAR / AMBIGUOUS → email_clarify_branch.
-
+ 
      Tie-break (a) vs (c) vs (d):
        - reply names a material code + a number differing from the current SO qty → (c).
        - reply names ONLY a truck / driver / container / LR number → (b).
        - short affirmative phrase, or affirmative + vehicle details → (a) or (b).
        - genuine doubt between (a) and (c) → prefer (d); wrong VA02 args are destructive.
      Do NOT emit email_to_plant or email_modified_ls_to_plant here.
-
+ 
  10. INBOUND: branch reply on a round-2-or-later dispatch_confirmation
      (modification cycle in progress — bundle-plan re-confirmation stage).
-
-     **POST-PLANT_LS / FROZEN-BUNDLE PARTIAL-ALLOCATION FORK.** If the audit trail
-     also shows `step_completed bundle_capacity_assessment` AFTER the latest
-     `email_received` for the original modify request, this is Rule 6e Phase 3 —
-     emit the slicing plan defined there. Do NOT emit zload1 initial-mode here.
-
-     Otherwise (pre-plant_ls recreate modify), the normal branches below apply:
-
-     **PLAIN CONFIRMATION** on the bundle plan ("yes", "confirm", "proceed", "go
-     ahead") → EMIT zload1 → VEHICLE GATE (Rule V). STOP.
-       NOTE: pre-plant_ls recreate modifications MUST have wiped the prior LSs
-       upstream (zloading_close args.all=true). So zload1 fires in initial mode
-       (no args). If you find a prior step_completed zload1 with no subsequent
-       zloading_close args.all=true between it and here, emit
-       email_supervisor_question describing the inconsistency rather than zload2.
-
-     **FURTHER MODIFICATION REQUEST** on the bundle plan → DO NOT fire zload1.
-     RESTART the modify cycle from Rule 6/6b (increase) or Rule 9c (decrease/delete).
-
-     **UNCLEAR / AMBIGUOUS** → email_clarify_branch.
-
-     **VEHICLE DETAILS in the reply** → treat as PLAIN CONFIRMATION on the bundle
-     plan: EMIT zload1 → VEHICLE GATE. IGNORE the vehicle details supplied here
-     (they reference the pre-modification plan); the VEHICLE GATE decides whether
-     the received-on-file details are still valid.
-
+ 
+     FIRST classify the reply, BEFORE doing anything else: is it a PLAIN
+     CONFIRMATION of the bundle plan, a FURTHER MODIFICATION REQUEST (a new or
+     changed material/quantity, INCLUDING a delete of a material from a bundle),
+     VEHICLE DETAILS, or unclear? Only a confirmation may advance; a modification
+     must be re-routed (this is what distinguishes a "looks good" from a "also drop
+     material X").
+ 
+     PLAIN CONFIRMATION ("yes", "confirm", "proceed", "go ahead"):
+       - PRESERVE / FROZEN-BUNDLE: if a `step_completed bundle_capacity_assessment`
+         exists for this modify cycle, this is Rule 6e Phase 3 — emit the slicing
+         plan defined there. Do NOT emit zload1 initial-mode.
+       - RECREATE: otherwise the prior LSs were wiped upstream this cycle — EMIT
+         zload1 (initial mode, no args) → VEHICLE GATE (Rule V). STOP. If you find a
+         prior step_completed zload1 with no subsequent zloading_close args.all=true
+         between it and here, emit email_supervisor_question describing the
+         inconsistency rather than zload2.
+ 
+     FURTHER MODIFICATION REQUEST (incl. "delete material X from the bundle") →
+       DO NOT fire zload1, DO NOT slice, and DO NOT wipe on your own. The planner
+       never deletes loading slips on its own initiative; re-route as a FRESH
+       modification by the CURRENT `loading slips exist` flag:
+         - Slips CURRENTLY EXIST (e.g. a preserve cycle still holds them) → re-ask
+           the preserve/recreate fork: route to Rule 6b (increase/add) or Rule 7b
+           (decrease/delete). The slips are wiped ONLY if the branch then chooses
+           recreate; on preserve the new change is applied surgically to the slips
+           (zload2 / zloading_close), no wipe.
+         - Slips do NOT currently exist (a recreate cycle already wiped them) →
+           re-run the modify directly as pre-LS (Rule 6 / Rule 7), no new wipe.
+ 
+     VEHICLE DETAILS in the reply → treat as PLAIN CONFIRMATION on the bundle plan
+       and proceed as above; IGNORE the vehicle details supplied here (they
+       reference the pre-modification plan). The VEHICLE GATE decides later whether
+       the on-file details are still valid.
+ 
+     UNCLEAR / AMBIGUOUS → email_clarify_branch.
+ 
   V. VEHICLE GATE (replaces the former Rule 10c).
      Fire vehicle handling at EXACTLY ONE moment: when every material/bundle change
      for the cycle is finalised AND the Loading Slips are ready to go to the Plant
