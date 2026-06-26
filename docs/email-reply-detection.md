@@ -140,8 +140,9 @@ Email row)?**
 A single Gmail thread can carry many of our outbounds:
 
 - The plant_ls fan-out sends N emails (one per loading slip) into one Gmail
-  thread (the per-PO plant anchor). The plant replies separately to each →
-  one Gmail thread, N inbound replies, each addressed to a different LS.
+  thread (the per-(PO, plant) anchor — see "Thread anchoring & subjects" below).
+  The plant replies separately to each → one Gmail thread, N inbound replies,
+  each addressed to a different LS.
 - The per-PO branch thread anchors every branch-facing email
   (ls_dispatch, dispatch_confirmation, vehicle_details, 2nd_release, …) on
   one thread.
@@ -230,6 +231,34 @@ variants for robustness against angle-bracket inconsistencies).
 - Position-in-thread heuristics ("the latest inbound is my reply"). When the
   thread contains multiple outbounds, "latest inbound" is ambiguous and
   routes replies to the wrong pending row.
+
+---
+
+## 4b. Thread anchoring & subjects (one conversation per stakeholder)
+
+Every outbound is anchored so each stakeholder sees **one** conversation, and —
+critically — every email on a thread shares **one subject**. Gmail only keeps
+messages in a conversation when the `threadId`, the `References` chain, **and the
+subject** all line up; a differing subject forks a new conversation on the
+recipient's side even when we pass the right `threadId`. Anchoring lives in
+[`src/lib/po-thread.ts`](../src/lib/po-thread.ts).
+
+| Stakeholder | Thread key | Shared subject | Where stored |
+|---|---|---|---|
+| Branch | per **PO** (the NEW ORDER thread) | `Re: <NEW ORDER subject>` | `PurchaseOrder.branchThreadId` / `branchAnchorMsgId` / `branchSubject` |
+| Plant | per **(PO, plant email)** | `Loading Slips - PO <poNumber>` | `PoRecipientThread` (`@@unique([purchaseOrderId, recipientEmail])`) |
+| Production | per **PO** | `Material readiness - PO <poNumber>` | `PoRecipientThread`, `kind='production'` |
+
+- **Branch** subject is the branch's own NEW ORDER subject, captured at intake
+  (`branchSubject`) and reused as `Re: <subject>` by `resolvePoThreadAnchor(po,'branch')`.
+  The per-step purpose (vehicle details, dispatch confirmation, …) moves to the
+  body's first line via `withPurposeLine` / `withPurposeLineHtml`.
+- **Plant** is per (PO, plant) so a PO that dispatches from several plants gets
+  one thread per plant (one email per loading slip is unchanged). The LS number
+  lives in the body + attachment filename, not the subject.
+- **Subject changes do NOT affect reply detection.** The matcher (§4) keys only on
+  `threadId` + the `In-Reply-To` chain. Unifying subjects only changes how the
+  *recipient's* client groups messages; our routing is unchanged.
 
 ---
 
@@ -551,3 +580,11 @@ sqlite3 prisma/dev.db "
   multi-hop chain walk (`nearestOutboundAncestorRfc822`) so follow-up
   replies that target prior inbounds still resolve to the right outbound.
   Documented in this file.
+- **2026-06-26** — One conversation per stakeholder (§4b). Branch emails now
+  reuse `Re: <NEW ORDER subject>` (captured as `PurchaseOrder.branchSubject`);
+  per-step purpose moved to the body. Plant threads are now per **(PO, plant)**
+  and production reminders are anchored per **PO**, both via the new
+  `PoRecipientThread` table. The matcher is unchanged — it never read the
+  subject. (Touched: `po-thread.ts`, `email-service.ts`, `stock-shortage-email.ts`,
+  `email-reply-checker.ts`, `scenario-engine.ts`, `auto-gui-trigger.ts`,
+  `branch-*-email.ts`, `ask-vehicle-details/route.ts`.)

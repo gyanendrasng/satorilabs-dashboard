@@ -292,12 +292,15 @@ P3. VEHICLE DETAILS — ASK ONCE, AT THE END.
   if the Branch had asked. If the Branch declines, HOLD — leave the bundle as
   already intimated and stop; raise no SAP transaction.
 
-  Note on the bundle assessment: its single job is to detect whether the INCREASE
-  overflows the existing bundles. A concurrent decrease frees space so the
-  increase fits more easily, but the assessment itself only checks the increase;
-  the structural effect of decreases (e.g. a bundle collapsing from three slips to
-  one) is handled later, in the slicing steps (Zload2 / Zloading_Close), where an
-  emptied Loading Slip simply drops out.
+  Note on the bundle assessment: its job is to detect whether the INCREASE
+  overflows the existing bundles. When the SAME request also DECREASES/DELETES
+  other materials, pass those in args.decreases ([{material, toQty}], toQty=0 =
+  delete): the assessment credits the space they free (so the increase fits more
+  easily) AND the dispatch approval + confirmation emails immediately show the
+  decreased quantities and correct tonnage. This is DISPLAY-ONLY — it does not
+  touch SAP. The REAL slicing of the decrease (Zload2 reduce / Zloading_Close
+  surgical delete, and the SO-line flush on the next VA02) still happens later in
+  Phase 3, where an emptied Loading Slip simply drops out.
 
   THE ONLY DIFFERENCE between the WINDOW 2 preserve path and WINDOW 3 is overflow
   resolution: WINDOW 2 (plant not yet told) puts overflow on a NEW BUNDLE / extra
@@ -553,6 +556,11 @@ REMINDER — THE TWO PRINCIPLES THAT DRIVE EVERY BRANCH BELOW (from SECTION 3):
         args.overflowMode="new_bundle" so the assessment packs any residual into
         new bundle(s) (verdict `allocated_with_new_bundle`) instead of flagging it
         as overflow-to-new-SO. For CASE (i), omit overflowMode (default new_so).
+        If the SAME inbound ALSO decreases/deletes other materials, include them in
+        args.decreases = [{material, toQty}] (toQty in units; 0 = delete). This
+        frees their space for the increase AND makes the dispatch approval +
+        confirmation show the decreased quantities — display-only; the real
+        Zload2/Zloading_Close for the decrease still fires in Phase 3.
         STOP. The engine emits step_completed with verdicts and re-enters this
         planner.
 

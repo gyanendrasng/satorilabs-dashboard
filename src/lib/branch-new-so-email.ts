@@ -11,7 +11,8 @@
 
 import { prisma } from './prisma';
 import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from './gmail';
-import { resolvePoThreadAnchor, capturePoThreadAnchor } from './po-thread';
+import { resolvePoThreadAnchor, capturePoThreadAnchor, withPurposeLine } from './po-thread';
+import { kgPerUnitOf, kgToUnits } from './units';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
@@ -40,16 +41,28 @@ export async function sendBranchRequestNewSoEmail(args: {
 
   const so = await prisma.salesOrder.findUnique({
     where: { id: salesOrderId },
-    select: { soNumber: true, purchaseOrderId: true, purchaseOrder: { select: { poNumber: true } } },
+    select: {
+      soNumber: true,
+      purchaseOrderId: true,
+      purchaseOrder: { select: { poNumber: true } },
+      materials: { select: { material: true, orderWeightKg: true, orderQuantity: true } },
+    },
   });
   if (!so) {
     log(`[BranchNewSo] SO ${salesOrderId} not found`);
     return null;
   }
 
-  const lines = overflow.map(
-    (o) => `  - ${o.material}: requested an increase of ${o.deltaKg.toFixed(0)} kg`,
-  );
+  // kgPerUnit lookup so overflow reads in units (boxes), not kg.
+  const kgPerUnitByCode = new Map<string, number>();
+  for (const m of so.materials) {
+    kgPerUnitByCode.set(m.material, kgPerUnitOf(m.orderWeightKg ? Number(m.orderWeightKg) : 0, m.orderQuantity));
+  }
+
+  const lines = overflow.map((o) => {
+    const units = kgToUnits(o.deltaKg, kgPerUnitByCode.get(o.material) ?? 0);
+    return `  - ${o.material}: requested an increase of ${units} units`;
+  });
 
   const body = [
     `Hi team,`,
@@ -65,22 +78,24 @@ export async function sendBranchRequestNewSoEmail(args: {
     `Thanks for your understanding.`,
   ].join('\n');
 
-  const subject = `New SO Required - Overflow on SO ${so.soNumber}`;
+  const purposeLabel = `New SO Required - Overflow on SO ${so.soNumber}`;
 
   const anchor = so.purchaseOrderId
     ? await resolvePoThreadAnchor(so.purchaseOrderId, 'branch')
     : null;
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, body);
 
   let sent: { messageId: string; threadId: string };
   try {
     if (anchor) {
-      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
     }
   } catch (err) {
     log(`[BranchNewSo] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
-    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
   }
 
   if (so.purchaseOrderId && !anchor) {
@@ -100,7 +115,7 @@ export async function sendBranchRequestNewSoEmail(args: {
       subject,
       status: 'sent',
       emailType: 'branch_request_new_so',
-      sentBody: body,
+      sentBody: sendBody,
       relatedMaterials: JSON.stringify({ version: 'branch-new-so-v1', overflow }),
     },
   });
@@ -114,7 +129,7 @@ export async function sendBranchRequestNewSoEmail(args: {
         emailType: 'branch_request_new_so',
         recipient: BRANCH_EMAIL,
         subject,
-        body_excerpt: body.slice(0, 200),
+        body_excerpt: sendBody.slice(0, 200),
         gmailMessageId: sent.messageId,
         overflow,
       },

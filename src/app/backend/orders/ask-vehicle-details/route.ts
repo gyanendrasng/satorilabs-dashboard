@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { sendReplyEmail, sendPlainEmail, getMessageRfc822Id } from '@/lib/gmail';
+import { resolvePoThreadAnchor, withPurposeLine } from '@/lib/po-thread';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
@@ -43,7 +44,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Vehicle details email already sent for this SO' }, { status: 409 });
     }
 
-    const vehicleEmailBody = [
+    const vehicleEmailBodyRaw = [
       `Loading slip for Sales Order ${soNumber} has been created successfully.`,
       '',
       'Please reply with the following vehicle/transport details:',
@@ -52,11 +53,21 @@ export async function POST(request: Request) {
       '3. Container Number',
     ].join('\n');
 
-    const subject = `Vehicle Details Required - SO ${soNumber}`;
+    const purposeLabel = `Vehicle Details Required - SO ${soNumber}`;
+
+    // Ride the per-PO branch conversation (shared subject). Fall back to the
+    // SO's NEW ORDER thread if no anchor resolves.
+    const branchAnchor = salesOrder.purchaseOrderId
+      ? await resolvePoThreadAnchor(salesOrder.purchaseOrderId, 'branch')
+      : null;
+    const subject = branchAnchor?.subject ?? purposeLabel;
+    const vehicleEmailBody = withPurposeLine(purposeLabel, vehicleEmailBodyRaw);
 
     let emailResult: { messageId: string; threadId: string };
 
-    if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
+    if (branchAnchor) {
+      emailResult = await sendReplyEmail(BRANCH_EMAIL, subject, vehicleEmailBody, branchAnchor.threadId, branchAnchor.rfc822MessageId);
+    } else if (salesOrder.originalThreadId && salesOrder.originalMessageId) {
       try {
         const rfc822Id = await getMessageRfc822Id(salesOrder.originalMessageId);
         if (rfc822Id) {

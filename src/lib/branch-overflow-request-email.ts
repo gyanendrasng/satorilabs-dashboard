@@ -19,7 +19,8 @@
 
 import { prisma } from './prisma';
 import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from './gmail';
-import { resolvePoThreadAnchor, capturePoThreadAnchor } from './po-thread';
+import { resolvePoThreadAnchor, capturePoThreadAnchor, withPurposeLine } from './po-thread';
+import { kgPerUnitOf, kgToUnits } from './units';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
@@ -59,7 +60,7 @@ export async function sendBranchOverflowRequestEmail(args: {
       soNumber: true,
       purchaseOrderId: true,
       purchaseOrder: { select: { poNumber: true } },
-      materials: { select: { material: true, materialDescription: true } },
+      materials: { select: { material: true, materialDescription: true, orderWeightKg: true, orderQuantity: true } },
     },
   });
   if (!so) {
@@ -67,15 +68,21 @@ export async function sendBranchOverflowRequestEmail(args: {
     return null;
   }
 
-  // Material description lookup so the body reads in human terms, not codes.
+  // Material description + kgPerUnit lookup so the body reads in human terms
+  // (units, not codes or kg).
   const descByCode = new Map<string, string | null>();
-  for (const m of so.materials) descByCode.set(m.material, m.materialDescription ?? null);
+  const kgPerUnitByCode = new Map<string, number>();
+  for (const m of so.materials) {
+    descByCode.set(m.material, m.materialDescription ?? null);
+    kgPerUnitByCode.set(m.material, kgPerUnitOf(m.orderWeightKg ? Number(m.orderWeightKg) : 0, m.orderQuantity));
+  }
 
   const lines = items.map((it) => {
     const desc = descByCode.get(it.material) || it.material;
-    const placed = Math.round(it.placedKg);
-    const overflow = Math.round(it.overflowKg);
-    return `  - ${desc} — can accommodate ${placed} kg in this dispatch; ${overflow} kg overflow`;
+    const kpu = kgPerUnitByCode.get(it.material) ?? 0;
+    const placed = kgToUnits(it.placedKg, kpu);
+    const overflow = kgToUnits(it.overflowKg, kpu);
+    return `  - ${desc} — can fit ${placed} units in this dispatch; ${overflow} units overflow`;
   });
 
   const body = resolution === 'new_bundle'
@@ -112,22 +119,24 @@ export async function sendBranchOverflowRequestEmail(args: {
         `Thanks.`,
       ].join('\n');
 
-  const subject = `Action required — partial dispatch for SO ${so.soNumber}`;
+  const purposeLabel = `Action required — partial dispatch for SO ${so.soNumber}`;
 
   const anchor = so.purchaseOrderId
     ? await resolvePoThreadAnchor(so.purchaseOrderId, 'branch')
     : null;
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, body);
 
   let sent: { messageId: string; threadId: string };
   try {
     if (anchor) {
-      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.threadId, anchor.rfc822MessageId);
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
     }
   } catch (err) {
     log(`[BranchOverflow] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
-    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
   }
 
   if (so.purchaseOrderId && !anchor) {
@@ -147,7 +156,7 @@ export async function sendBranchOverflowRequestEmail(args: {
       subject,
       status: 'sent',
       emailType: 'overflow_request',
-      sentBody: body,
+      sentBody: sendBody,
       relatedMaterials: JSON.stringify({ version: 'overflow-request-v1', items }),
     },
   });
@@ -161,7 +170,7 @@ export async function sendBranchOverflowRequestEmail(args: {
         emailType: 'overflow_request',
         recipient: BRANCH_EMAIL,
         subject,
-        body_excerpt: body.slice(0, 200),
+        body_excerpt: sendBody.slice(0, 200),
         gmailMessageId: sent.messageId,
         items,
       },

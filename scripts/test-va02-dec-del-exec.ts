@@ -110,9 +110,13 @@ async function main() {
       const inc = await prisma.material.findFirst({ where: { salesOrderId: so.id, material: 'MINC' } });
       const pend = await prisma.material.findFirst({ where: { salesOrderId: so.id, material: 'MPEND' } });
       const incOk = inc?.orderQuantity === 220;
-      const pendOk = pend?.orderQuantity === 60 && pend?.pendingSoOp === null && pend?.pendingSoQty === null;
-      if (incOk && pendOk) pass('increase applied AND unnamed pending-dec flushed to 60, flags cleared');
-      else fail(`flush → MINC oq=${inc?.orderQuantity}; MPEND oq=${pend?.orderQuantity} op=${pend?.pendingSoOp} qty=${pend?.pendingSoQty}`);
+      // Flush lowers orderQuantity 80→60 AND scales orderWeightKg 800→600 so
+      // kgPerUnit stays 10 (the weight-scaling fix).
+      const pendKgpu = pend?.orderWeightKg ? Number(pend.orderWeightKg) / (pend.orderQuantity ?? 1) : 0;
+      const pendOk = pend?.orderQuantity === 60 && pend?.pendingSoOp === null && pend?.pendingSoQty === null
+        && Math.abs(Number(pend?.orderWeightKg) - 600) < 1e-3 && Math.abs(pendKgpu - 10) < 1e-3;
+      if (incOk && pendOk) pass('increase applied AND unnamed pending-dec flushed to 60, weight rescaled 800→600 (kgPerUnit 10), flags cleared');
+      else fail(`flush → MINC oq=${inc?.orderQuantity}; MPEND oq=${pend?.orderQuantity} weight=${pend?.orderWeightKg} op=${pend?.pendingSoOp} qty=${pend?.pendingSoQty}`);
       await cleanup(so.id, po.id);
     }
   } finally {

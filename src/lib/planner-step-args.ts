@@ -160,6 +160,18 @@ export interface BundleCapacityAssessmentItem {
   deltaKg: number;
 }
 
+/**
+ * A material the SAME modify request is DECREASING / DELETING alongside the
+ * increases in `items`. Carried so the assessment can credit the space the
+ * decrease frees (the increase then fits more easily) and the dispatch emails
+ * can show the new lower quantity. `toQty` is the material's new total dispatch
+ * quantity in UNITS; `toQty: 0` denotes a delete.
+ */
+export interface BundleCapacityDecrease {
+  material: string;
+  toQty: number;
+}
+
 export interface BundleCapacityAssessmentArgs {
   items: BundleCapacityAssessmentItem[];
   /**
@@ -169,6 +181,8 @@ export interface BundleCapacityAssessmentArgs {
    *                  (new bundle) on the same PO. Set via args.overflowMode.
    */
   overflowMode: 'new_so' | 'new_bundle';
+  /** Concurrent decreases/deletes in the same request (optional). */
+  decreases: BundleCapacityDecrease[];
 }
 
 export function coerceBundleCapacityArgs(step: PlannedStep | undefined): BundleCapacityAssessmentArgs {
@@ -185,7 +199,23 @@ export function coerceBundleCapacityArgs(step: PlannedStep | undefined): BundleC
     return { material, deltaKg: it.deltaKg };
   });
   const overflowMode = args.overflowMode === 'new_bundle' ? 'new_bundle' : 'new_so';
-  return { items, overflowMode };
+
+  // Optional concurrent decreases/deletes.
+  const decreases: BundleCapacityDecrease[] = [];
+  if (Array.isArray(args.decreases)) {
+    args.decreases.forEach((raw, i) => {
+      const d = raw as Record<string, unknown>;
+      const material = asString(d.material, `decreases[${i}].material`, 'bundle_capacity_assessment');
+      if (typeof d.toQty !== 'number' || !Number.isFinite(d.toQty) || d.toQty < 0) {
+        throw new PlannerArgsError(
+          `bundle_capacity_assessment.args.decreases[${i}].toQty must be a non-negative finite number (0 = delete), got ${JSON.stringify(d.toQty)}`,
+        );
+      }
+      decreases.push({ material, toQty: d.toQty });
+    });
+  }
+
+  return { items, overflowMode, decreases };
 }
 
 // ─── email_branch_request_new_so ───────────────────────────────────────────

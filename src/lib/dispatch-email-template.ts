@@ -14,6 +14,13 @@ export interface DispatchMaterial {
   materialDescription: string | null;
   batch: string;
   orderQuantity: number;
+  /**
+   * The branch's effective release quantity for THIS dispatch, when known.
+   * In the modify (preserve) flow it carries a virtual decrease (e.g. 60 of an
+   * ordered 100); null in the initial new-order flow. Display prefers this over
+   * orderQuantity so the branch sees the quantity we'll actually dispatch.
+   */
+  dispatchQuantity?: number | null;
   availableStock: number | null;
   orderWeightKg: number | null;
 }
@@ -57,7 +64,9 @@ function escapeHtml(s: string | null | undefined): string {
 }
 
 function proseLineFor(m: DispatchMaterial, soPlant: string | null | undefined): string {
-  const requested = m.orderQuantity;
+  // Effective dispatch quantity: the virtual-decrease value when set (modify
+  // flow), else the ordered quantity (initial new-order flow).
+  const requested = m.dispatchQuantity ?? m.orderQuantity;
   const available = m.availableStock ?? requested;
   const labelBase = m.materialDescription ?? m.material;
   const label = m.materialDescription

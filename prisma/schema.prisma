@@ -125,6 +125,12 @@ model PurchaseOrder {
   // so Gmail keeps replies stitched.
   branchThreadId    String?
   branchAnchorMsgId String?
+  // Original NEW ORDER subject (e.g. "New Order - 3382187"). Every branch
+  // outbound for this PO replies as "Re: <branchSubject>" so Gmail collapses
+  // all of the PO's branch emails into the conversation the branch started.
+  branchSubject     String?
+  // DEPRECATED — plant threads are now per (PO, plant) in PoRecipientThread.
+  // Kept (unused) to avoid a destructive column drop on existing rows.
   plantThreadId     String?
   plantAnchorMsgId  String?
   createdAt    DateTime @default(now())
@@ -134,8 +140,32 @@ model PurchaseOrder {
   emails      Email[]
   customer    Customer? @relation(fields: [customerId], references: [id])
   bundles     Bundle[]
+  recipientThreads PoRecipientThread[]
 
   @@map("purchase_order")
+}
+
+// Per-recipient Gmail thread anchor for a PO. One row per (PO, recipientEmail).
+// Used for PLANT (one thread per plant a PO dispatches from) and PRODUCTION
+// (one thread per PO). BRANCH does not use this table — it stays on the
+// PurchaseOrder.branchThreadId/branchSubject columns. Every outbound to that
+// recipient replies into `threadId` with `In-Reply-To: anchorMsgId` and the
+// fixed `subject`, so the recipient sees a single conversation.
+model PoRecipientThread {
+  id              String   @id @default(cuid())
+  purchaseOrderId String
+  recipientEmail  String // plant email or PRODUCTION_EMAIL
+  kind            String // 'plant' | 'production'
+  threadId        String
+  anchorMsgId     String? // RFC822 Message-ID of the first outbound (In-Reply-To)
+  subject         String // fixed subject every email in this thread shares
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([purchaseOrderId, recipientEmail])
+  @@map("po_recipient_thread")
 }
 
 // One Bundle = one truck/vehicle worth of LoadingSlipItems. Computed from

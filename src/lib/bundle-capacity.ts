@@ -36,6 +36,7 @@
  */
 
 import { prisma } from './prisma';
+import { kgPerUnitOf } from './units';
 
 /**
  * One leg of an allocation for a single material. The same material can have
@@ -82,6 +83,13 @@ export interface AssessPostLsIncreaseArgs {
    *                 (allocated_with_new_bundle verdict). Never overflows to a SO.
    */
   overflowMode?: 'new_so' | 'new_bundle';
+  /**
+   * Materials the SAME request is decreasing/deleting. Each frees space on the
+   * bundle it currently rides, so the increase fits more easily. `toQty` is the
+   * new total quantity in UNITS (0 = delete). The decrease is NOT applied to
+   * SAP here — it only credits the in-memory headroom used to pack the increase.
+   */
+  decreases?: Array<{ material: string; toQty: number }>;
 }
 
 export interface AssessPostLsIncreaseResult {
@@ -157,6 +165,35 @@ export async function assessPostLsIncrease(
     tentativeWeightKg.set(b.id, Number(b.totalWeightKg));
   }
   const dispatchedIds = new Set(bundles.filter((b) => b.status === 'dispatched').map((b) => b.id));
+
+  // Credit the space freed by any concurrent decreases/deletes BEFORE packing
+  // the increases, so the increase fits into the headroom the decrease opens up.
+  // This is in-memory only (tentativeWeightKg) — the real LS reduction happens
+  // later in Phase 3 slicing; here we only need an honest headroom for packing.
+  for (const dec of args.decreases ?? []) {
+    const bundleId = await findCurrentBundleForMaterial({
+      salesOrderId: args.salesOrderId,
+      material: dec.material,
+    });
+    if (!bundleId || dispatchedIds.has(bundleId)) continue;
+    // Current physical units on the LS(s) for this material, and kgPerUnit.
+    const lsis = await prisma.loadingSlipItem.findMany({
+      where: { salesOrderId: args.salesOrderId, material: dec.material, loadingSlipId: { not: null } },
+      select: { orderQuantity: true },
+    });
+    const currentUnits = lsis.reduce((s, l) => s + (l.orderQuantity ?? 0), 0);
+    const mat = await prisma.material.findFirst({
+      where: { salesOrderId: args.salesOrderId, material: dec.material },
+      select: { orderWeightKg: true, orderQuantity: true },
+    });
+    const kgPerUnit = kgPerUnitOf(mat?.orderWeightKg ? Number(mat.orderWeightKg) : 0, mat?.orderQuantity ?? 0);
+    const freedUnits = Math.max(0, currentUnits - dec.toQty);
+    const freedKg = freedUnits * kgPerUnit;
+    if (freedKg > 0) {
+      const used = tentativeWeightKg.get(bundleId) ?? 0;
+      tentativeWeightKg.set(bundleId, Math.max(0, used - freedKg));
+    }
+  }
 
   for (const item of args.items) {
     const currentBundleId = await findCurrentBundleForMaterial({

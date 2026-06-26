@@ -1,6 +1,11 @@
 import { prisma } from './prisma';
 import { sendEmail, sendReplyEmailWithAttachment, getMessageRfc822Id } from './gmail';
-import { resolvePoThreadAnchor, capturePoThreadAnchor } from './po-thread';
+import {
+  resolveRecipientThreadAnchor,
+  captureRecipientThreadAnchor,
+  plantThreadSubject,
+  withPurposeLine,
+} from './po-thread';
 
 interface VehicleDetails {
   vehicleNumber?: string | null;
@@ -29,7 +34,7 @@ export async function sendLSEmail(
     select: {
       loadingSlipId: true,
       loadingSlip: { select: { plantEmail: true } },
-      salesOrder: { select: { purchaseOrderId: true } },
+      salesOrder: { select: { purchaseOrderId: true, purchaseOrder: { select: { poNumber: true } } } },
     },
   });
   const envPlantEmail = process.env.PLANT_EMAIL || '';
@@ -41,7 +46,7 @@ export async function sendLSEmail(
 
   console.log(`[Email] Preparing to send LS ${lsNumber} for SO ${soNumber} to ${plantEmail}`);
 
-  const subject = `Loading Slip ${lsNumber} - SO ${soNumber}`;
+  const purposeLabel = `Loading Slip ${lsNumber} - SO ${soNumber}`;
 
   const bodyLines = [
     `Please find attached the Loading Slip ${lsNumber} for Sales Order ${soNumber}.`,
@@ -60,7 +65,10 @@ export async function sendLSEmail(
   }
   bodyLines.push('', 'Please reply with the invoice PDF.');
 
-  const body = bodyLines.join('\n');
+  // Per-LS purpose line at the top — every LS to this plant shares ONE umbrella
+  // subject (so the plant sees one conversation), so the LS number lives in the
+  // body and the attachment filename instead of the subject.
+  const body = withPurposeLine(purposeLabel, bodyLines.join('\n'));
 
   // Determine filename and mime type
   const filename = originalFilename || `LS_${lsNumber}.pdf`;
@@ -73,21 +81,32 @@ export async function sendLSEmail(
       : 'application/pdf';
 
   try {
-    // Anchor on the per-PO plant thread so every plant outbound for this PO
-    // (LS forwards, modified LS forwards, 2nd_release, etc.) stays in one
-    // conversation. First plant outbound for the PO captures the thread.
+    // Anchor on the per-(PO, plant) thread so every outbound to THIS plant for
+    // this PO (each LS forward, modified LS, etc.) stays in one conversation —
+    // keyed by the plant's email so a PO that dispatches from several plants
+    // gets one thread per plant. First outbound to the plant captures the
+    // thread under the shared umbrella subject.
     const poId = lsiRow?.salesOrder?.purchaseOrderId ?? null;
-    const anchor = poId ? await resolvePoThreadAnchor(poId, 'plant') : null;
+    const poNumber = lsiRow?.salesOrder?.purchaseOrder?.poNumber ?? null;
+    const anchor = poId ? await resolveRecipientThreadAnchor(poId, plantEmail) : null;
+    const threadSubject = anchor?.subject ?? (poNumber ? plantThreadSubject(poNumber) : purposeLabel);
 
     const attachment = { filename, content: fileBuffer, mimeType };
     const sent = anchor
-      ? await sendReplyEmailWithAttachment(plantEmail, subject, body, anchor.threadId, anchor.rfc822MessageId, attachment)
-      : await sendEmail(plantEmail, subject, body, attachment);
+      ? await sendReplyEmailWithAttachment(plantEmail, threadSubject, body, anchor.threadId, anchor.rfc822MessageId ?? '', attachment)
+      : await sendEmail(plantEmail, threadSubject, body, attachment);
     const { messageId, threadId } = sent;
 
     if (poId && !anchor) {
       const rfc822 = await getMessageRfc822Id(messageId);
-      if (rfc822) await capturePoThreadAnchor(poId, 'plant', threadId, rfc822);
+      await captureRecipientThreadAnchor({
+        purchaseOrderId: poId,
+        recipientEmail: plantEmail,
+        kind: 'plant',
+        threadId,
+        rfc822MessageId: rfc822 ?? null,
+        subject: threadSubject,
+      });
     }
 
     console.log(`[Email] Successfully sent LS ${lsNumber} for SO ${soNumber} - messageId: ${messageId}, threadId: ${threadId}`);
@@ -101,7 +120,7 @@ export async function sendLSEmail(
         gmailMessageId: messageId,
         gmailThreadId: threadId,
         recipientEmail: plantEmail,
-        subject,
+        subject: threadSubject,
         status: 'sent',
         emailType: 'plant_ls',
       },
@@ -116,7 +135,7 @@ export async function sendLSEmail(
         payload: {
           emailType: 'plant_ls',
           recipient: plantEmail,
-          subject,
+          subject: threadSubject,
           ls_number: lsNumber,
           gmailMessageId: messageId,
         },

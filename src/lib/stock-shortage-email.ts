@@ -1,25 +1,27 @@
 import { prisma } from './prisma';
 import { sendPlainEmail, sendReplyEmail, getMessageRfc822Id } from './gmail';
 import type { StockShortage } from './stock-precheck';
-import { resolvePoThreadAnchor, capturePoThreadAnchor } from './po-thread';
+import { resolvePoThreadAnchor, capturePoThreadAnchor, withPurposeLine } from './po-thread';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
-const PLANT_EMAIL = process.env.PLANT_EMAIL || '';
 
+/**
+ * Ask how to proceed when a modification can't be fully stocked. Always goes to
+ * the BRANCH: even a plant-initiated change is funnelled through the branch
+ * (we send a plant_change_notification, the branch approves, then the branch
+ * makes every downstream decision), so the "how do you want to proceed on the
+ * short stock" question is always a branch conversation.
+ */
 export async function sendStockShortageInquiryEmail(args: {
   salesOrderId: string;
   triggerEmailId: string;
   shortages: StockShortage[];
-  // Who originally requested the increase. Determines who gets the shortfall
-  // inquiry — replies go back to the same party that asked.
-  requestSource: 'branch' | 'plant';
   log: (msg: string) => void;
 }): Promise<{ messageId: string; threadId: string } | null> {
-  const { salesOrderId, shortages, requestSource, log } = args;
+  const { salesOrderId, shortages, log } = args;
 
-  const recipient = requestSource === 'plant' ? PLANT_EMAIL : BRANCH_EMAIL;
-  if (!recipient) {
-    log(`[StockShort] ${requestSource === 'plant' ? 'PLANT_EMAIL' : 'BRANCH_EMAIL'} not configured — skipping`);
+  if (!BRANCH_EMAIL) {
+    log(`[StockShort] BRANCH_EMAIL not configured — skipping`);
     return null;
   }
 
@@ -54,29 +56,30 @@ export async function sendStockShortageInquiryEmail(args: {
     `Thanks.`,
   ].join('\n');
 
-  const subject = `Stock Short - SO ${so.soNumber}`;
+  const purposeLabel = `Stock Short - SO ${so.soNumber}`;
 
+  // Ride the per-PO branch conversation (Re: <NEW ORDER subject>).
   const anchor = so.purchaseOrderId
-    ? await resolvePoThreadAnchor(so.purchaseOrderId, requestSource)
+    ? await resolvePoThreadAnchor(so.purchaseOrderId, 'branch')
     : null;
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, body);
 
   let sent: { messageId: string; threadId: string };
   try {
     if (anchor) {
-      sent = await sendReplyEmail(recipient, subject, body, anchor.threadId, anchor.rfc822MessageId);
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(recipient, subject, body);
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
     }
   } catch (err) {
     log(`[StockShort] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
-    sent = await sendPlainEmail(recipient, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
   }
 
   if (so.purchaseOrderId && !anchor) {
     const rfc822 = await getMessageRfc822Id(sent.messageId);
-    if (rfc822) {
-      await capturePoThreadAnchor(so.purchaseOrderId, requestSource, sent.threadId, rfc822);
-    }
+    if (rfc822) await capturePoThreadAnchor(so.purchaseOrderId, 'branch', sent.threadId, rfc822);
   }
 
   await prisma.email.create({
@@ -85,12 +88,12 @@ export async function sendStockShortageInquiryEmail(args: {
       purchaseOrderId: so.purchaseOrderId,
       gmailMessageId: sent.messageId,
       gmailThreadId: sent.threadId,
-      recipientEmail: recipient,
+      recipientEmail: BRANCH_EMAIL,
       subject,
       status: 'sent',
       emailType: 'stock_short_inquiry',
-      sentBody: body,
-      relatedMaterials: JSON.stringify({ version: 'stock-short-v1', shortages, requestSource }),
+      sentBody: sendBody,
+      relatedMaterials: JSON.stringify({ version: 'stock-short-v1', shortages }),
     },
   });
 
@@ -101,18 +104,17 @@ export async function sendStockShortageInquiryEmail(args: {
       type: 'email_sent',
       payload: {
         emailType: 'stock_short_inquiry',
-        recipient,
+        recipient: BRANCH_EMAIL,
         subject,
-        body_excerpt: body.slice(0, 200),
+        body_excerpt: sendBody.slice(0, 200),
         gmailMessageId: sent.messageId,
         shortages,
-        requestSource,
       },
     });
   } catch {
     // Event emission must never break the primary flow.
   }
 
-  log(`[StockShort] Sent to ${requestSource} for SO ${so.soNumber} (${shortages.length} short item(s))`);
+  log(`[StockShort] Sent to branch for SO ${so.soNumber} (${shortages.length} short item(s))`);
   return sent;
 }

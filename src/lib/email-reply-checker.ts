@@ -388,7 +388,7 @@ export async function checkWorkflowTimers(): Promise<{
       waitUntil: { lte: new Date() },
     },
     include: {
-      salesOrder: true,
+      salesOrder: { include: { purchaseOrder: { select: { id: true, poNumber: true } } } },
       loadingSlipItem: true,
     },
   });
@@ -441,12 +441,38 @@ export async function checkWorkflowTimers(): Promise<{
         continue;
       }
 
-      // Send reminder to production
-      const sentResult = await sendPlainEmail(
-        PRODUCTION_EMAIL,
-        result.email_payload.subject,
-        result.email_payload.body
-      );
+      // Send reminder to production on the per-PO production thread so every
+      // reminder for this PO stays in one conversation (shared subject). The
+      // first reminder opens the thread; later ones reply into it.
+      const poId = email.salesOrder?.purchaseOrderId ?? null;
+      const poNumber = email.salesOrder?.purchaseOrder?.poNumber ?? null;
+      const { resolveRecipientThreadAnchor, captureRecipientThreadAnchor, productionThreadSubject } =
+        await import('./po-thread');
+      const prodAnchor = poId ? await resolveRecipientThreadAnchor(poId, PRODUCTION_EMAIL) : null;
+      const reminderSubject =
+        prodAnchor?.subject ?? (poNumber ? productionThreadSubject(poNumber) : result.email_payload.subject);
+
+      const sentResult = prodAnchor
+        ? await sendReplyEmail(
+            PRODUCTION_EMAIL,
+            reminderSubject,
+            result.email_payload.body,
+            prodAnchor.threadId,
+            prodAnchor.rfc822MessageId ?? '',
+          )
+        : await sendPlainEmail(PRODUCTION_EMAIL, reminderSubject, result.email_payload.body);
+
+      if (poId && !prodAnchor) {
+        const rfc822 = await getMessageRfc822Id(sentResult.messageId);
+        await captureRecipientThreadAnchor({
+          purchaseOrderId: poId,
+          recipientEmail: PRODUCTION_EMAIL,
+          kind: 'production',
+          threadId: sentResult.threadId,
+          rfc822MessageId: rfc822 ?? null,
+          subject: reminderSubject,
+        });
+      }
 
       log(`[TimerCheck] Reminder sent to ${PRODUCTION_EMAIL} for SO ${soNumber}`);
 
@@ -458,7 +484,7 @@ export async function checkWorkflowTimers(): Promise<{
           gmailMessageId: sentResult.messageId,
           gmailThreadId: sentResult.threadId,
           recipientEmail: PRODUCTION_EMAIL,
-          subject: result.email_payload.subject,
+          subject: reminderSubject,
           status: 'sent',
           emailType: 'production_reminder',
           workflowState: 'awaiting_confirmation',
@@ -618,6 +644,9 @@ export async function checkForNewEmails(): Promise<{
             // Backfill the canonical branch thread on this PO from the
             // NEW ORDER message if we haven't claimed one yet.
             branchThreadId: msg.threadId,
+            // Backfill the branch subject (same NEW ORDER message → same
+            // subject); guard against clobbering with an empty transient read.
+            ...(subject ? { branchSubject: subject } : {}),
           },
           create: {
             poNumber,
@@ -631,6 +660,9 @@ export async function checkForNewEmails(): Promise<{
             // (see resolvePoThreadAnchor) — Gmail message-id lookups are
             // cheap but not free, and many POs never send into the thread.
             branchThreadId: msg.threadId,
+            // The NEW ORDER subject. Every branch outbound replies as
+            // "Re: <branchSubject>" so the branch sees one conversation.
+            branchSubject: subject || null,
           },
         });
 
@@ -718,7 +750,7 @@ export async function checkForNewEmails(): Promise<{
             // our example number instead of the branch's actual answer.
             // Keep the ask in plain prose so the reply has only one numeric
             // candidate above the quote line.
-            const tonnageBody = [
+            const tonnageBodyRaw = [
               `Hi,`,
               ``,
               `We received your dispatch request for SO ${soNumbers.join(', ')}.`,
@@ -729,7 +761,12 @@ export async function checkForNewEmails(): Promise<{
               ``,
               `Thanks.`,
             ].join('\n');
-            const tonnageSubject = `Vehicle Tonnage Required - PO ${poNumber}`;
+            const tonnagePurpose = `Vehicle Tonnage Required - PO ${poNumber}`;
+            // Reuse the NEW ORDER subject (Re: <subject>) so this — the first
+            // branch outbound — opens the single conversation the branch sees.
+            const { branchReplySubject, withPurposeLine } = await import('./po-thread');
+            const tonnageSubject = subject ? branchReplySubject(subject) : tonnagePurpose;
+            const tonnageBody = withPurposeLine(tonnagePurpose, tonnageBodyRaw);
             const rfc822Id = await getMessageRfc822Id(msg.id);
             const sent = rfc822Id && BRANCH_EMAIL
               ? await sendReplyEmail(BRANCH_EMAIL, tonnageSubject, tonnageBody, msg.threadId, rfc822Id)
