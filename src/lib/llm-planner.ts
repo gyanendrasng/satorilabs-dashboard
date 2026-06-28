@@ -614,11 +614,46 @@ export async function planNextSteps(args: {
   // We do NOT retry on planFailure(...) for application-logic reasons: only
   // on actual parse/validation/network failures.
   const PLANNER_LLM_ATTEMPTS = 3;
+  // Fallback model for the escalation ladder (below). Override via env; defaults
+  // to a more reliable Gemini model than the primary preview model.
+  const PLANNER_FALLBACK_MODEL = process.env.LLM_PLANNER_FALLBACK_MODEL || 'gemini-3.5-flash';
+  // 429 / quota detection so a throttled primary skips straight to the fallback.
+  const isRateLimitError = (e: unknown): boolean => {
+    const status = (e as { status?: unknown } | null)?.status;
+    const msg = (e instanceof Error ? e.message : String(e ?? '')).toLowerCase();
+    return (
+      status === 429 ||
+      msg.includes('429') ||
+      msg.includes('rate limit') ||
+      msg.includes('rate-limit') ||
+      msg.includes('too many requests') ||
+      msg.includes('quota') ||
+      msg.includes('resource_exhausted')
+    );
+  };
+
+  const baseModel = llm.config.model;
+  const baseTemp = llm.config.defaultTemperature;
   let result: Awaited<ReturnType<typeof llm.chat>> | null = null;
   let validated: ReturnType<typeof PlanResultSchema.safeParse> | null = null;
   let lastErr: unknown = null;
 
+  // Escalation ladder. We do NOT blindly re-send the same request — re-asking
+  // the identical model at the identical temperature reproduces the identical
+  // bad output (the array-wrap / missing-field / parse failures all did exactly
+  // that). Each retryable failure advances one rung:
+  //   1. Cool the temperature to 0 on the SAME model (format drift correlates
+  //      with higher temperature → a deterministic pass usually parses).
+  //   2. Already at temp 0 → fall back to PLANNER_FALLBACK_MODEL at temp 0.
+  // A rate-limit (429 / quota) on the primary skips straight to the fallback
+  // model — cooling a throttled model down won't help.
+  // `modelOverride === undefined` means the primary (env-configured) model.
+  let temperature = baseTemp;
+  let modelOverride: string | undefined = undefined;
+
   for (let attempt = 1; attempt <= PLANNER_LLM_ATTEMPTS; attempt++) {
+    const rungModel = modelOverride ?? baseModel;
+    let rateLimited = false;
     try {
       result = await llm.chat({
         // V3.0 sends the ENTIRE rendered prompt as one system message. The user
@@ -636,6 +671,8 @@ export async function planNextSteps(args: {
         // multi-step modify cycles. Lock the cap here so a low LLM_MAX_TOKENS
         // env value can't truncate the JSON mid-stream and fail the Zod parse.
         maxTokens: 50000,
+        temperature,
+        ...(modelOverride ? { modelOverride } : {}),
       });
 
       if (!result.text) {
@@ -644,46 +681,78 @@ export async function planNextSteps(args: {
         );
         result = null;
         console.warn(
-          `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} reason=empty-content`,
+          `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} ` +
+            `model=${rungModel} temp=${temperature} reason=empty-content`,
         );
-        continue;
-      }
+      } else {
+        // llm.chat() with requireJson=true already parsed JSON; if the model
+        // emitted something unparseable, chat() would have thrown above.
+        //
+        // Gemini's JSON mode (responseMimeType:'application/json') only
+        // guarantees VALID JSON — not a top-level object (unlike OpenAI's
+        // json_object). It occasionally wraps the single plan in a one-element
+        // array `[ { rationale, steps } ]`. Unwrap a lone single-element array
+        // so the object inside validates.
+        let candidate: unknown = result.json;
+        if (Array.isArray(candidate) && candidate.length === 1) {
+          console.warn(
+            `[PLANNER] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} ` +
+              `note=unwrapped single-element top-level array from ${result.provider}`,
+          );
+          candidate = candidate[0];
+        }
+        validated = PlanResultSchema.safeParse(candidate);
+        if (validated.success) {
+          break;
+        }
 
-      // llm.chat() with requireJson=true already parsed JSON; if the model
-      // emitted something unparseable, chat() would have thrown above and
-      // we'd already be in the catch block.
-      validated = PlanResultSchema.safeParse(result.json);
-      if (validated.success) {
-        break;
+        // Zod failed — log and escalate. Keep the raw response for debugging.
+        const raw = result.text;
+        const preview = raw.length > 600 ? raw.slice(0, 600) + '…' : raw;
+        console.warn(
+          `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} ` +
+            `model=${rungModel} temp=${temperature} reason=zod-fail ` +
+            `errors=${JSON.stringify(validated.error.issues)} raw=${preview}`,
+        );
+        lastErr = new Error(`Zod validation failed: ${validated.error.message}`);
+        result = null;
+        validated = null;
       }
-
-      // Zod failed — log and retry. Keep the raw response in the warn line
-      // for offline debugging.
-      const raw = result.text;
-      const preview = raw.length > 600 ? raw.slice(0, 600) + '…' : raw;
-      console.warn(
-        `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} reason=zod-fail ` +
-          `errors=${JSON.stringify(validated.error.issues)} raw=${preview}`,
-      );
-      lastErr = new Error(`Zod validation failed: ${validated.error.message}`);
-      result = null;
-      validated = null;
     } catch (e) {
       lastErr = e;
+      rateLimited = isRateLimitError(e);
       console.warn(
-        `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} reason=throw ` +
-          `error=${e instanceof Error ? e.message : String(e)}\n` +
-          `stack=${e instanceof Error && e.stack ? e.stack : '(no stack)'}`,
+        `[PLANNER_RETRY] soId=${args.salesOrderId} attempt=${attempt}/${PLANNER_LLM_ATTEMPTS} ` +
+          `model=${rungModel} temp=${temperature} reason=${rateLimited ? 'rate-limit' : 'throw'} ` +
+          `error=${e instanceof Error ? e.message : String(e)}`,
       );
       result = null;
       validated = null;
     }
 
-    // Backoff before the next attempt (skip after the last attempt).
-    if (attempt < PLANNER_LLM_ATTEMPTS) {
-      const backoffMs = 300 * attempt;
-      await new Promise((r) => setTimeout(r, backoffMs));
+    if (attempt >= PLANNER_LLM_ATTEMPTS) break;
+
+    // Advance the ladder for the NEXT attempt.
+    const prevRung = `${rungModel}@${temperature}`;
+    if (rateLimited && modelOverride === undefined) {
+      modelOverride = PLANNER_FALLBACK_MODEL; // throttled primary → switch model
+      temperature = 0;
+    } else if (temperature > 0) {
+      temperature = 0; // cool down on the same model
+    } else if (modelOverride === undefined) {
+      modelOverride = PLANNER_FALLBACK_MODEL; // already cool on primary → switch model
+      temperature = 0;
     }
+    const nextRung = `${modelOverride ?? baseModel}@${temperature}`;
+    if (nextRung !== prevRung) {
+      console.warn(
+        `[PLANNER] soId=${args.salesOrderId} escalating planner LLM: ${prevRung} → ${nextRung}`,
+      );
+    }
+
+    // Backoff before the next attempt.
+    const backoffMs = 300 * attempt;
+    await new Promise((r) => setTimeout(r, backoffMs));
   }
 
   if (!result || !validated || !validated.success) {
@@ -707,7 +776,8 @@ export async function planNextSteps(args: {
 
   console.log(
     `[PLANNER] soId=${args.salesOrderId} emailId=${args.triggerEmailId} sender=${args.sender} ` +
-      `steps=${v.steps.map((s) => s.kind).join(',') || '∅'} stopAfter=${stopAfterIndex} escalate=${v.escalate}`,
+      `model=${result.model} steps=${v.steps.map((s) => s.kind).join(',') || '∅'} ` +
+      `stopAfter=${stopAfterIndex} escalate=${v.escalate}`,
   );
 
   return {
