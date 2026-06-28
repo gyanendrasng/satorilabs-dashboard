@@ -228,12 +228,23 @@ class OpenAICompatibleClient implements ProviderClient {
     const start = Date.now();
     const requireJson = args.requireJson ?? true;
     const model = args.modelOverride || this.cfg.model;
+    const maxTok = args.maxTokens ?? this.cfg.defaultMaxTokens;
+    const temperature = args.temperature ?? this.cfg.defaultTemperature;
+
+    // OpenAI's gpt-5.x / o-series models renamed `max_tokens` →
+    // `max_completion_tokens` (sending the old name 400s) and only accept the
+    // DEFAULT temperature (a custom value 400s). The other OpenAI-compatible
+    // providers (groq, together, deepinfra, runpod) keep the classic
+    // `max_tokens` + `temperature` shape. `max_completion_tokens` is accepted by
+    // all current real-OpenAI chat models, so we send it for any `openai` model.
+    const isOpenAI = this.cfg.provider === 'openai';
+    const isReasoningModel = isOpenAI && /^(o\d|gpt-5)/i.test(model);
 
     const completion = await this.client.chat.completions.create({
       model,
       messages: args.messages,
-      max_tokens: args.maxTokens ?? this.cfg.defaultMaxTokens,
-      temperature: args.temperature ?? this.cfg.defaultTemperature,
+      ...(isOpenAI ? { max_completion_tokens: maxTok } : { max_tokens: maxTok }),
+      ...(isReasoningModel ? {} : { temperature }),
       ...(requireJson ? { response_format: { type: 'json_object' } as const } : {}),
     });
 
