@@ -2154,7 +2154,7 @@ export async function triggerLoneZmatana(
     payload: {
       instruction:
         `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
-        `Transaction LONE-ZMATANA for Sales Order number ${soNumber} for material ${materialList}.`,
+        `Transaction ZMATANA for Sales Order number ${soNumber} for material ${materialList}.`,
       transaction_code: 'LONE-ZMATANA',
       meta: {
         so_number: soNumber,
