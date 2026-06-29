@@ -91,7 +91,7 @@ const toRow = (db: DbRow): EditRow => ({
   freeStock: String(db.freeStock),
 });
 
-export default function InventoryPage() {
+export function InventoryEditor() {
   const [rows, setRows] = useState<EditRow[]>([]);
   const [baseline, setBaseline] = useState<Map<string, Baseline>>(new Map());
   const [loading, setLoading] = useState(true);
@@ -216,7 +216,12 @@ export default function InventoryPage() {
       const material = (r.isNew ? r.material : r.origMaterial).trim();
       const plant = (r.isNew ? r.plant : r.origPlant).trim();
       if (r.isNew) {
-        const blank = !material && !plant && r.materialDescription.trim() === '' && r.vertical.trim() === '' && r.freeStock.trim() === '';
+        const blank =
+          !material &&
+          !plant &&
+          r.materialDescription.trim() === '' &&
+          r.vertical.trim() === '' &&
+          r.freeStock.trim() === '';
         if (blank) continue; // an untouched blank new row is ignored, not an error
         if (!material || !plant) return 'New rows need both a material code and a plant.';
         if (r.freeStock.trim() === '' || !Number.isInteger(Number(r.freeStock)) || Number(r.freeStock) < 0)
@@ -275,7 +280,7 @@ export default function InventoryPage() {
   const dirtyCount = changes.length;
 
   return (
-    <div className="mx-auto max-w-6xl p-6 space-y-4">
+    <div className="space-y-4">
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -476,8 +481,7 @@ function ChangeLine({ change, baseline }: { change: Change; baseline: Map<string
     return (
       <div className="rounded border border-emerald-200 bg-emerald-50 px-2 py-1">
         <Badge variant="secondary" className="mr-2 bg-emerald-600 text-white">ADD</Badge>
-        <span className="font-mono">{label}</span> — free stock{' '}
-        <b>{change.freeStock}</b>
+        <span className="font-mono">{label}</span> — free stock <b>{change.freeStock}</b>
         {change.vertical ? `, vertical ${change.vertical}` : ''}
         {change.materialDescription ? `, “${change.materialDescription}”` : ''}
       </div>

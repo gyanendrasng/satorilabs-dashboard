@@ -31,11 +31,13 @@ import {
   Trash2,
   ArrowDown,
   ListChecks,
+  Boxes,
 } from 'lucide-react';
 import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, Bundle, groupItemsByLsNumber } from '@/components/orders/types';
 import { BundleVehicleEditor } from '@/components/orders/BundleVehicleEditor';
 import { AGENT_SCREENS } from '@/lib/agent-screens';
 import { SatoriWordmark } from '@/components/work/SatoriBrand';
+import { InventoryEditor } from '@/components/inventory/InventoryEditor';
 
 interface ChatMessage {
   id: string;
@@ -56,7 +58,7 @@ interface WorkSession {
 
 export default function WorkV2Page() {
   // Active tab state
-  const [activeTab, setActiveTab] = useState<'hierarchy' | 'chat' | 'screen' | 'queue' | 'logs'>('hierarchy');
+  const [activeTab, setActiveTab] = useState<'hierarchy' | 'chat' | 'screen' | 'queue' | 'logs' | 'inventory'>('hierarchy');
 
   // Work queue state
   interface QueueItem {
@@ -796,6 +798,7 @@ export default function WorkV2Page() {
     { id: 'screen', label: 'Agent Screen', icon: Monitor },
     { id: 'queue', label: 'Work Queue', icon: ListChecks },
     { id: 'logs', label: 'Logs', icon: ScrollText },
+    { id: 'inventory', label: 'Inventory', icon: Boxes },
   ];
   const activeQueueCount = queueItems.filter((i) => i.state === 'queued' || i.state === 'firing').length;
 
@@ -1338,6 +1341,9 @@ export default function WorkV2Page() {
             <WorkChat session={chat} onUpdateTitle={handleUpdateTitle} />
           </div>
         )}
+
+        {/* Inventory Tab */}
+        {activeTab === 'inventory' && <InventoryEditor />}
 
         {/* Agent Screen Tab */}
         {activeTab === 'screen' && (
