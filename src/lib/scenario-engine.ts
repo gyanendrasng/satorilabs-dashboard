@@ -3589,6 +3589,43 @@ export async function maybeAdvanceScenario(
     }
   }
 
+  // Multi-fire barrier: a SINGLE engine step can enqueue MORE THAN ONE WorkQueue
+  // row — zload2 and zloading_close fire one row per loading slip, so a modify
+  // that touches materials on different LSs of the same bundle fans out into
+  // several SAP transactions. Each row's completion calls back here, but the
+  // step is only truly finished when EVERY one of its rows is done. Advancing on
+  // the FIRST callback lets the next step read half-applied SAP state — the
+  // reported bug: the vehicle-details email ran between the two zload2 callbacks
+  // and printed a bundle weight that counted the increased LS but not yet the
+  // decreased one (~11.44 t instead of ~10.78 t).
+  //
+  // So: while any sibling row for this SO + step is still queued/firing, hold —
+  // the LAST row's callback finds none pending and advances. The just-completed
+  // row is already `done` (markDone runs before this in /step-status), so it is
+  // not counted. This relies on auto_gui2 posting the data callback
+  // (e.g. /zload2-data, which reconciles LSIs + recomputes Bundle.totalWeightKg)
+  // BEFORE the step-status 'done' webhook — the same ordering the zload1
+  // vehicle-email gate already depends on — so "all rows done" ⇒ "all data
+  // reconciled". Single-fire and sentinel steps (va02, await_vt01n, …) have ≤1
+  // matching row, so this is a harmless no-op for them.
+  const barrierStep = STEP_TO_WORK_STEP[currentStep.kind];
+  if (barrierStep) {
+    const pending = await prisma.workQueue.count({
+      where: {
+        salesOrderId,
+        step: barrierStep,
+        state: { in: ['queued', 'firing'] },
+      },
+    });
+    if (pending > 0) {
+      console.log(
+        `[ENGINE] maybeAdvanceScenario — ${currentStep.kind} for SO ${salesOrderId} still has ` +
+          `${pending} ${barrierStep} transaction(s) in flight; holding until all complete`,
+      );
+      return;
+    }
+  }
+
   await advanceScenario(salesOrderId);
 }
 
