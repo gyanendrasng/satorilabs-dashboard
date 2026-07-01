@@ -246,16 +246,21 @@ recipient's side even when we pass the right `threadId`. Anchoring lives in
 | Stakeholder | Thread key | Shared subject | Where stored |
 |---|---|---|---|
 | Branch | per **PO** (the NEW ORDER thread) | `Re: <NEW ORDER subject>` | `PurchaseOrder.branchThreadId` / `branchAnchorMsgId` / `branchSubject` |
-| Plant | per **(PO, plant email)** | `Loading Slips - PO <poNumber>` | `PoRecipientThread` (`@@unique([purchaseOrderId, recipientEmail])`) |
+| Plant | per **loading slip** (de-unified) | `Loading Slip <ls> - SO <so>` (distinct per LS) | thread reused from the first `plant_ls` `Email` row for that `loadingSlipId` |
 | Production | per **PO** | `Material readiness - PO <poNumber>` | `PoRecipientThread`, `kind='production'` |
 
 - **Branch** subject is the branch's own NEW ORDER subject, captured at intake
   (`branchSubject`) and reused as `Re: <subject>` by `resolvePoThreadAnchor(po,'branch')`.
   The per-step purpose (vehicle details, dispatch confirmation, …) moves to the
   body's first line via `withPurposeLine` / `withPurposeLineHtml`.
-- **Plant** is per (PO, plant) so a PO that dispatches from several plants gets
-  one thread per plant (one email per loading slip is unchanged). The LS number
-  lives in the body + attachment filename, not the subject.
+- **Plant** is per **loading slip** — the per-plant unification was reverted on
+  the plant side only. The plant receives one email per LS, each in its OWN
+  thread under a distinct `Loading Slip <ls> - SO <so>` subject, and replies to
+  each with that LS's invoice — so every reply carries exactly **one** invoice
+  (no multi-invoice-in-one-thread ambiguity). A modify re-send of the SAME LS
+  threads back into that LS's conversation (looked up by `loadingSlipId`); a
+  brand-new LS opens a fresh thread. `sendLSEmail` no longer reads/writes the
+  `PoRecipientThread` (`kind='plant'`) anchor.
 - **Subject changes do NOT affect reply detection.** The matcher (§4) keys only on
   `threadId` + the `In-Reply-To` chain. Unifying subjects only changes how the
   *recipient's* client groups messages; our routing is unchanged.
@@ -595,3 +600,14 @@ sqlite3 prisma/dev.db "
   subject, so the `is:unread` NEW ORDER scan could no longer tell a fresh order
   from a reply by subject alone. The reply matcher is unchanged.
   (Touched: `email-reply-checker.ts`, `gmail.ts`.)
+- **2026-07-01** — **De-unified plant threading: one thread per loading slip.**
+  `sendLSEmail` no longer anchors on the per-(PO, plant) `PoRecipientThread`;
+  each LS opens its own thread under a distinct `Loading Slip <ls> - SO <so>`
+  subject (modify re-sends of the same LS thread back in, looked up by
+  `loadingSlipId`). Branch/production unification is unchanged. Why: with the
+  unified plant thread, a plant replying once with several invoice PDFs landed
+  on a single outbound and only `attachments[0]` was ingested (the rest dropped,
+  the other LSs' `plant_ls` rows never completed → ZLOAD3 stalled). Per-LS
+  threads make each reply carry exactly one invoice, so the existing one-PDF-per
+  -reply ingestion is correct. The matcher (§4) is unchanged — it never read the
+  subject. (Touched: `email-service.ts`; doc §4b.)

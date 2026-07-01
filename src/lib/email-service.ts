@@ -1,11 +1,6 @@
 import { prisma } from './prisma';
 import { sendEmail, sendReplyEmailWithAttachment, getMessageRfc822Id } from './gmail';
-import {
-  resolveRecipientThreadAnchor,
-  captureRecipientThreadAnchor,
-  plantThreadSubject,
-  withPurposeLine,
-} from './po-thread';
+import { withPurposeLine } from './po-thread';
 
 interface VehicleDetails {
   vehicleNumber?: string | null;
@@ -34,7 +29,6 @@ export async function sendLSEmail(
     select: {
       loadingSlipId: true,
       loadingSlip: { select: { plantEmail: true } },
-      salesOrder: { select: { purchaseOrderId: true, purchaseOrder: { select: { poNumber: true } } } },
     },
   });
   const envPlantEmail = process.env.PLANT_EMAIL || '';
@@ -81,33 +75,43 @@ export async function sendLSEmail(
       : 'application/pdf';
 
   try {
-    // Anchor on the per-(PO, plant) thread so every outbound to THIS plant for
-    // this PO (each LS forward, modified LS, etc.) stays in one conversation —
-    // keyed by the plant's email so a PO that dispatches from several plants
-    // gets one thread per plant. First outbound to the plant captures the
-    // thread under the shared umbrella subject.
-    const poId = lsiRow?.salesOrder?.purchaseOrderId ?? null;
-    const poNumber = lsiRow?.salesOrder?.purchaseOrder?.poNumber ?? null;
-    const anchor = poId ? await resolveRecipientThreadAnchor(poId, plantEmail) : null;
-    const threadSubject = anchor?.subject ?? (poNumber ? plantThreadSubject(poNumber) : purposeLabel);
+    // Plant threading is per-LOADING-SLIP, NOT unified per plant. Every LS gets
+    // its OWN conversation: the plant receives one email per LS (its own thread,
+    // its own subject) and replies to each with that LS's invoice — so every
+    // reply maps unambiguously to one LS + one invoice (no multi-invoice-in-one
+    // -thread ambiguity). The BRANCH side stays unified via a separate per-PO
+    // anchor; only the plant side is de-unified here.
+    //
+    // A re-send of the SAME LS (a modify re-forward) threads back into that LS's
+    // existing conversation; a brand-new LS opens a fresh thread. We find the
+    // existing thread from the FIRST plant_ls Email row for this loadingSlip.
+    const priorLsEmail = lsiRow?.loadingSlipId
+      ? await prisma.email.findFirst({
+          where: {
+            loadingSlipId: lsiRow.loadingSlipId,
+            emailType: 'plant_ls',
+            recipientEmail: plantEmail,
+          },
+          orderBy: { sentAt: 'asc' },
+          select: { gmailMessageId: true, gmailThreadId: true, subject: true },
+        })
+      : null;
 
+    const threadSubject = priorLsEmail?.subject ?? purposeLabel;
     const attachment = { filename, content: fileBuffer, mimeType };
-    const sent = anchor
-      ? await sendReplyEmailWithAttachment(plantEmail, threadSubject, body, anchor.threadId, anchor.rfc822MessageId ?? '', attachment)
-      : await sendEmail(plantEmail, threadSubject, body, attachment);
-    const { messageId, threadId } = sent;
 
-    if (poId && !anchor) {
-      const rfc822 = await getMessageRfc822Id(messageId);
-      await captureRecipientThreadAnchor({
-        purchaseOrderId: poId,
-        recipientEmail: plantEmail,
-        kind: 'plant',
-        threadId,
-        rfc822MessageId: rfc822 ?? null,
-        subject: threadSubject,
-      });
+    let sent: { messageId: string; threadId: string };
+    if (priorLsEmail?.gmailThreadId && priorLsEmail.gmailMessageId) {
+      // Reply into this LS's existing thread so the revision stays in context.
+      const priorRfc822 = await getMessageRfc822Id(priorLsEmail.gmailMessageId);
+      sent = priorRfc822
+        ? await sendReplyEmailWithAttachment(plantEmail, threadSubject, body, priorLsEmail.gmailThreadId, priorRfc822, attachment)
+        : await sendEmail(plantEmail, threadSubject, body, attachment);
+    } else {
+      // First email for this LS — open a fresh thread under the per-LS subject.
+      sent = await sendEmail(plantEmail, threadSubject, body, attachment);
     }
+    const { messageId, threadId } = sent;
 
     console.log(`[Email] Successfully sent LS ${lsNumber} for SO ${soNumber} - messageId: ${messageId}, threadId: ${threadId}`);
 
