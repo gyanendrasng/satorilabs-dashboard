@@ -3,7 +3,7 @@ import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { checkAndSendCombinedVehicleEmailForPo } from '@/lib/auto-gui-trigger';
 import { parseLoadingSlipPdf, type ParsedLoadingSlip } from '@/lib/ls-pdf-parser';
-import { resolveLsiCode, normaliseLsiDesc, type LsiMatEntry } from '../zload2-data/route';
+import { resolveLsiCode, normaliseLsiDesc, normaliseBatchToken, type LsiMatEntry } from '../zload2-data/route';
 // linkLsiToBundle was removed in the LoadingSlip refactor — LSIs reach a
 // bundle via their parent LoadingSlip now.
 
@@ -260,13 +260,16 @@ export async function POST(request: Request) {
       // whose Material batch had drifted fell straight to the family prefix.
       const matEntries: LsiMatEntry[] = [];
       for (const m of soMaterials) {
-        if (!m.materialDescription) continue;
-        const desc = normaliseLsiDesc(m.materialDescription);
+        // Keep materials even without a description — an empty desc can't match
+        // by text but its batch still feeds resolveLsiCode's unique-batch tier.
+        const desc = m.materialDescription ? normaliseLsiDesc(m.materialDescription) : '';
         const batchTokens = String(m.batch ?? '')
           .split(',')
-          .map((b) => b.trim())
+          .map((b) => normaliseBatchToken(b))
           .filter((b) => b.length > 0);
-        matEntries.push({ desc, batchTokens: [...batchTokens, normaliseLsiDesc(m.batch ?? '')], code: m.material });
+        const joined = normaliseBatchToken(m.batch ?? '');
+        if (joined) batchTokens.push(joined);
+        matEntries.push({ desc, batchTokens, code: m.material });
       }
 
       for (const item of parsed.items) {

@@ -3,6 +3,7 @@ import { prisma } from '@/lib/prisma';
 import { uploadToS3 } from '@/lib/s3';
 import { parseLoadingSlipPdf, type ParsedLoadingSlip } from '@/lib/ls-pdf-parser';
 import { resolvePlantEmailForLoadingSlip } from '@/lib/plant-resolver';
+import { normaliseForMatch } from '@/lib/text-normalize';
 
 /**
  * Confidence threshold below which we stop trusting the PDF parser. Mirrors
@@ -21,25 +22,42 @@ export interface LsiMatEntry {
   code: string;
 }
 
-/** Normalise a description for prefix matching: uppercase, single spaces, trimmed. */
+/** Comparison key for a description: fully sanitised (invisible / zero-width /
+ *  non-breaking chars folded away, NFKC, whitespace collapsed) + upper-cased.
+ *  Thin wrapper so the exported name and existing callers stay stable. */
 export function normaliseLsiDesc(s: string): string {
-  return s.toUpperCase().replace(/\s+/g, ' ').trim();
+  return normaliseForMatch(s);
+}
+
+/** Comparison key for a batch token: same sanitisation as descriptions. Batch
+ *  codes (e.g. "AN-72") are short and exact — the strongest signal we have when
+ *  a description is missing or garbled. */
+export function normaliseBatchToken(s: string): string {
+  return normaliseForMatch(s);
 }
 
 /**
  * Resolve a PDF row (description, batch) to a real SAP code against the SO's
  * indexed Material rows. Pure + exported so it is unit-testable in isolation.
  *
- * Two-tier match, both requiring a UNIQUE description hit:
- *   1. batch-qualified — description prefix-matches (either direction, since the
- *      PDF text layer truncates long descriptions) AND the PDF batch token is
- *      one of the Material's batch tokens. Strongest signal.
- *   2. description-only fallback — when the batch doesn't line up (e.g. the
- *      Material row still carries a stale 'N/A' batch while the PDF prints the
- *      real "P"), accept a UNIQUE description match. Far safer than the caller's
- *      last-resort family-prefix fallback, which yields a wrong code (e.g.
- *      "OOWJ") and breaks PlantResolver. A description shared by 2+ materials
- *      stays unresolved (returns undefined) so the caller treats it as ambiguous.
+ * Inputs are fully sanitised (see text-normalize.ts) so a lone invisible /
+ * non-breaking character can no longer defeat the comparison.
+ *
+ * Three tiers, tried in decreasing confidence; each resolves only when its
+ * signal is UNAMBIGUOUS (exactly one candidate), else we fall through:
+ *   1. desc + batch — description prefix-matches (either direction; the PDF text
+ *      layer truncates long descriptions) AND the batch token matches. Strongest.
+ *   2. unique description — a single material's description matches (its batch
+ *      may be a stale 'N/A' on the Material row while the PDF prints the real one).
+ *   3. unique batch — NEW safety net. The batch token maps to exactly one
+ *      material on the SO, regardless of description. This covers the failure
+ *      that motivated this rewrite: the Material row's LLM-extracted description
+ *      was absent/garbled so tiers 1–2 found nothing, yet the batch ("AN-72")
+ *      still pins the code exactly. Shared batches like "P" hit many lines →
+ *      ambiguous → this never mis-fires on them.
+ *
+ * If every tier is ambiguous/empty we return undefined and the caller keeps its
+ * family-prefix fallback (logged loudly) rather than guessing wrong.
  */
 export function resolveLsiCode(
   matEntries: LsiMatEntry[],
@@ -47,17 +65,28 @@ export function resolveLsiCode(
   rawBatch: string,
 ): string | undefined {
   const d = normaliseLsiDesc(rawDesc);
-  const b = rawBatch.trim();
-  const batchHits = new Set<string>();
-  const descHits = new Set<string>();
+  const b = normaliseBatchToken(rawBatch);
+
+  const descAndBatch = new Set<string>(); // desc matches AND batch matches
+  const descOnly = new Set<string>();     // desc matches (any batch)
+  const batchOnly = new Set<string>();    // batch matches (any/no desc)
+
   for (const e of matEntries) {
-    const descMatch = e.desc === d || e.desc.startsWith(d) || d.startsWith(e.desc);
+    const batchMatch = b.length > 0 && e.batchTokens.includes(b);
+    if (batchMatch) batchOnly.add(e.code);
+
+    // An empty stored description can't disambiguate by text — skip the desc
+    // tiers for it, but it still contributes its batch to tier 3 above.
+    const descMatch =
+      e.desc.length > 0 && (e.desc === d || e.desc.startsWith(d) || d.startsWith(e.desc));
     if (!descMatch) continue;
-    descHits.add(e.code);
-    if (e.batchTokens.includes(b)) batchHits.add(e.code);
+    descOnly.add(e.code);
+    if (batchMatch) descAndBatch.add(e.code);
   }
-  if (batchHits.size === 1) return [...batchHits][0];
-  if (descHits.size === 1) return [...descHits][0];
+
+  if (descAndBatch.size === 1) return [...descAndBatch][0];
+  if (descOnly.size === 1) return [...descOnly][0];
+  if (batchOnly.size === 1) return [...batchOnly][0];
   return undefined;
 }
 
@@ -231,13 +260,16 @@ export async function POST(request: Request) {
     // row resolves to the real code instead of the family prefix.
     const matEntries: LsiMatEntry[] = [];
     for (const m of soMaterials) {
-      if (!m.materialDescription) continue;
-      const desc = normaliseLsiDesc(m.materialDescription);
+      // Keep materials even without a description — an empty desc can't match by
+      // text but its batch still feeds resolveLsiCode's unique-batch tier.
+      const desc = m.materialDescription ? normaliseLsiDesc(m.materialDescription) : '';
       const batchTokens = String(m.batch ?? '')
         .split(',')
-        .map((b) => b.trim())
+        .map((b) => normaliseBatchToken(b))
         .filter((b) => b.length > 0);
-      matEntries.push({ desc, batchTokens: [...batchTokens, normaliseLsiDesc(m.batch ?? '')], code: m.material });
+      const joined = normaliseBatchToken(m.batch ?? '');
+      if (joined) batchTokens.push(joined);
+      matEntries.push({ desc, batchTokens, code: m.material });
     }
 
     // Build the set of (material, batch) the regenerated PDF reports.

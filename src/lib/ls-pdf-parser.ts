@@ -40,6 +40,7 @@
  */
 
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { sanitizeText } from './text-normalize';
 
 export interface ParsedLineItem {
   /** 1-based serial number on the slip. */
@@ -111,9 +112,15 @@ async function extractTextItems(pdfBuffer: Buffer): Promise<TextItem[]> {
     const page = await doc.getPage(i);
     const content = await page.getTextContent();
     for (const raw of content.items as Array<{ str: string; transform: number[] }>) {
-      if (!raw.str || !raw.str.trim()) continue;
+      // Sanitise at the source: fold/strip invisible, zero-width and
+      // non-breaking characters the SAP text layer injects, so every
+      // downstream token (material-code detection, description, batch)
+      // compares reliably. This is where a lone U+00A0 / U+200B between
+      // "IV" and "BR" used to poison the whole match.
+      const str = sanitizeText(raw.str);
+      if (!str) continue;
       items.push({
-        str: raw.str.trim(),
+        str,
         x: raw.transform[4],
         // Stack pages: offset y by a big page-index multiplier so page-2
         // items sort below page-1 items.

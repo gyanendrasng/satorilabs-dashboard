@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { getProduct } from '@/lib/product-db';
+import { sanitizeText } from '@/lib/text-normalize';
 
 /** One material row in a LONE-ZMATANA response. Mirrors the visibility-data
  *  material shape. */
@@ -113,7 +114,7 @@ export async function POST(request: Request) {
       // one, else fall back to the static DB (null when neither has it).
       const product = getProduct(materialCode);
       const materialDescription =
-        m.material_description ?? product?.material_description ?? null;
+        sanitizeText(m.material_description ?? product?.material_description) || null;
 
       // We do NOT touch orderQuantity OR orderWeightKg on update. Both are
       // FULL-order fields owned by the SO line (VA02 sets the quantity; the

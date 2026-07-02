@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { randomUUID } from 'node:crypto';
 import { prisma } from '@/lib/prisma';
 import { assembleAndSendCombinedEmail } from '@/lib/auto-gui-trigger';
+import { sanitizeText } from '@/lib/text-normalize';
 
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
 
@@ -153,7 +154,15 @@ export async function POST(request: Request) {
       // Only include fields the payload actually provided, so a sparse entry
       // doesn't clobber a fully-populated existing row.
       const data: Record<string, unknown> = {};
-      if (raw.material_description !== undefined) data.materialDescription = raw.material_description ?? null;
+      // Only overwrite the description when THIS run actually carries one — never
+      // wipe a good description from a prior run with null. A later ZSO-VISIBILITY
+      // run whose LLM failed to extract a product's description would otherwise
+      // blank it, and ZLOAD1/2's PDF reconcile then skips the row and falls back
+      // to the family prefix ("OT2FJ"), corrupting plant routing + weight + email.
+      // Mirrors the guard in zmatana-data. Sanitise so stored text is free of the
+      // invisible chars that break matching.
+      const cleanDesc = sanitizeText(raw.material_description);
+      if (cleanDesc) data.materialDescription = cleanDesc;
       if (hasBatch) data.batch = batch;
       if (hasOrderQty) data.orderQuantity = raw.order_quantity;
       if (raw.available_stock_for_so !== undefined && raw.available_stock_for_so !== null) {
@@ -176,7 +185,7 @@ export async function POST(request: Request) {
           data: {
             salesOrderId: salesOrder.id,
             material: materialCode,
-            materialDescription: raw.material_description ?? null,
+            materialDescription: sanitizeText(raw.material_description) || null,
             batch,
             orderQuantity: raw.order_quantity as number,
             availableStock: raw.available_stock_for_so ?? null,
