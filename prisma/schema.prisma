@@ -209,8 +209,8 @@ model Shipment {
   id                  String    @id @default(cuid())
   bundleId            String
   salesOrderId        String
-  obdNumber           String?   // delivery_no — the Outbound Delivery / Dispatch Document
-  invoiceNumber       String?   // invoice_no — the HRJ Invoice
+  obdNumber           String?   @unique // delivery_no — ONE Shipment per OBD (a delivery groups several LSs); the VT01N unit
+  invoiceNumber       String?   // invoice_no — representative HRJ invoice for the OBD (per-LS invoices live on LoadingSlip)
   invoiceDate         DateTime?
   sapResults          String?   // JSON: full /processing-data rows for forensics
   status              String    @default("created") // created | shipment-triggered | shipped
@@ -227,7 +227,6 @@ model Shipment {
   salesOrder SalesOrder       @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   items      LoadingSlipItem[]
 
-  @@unique([bundleId, salesOrderId])
   @@map("shipment")
 }
 
@@ -465,6 +464,14 @@ model LoadingSlip {
   plantEmail   String   // recipient of plant_ls email (today: process.env.PLANT_EMAIL)
   fileUrl      String?  // R2 key for the LS PDF returned by ZLOAD1
   status       String   @default("pending") // pending, sent_to_plant, invoiced, completed
+  // Per-LS invoice mapping — RESERVED, populated later. The ZLOAD3 payload has
+  // no ls_number (rows are keyed by material_doc), so we can't yet reliably pin
+  // an invoice to its loading slip; these stay null until the SAP LS→invoice
+  // mapping is supplied, then backfilled. Meanwhile the delivery/OBD + its
+  // invoices are captured on Shipment (per OBD).
+  obdNumber     String?
+  invoiceNumber String?
+  invoiceDate   DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

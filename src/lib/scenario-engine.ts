@@ -840,24 +840,18 @@ async function sendPlannerQuestionEmail(args: {
 
   // Resolve the right thread + shared subject for this recipient:
   //   branch  → the per-PO branch conversation (Re: <NEW ORDER subject>).
-  //   plant   → the per-(PO, plant) thread keyed by the plant's email, so all
-  //             of that plant's conversation (LS + clarifications) is one thread.
+  //   plant   → the specific LOADING-SLIP conversation the plant replied on
+  //             (plant threading is per-LS; see email-service.sendLSEmail).
   //   supervisor → always a fresh thread with its own descriptive subject.
   const {
     resolvePoThreadAnchor,
     capturePoThreadAnchor,
-    resolveRecipientThreadAnchor,
-    captureRecipientThreadAnchor,
-    plantThreadSubject,
     withPurposeLine,
   } = await import('./po-thread');
 
   let threadId: string | null = null;
   let inReplyTo: string | null = null;
   let subject = purposeLabel; // supervisor / fallback
-  // For a plant first-send we must capture the new thread under the umbrella
-  // plant subject so later loading slips join it.
-  let capturePlant = false;
 
   if (recipientRole === 'branch' && so.purchaseOrderId && !freshThread) {
     const a = await resolvePoThreadAnchor(so.purchaseOrderId, 'branch');
@@ -866,15 +860,26 @@ async function sendPlannerQuestionEmail(args: {
       inReplyTo = a.rfc822MessageId;
       if (a.subject) subject = a.subject;
     }
-  } else if (recipientRole === 'plant' && so.purchaseOrderId && !freshThread) {
-    const a = await resolveRecipientThreadAnchor(so.purchaseOrderId, recipient);
-    if (a) {
-      threadId = a.threadId;
-      inReplyTo = a.rfc822MessageId;
-      subject = a.subject;
-    } else if (so.purchaseOrder?.poNumber) {
-      subject = plantThreadSubject(so.purchaseOrder.poNumber);
-      capturePlant = true;
+  } else if (recipientRole === 'plant' && !freshThread) {
+    // Plant threading is per-LOADING-SLIP. A clarification is a follow-up to the
+    // plant's reply on ONE loading slip's thread, so thread it back INTO that
+    // conversation via the trigger email (the plant_ls outbound the plant
+    // replied to). Threading off the retired per-(PO,plant) anchor would land
+    // the question in a disconnected thread, and any invoice the plant
+    // re-attaches there would match the plant_clarify row instead of the
+    // plant_ls row — missing the per-bundle invoice gate
+    // (checkAndSendBatchToAman). If the trigger thread can't be resolved, fall
+    // back to a fresh thread (safe for a pre-LS clarify).
+    if (triggerEmailId) {
+      const trig = await prisma.email.findUnique({
+        where: { id: triggerEmailId },
+        select: { gmailThreadId: true, gmailMessageId: true, subject: true },
+      });
+      if (trig?.gmailThreadId && trig.gmailMessageId) {
+        threadId = trig.gmailThreadId;
+        inReplyTo = await getMessageRfc822Id(trig.gmailMessageId);
+        if (trig.subject) subject = trig.subject;
+      }
     }
   }
 
@@ -890,20 +895,12 @@ async function sendPlannerQuestionEmail(args: {
     log(`[PlannerQ:${recipientRole}] reply-in-thread failed (${err instanceof Error ? err.message : err}); sending as new email`);
     sent = await sendPlainEmail(recipient, subject, sendBody);
   }
-  // Capture the anchor on first send so subsequent emails join this thread.
+  // Capture the branch anchor on first send so subsequent branch emails join
+  // this thread. (Plant is per-LS now — there is no plant anchor to capture;
+  // the clarification simply joined the trigger LS's thread above.)
   if (recipientRole === 'branch' && so.purchaseOrderId && !threadId && !freshThread) {
     const rfc822 = await getMessageRfc822Id(sent.messageId);
     if (rfc822) await capturePoThreadAnchor(so.purchaseOrderId, 'branch', sent.threadId, rfc822);
-  } else if (recipientRole === 'plant' && so.purchaseOrderId && capturePlant) {
-    const rfc822 = await getMessageRfc822Id(sent.messageId);
-    await captureRecipientThreadAnchor({
-      purchaseOrderId: so.purchaseOrderId,
-      recipientEmail: recipient,
-      kind: 'plant',
-      threadId: sent.threadId,
-      rfc822MessageId: rfc822 ?? null,
-      subject,
-    });
   }
 
   await prisma.email.create({
