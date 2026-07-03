@@ -100,6 +100,23 @@ export async function checkForReplies(): Promise<{
     log(`  - SO ${soNumber}: ${emails.length} pending emails`);
   }
 
+  // Fetch each Gmail thread AT MOST ONCE per tick. Many outbound Email rows
+  // share a thread (per-PO branch thread, per-(PO,plant) plant thread, plant_ls
+  // fan-out), so we used to re-download the whole thread once per email row —
+  // dozens of identical threads.get calls that tripped Gmail's per-user rate
+  // limit. The thread contents don't change within a single tick, and the
+  // per-outbound In-Reply-To matching below still runs per email row against
+  // this shared snapshot, so correctness is unchanged. If a fetch throws it is
+  // NOT cached, so the next email on that thread retries exactly as before.
+  const threadCache = new Map<string, Awaited<ReturnType<typeof getThreadMessages>>>();
+  const getThreadMessagesCached = async (threadId: string) => {
+    const cached = threadCache.get(threadId);
+    if (cached) return cached;
+    const msgs = await getThreadMessages(threadId);
+    threadCache.set(threadId, msgs);
+    return msgs;
+  };
+
   for (const email of pendingEmails) {
     const soNumber = email.salesOrder?.soNumber || 'unknown';
     const lsNumber = email.loadingSlipItem?.lsNumber || 'N/A';
@@ -107,8 +124,8 @@ export async function checkForReplies(): Promise<{
     try {
       log(`[EmailChecker] Checking thread ${email.gmailThreadId} for SO ${soNumber} / LS ${lsNumber}`);
 
-      // Get all messages in the thread
-      const messages = await getThreadMessages(email.gmailThreadId);
+      // Get all messages in the thread (deduped per tick — see threadCache above)
+      const messages = await getThreadMessagesCached(email.gmailThreadId);
 
       // CRITICAL: multiple of OUR outbound emails can sit on the same Gmail
       // thread (e.g. when we fan out N plant_ls emails for N loading slips
@@ -141,9 +158,32 @@ export async function checkForReplies(): Promise<{
       // the full thread chain), because every reply in the thread would
       // then look like a reply to every prior outbound — the false-
       // positive bug we hit before with plant_ls fan-out.
-      const ourRfc822Id = await getMessageRfc822Id(email.gmailMessageId);
+      // Our outbound's RFC822 Message-ID is immutable once sent, so read it from
+      // the cached column. Only on a cache miss (existing rows pre-dating this
+      // column, or a brand-new email's first poll) do we call Gmail once, then
+      // persist it so every future tick reads it from the DB. This removes the
+      // per-email getMessageRfc822Id call that ran every minute forever.
+      let ourRfc822Id = email.rfc822MessageId;
       if (!ourRfc822Id) {
-        log(`[EmailChecker] Could not fetch RFC822 Message-ID for email ${email.id} (gmailMessageId=${email.gmailMessageId}) — skipping thread`);
+        ourRfc822Id = await getMessageRfc822Id(email.gmailMessageId);
+        if (ourRfc822Id) {
+          try {
+            await prisma.email.update({
+              where: { id: email.id },
+              data: { rfc822MessageId: ourRfc822Id },
+            });
+          } catch (persistErr) {
+            // Non-fatal: we still have the value for this tick; we'll just
+            // re-fetch next tick if the write didn't land.
+            log(
+              `[EmailChecker] Failed to cache rfc822MessageId for email ${email.id}: ` +
+                `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+            );
+          }
+        }
+      }
+      if (!ourRfc822Id) {
+        log(`[EmailChecker] Could not resolve RFC822 Message-ID for email ${email.id} (gmailMessageId=${email.gmailMessageId}) — skipping thread`);
         continue;
       }
 

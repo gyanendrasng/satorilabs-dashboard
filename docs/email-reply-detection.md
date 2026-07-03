@@ -611,3 +611,25 @@ sqlite3 prisma/dev.db "
   threads make each reply carry exactly one invoice, so the existing one-PDF-per
   -reply ingestion is correct. The matcher (§4) is unchanged — it never read the
   subject. (Touched: `email-service.ts`; doc §4b.)
+
+- **2026-07-03** — **Cut Gmail API call volume in `checkForReplies` (rate-limit
+  fix).** The poller was making ~2 Gmail calls per pending Email row every tick
+  (`threads.get` + `getMessageRfc822Id`), regardless of whether any new mail
+  existed — ~90 calls/min against one mailbox, which tripped Gmail's per-user
+  rate limit (`User-rate limit exceeded`) and cascaded into every remaining
+  email erroring for the rest of the tick. Two changes, **neither of which
+  touches the matcher (§4)**:
+  1. **Per-tick thread dedup.** Many Email rows share one Gmail thread (per-PO
+     branch, per-(PO,plant) plant, plant_ls fan-out), so we now fetch each
+     unique `threadId` at most once per tick (`threadCache` /
+     `getThreadMessagesCached`) and run the same per-outbound In-Reply-To walk
+     against that shared snapshot. Thread contents don't change within a tick.
+  2. **Cache the RFC822 Message-ID.** New nullable `Email.rfc822MessageId`
+     column. The value is immutable once sent, so `checkForReplies` reads it
+     from the DB and only calls `getMessageRfc822Id` on a cache miss (rows
+     predating the column, or a brand-new email's first poll), then persists it.
+     Backfills lazily over the first tick or two; steady state is ~1 call per
+     unique thread. No send-site changes (there are ~40) — the checker is the
+     single choke point. Follow-up detection, `status='replied'` polling, the
+     `ProcessedEmail` dedup, and the `replyHtml` invariant are all unchanged.
+     (Touched: `email-reply-checker.ts`, `prisma/schema.prisma`.)

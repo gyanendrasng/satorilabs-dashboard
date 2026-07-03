@@ -546,6 +546,12 @@ model Email {
   bundleId          String?   // For per-bundle (per-truck) emails — vehicle details, etc.
   gmailMessageId    String    @unique // Gmail message ID for reply tracking
   gmailThreadId     String             // Thread ID to find replies
+  // RFC822 Message-ID header of this outbound (e.g. <CAh...@mail.gmail.com>).
+  // Immutable once sent; it's the join key inbound replies point at via
+  // In-Reply-To. Cached here so the reply-checker reads it from the DB instead
+  // of calling Gmail (getMessageRfc822Id) once per email on every cron tick.
+  // Backfilled lazily by checkForReplies on first poll of each email.
+  rfc822MessageId   String?
   recipientEmail    String
   subject           String
   status            String    @default("sent") // sent, replied, processed, queued, consumed
