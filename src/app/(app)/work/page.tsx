@@ -32,7 +32,8 @@ import {
   ArrowDown,
   ListChecks,
 } from 'lucide-react';
-import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, groupItemsByLsNumber } from '@/components/orders/types';
+import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, Bundle, groupItemsByLsNumber } from '@/components/orders/types';
+import { BundleVehicleEditor } from '@/components/orders/BundleVehicleEditor';
 
 interface ChatMessage {
   id: string;
@@ -296,7 +297,7 @@ export default function WorkPage() {
   // Agent screen: connect directly to the auto_gui2 live-view's /video WebSocket
   // and render each JPEG frame into an <img>. Skips the source page's toolbar
   // and right-side logs panel — we have our own Logs tab.
-  const AGENT_SCREEN_HOST = '20.244.42.146:8080';
+  const AGENT_SCREEN_HOST = 'vm.satorilabs.tech';
   const agentImgRef = useRef<HTMLImageElement>(null);
   const [agentFps, setAgentFps] = useState<number | null>(null);
   const [agentStatus, setAgentStatus] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
@@ -311,7 +312,7 @@ export default function WorkPage() {
     let closed = false;
 
     const connect = () => {
-      ws = new WebSocket(`ws://${AGENT_SCREEN_HOST}/video`);
+      ws = new WebSocket(`wss://${AGENT_SCREEN_HOST}/video`);
       ws.binaryType = 'blob';
       ws.onopen = () => setAgentStatus('live');
       ws.onmessage = (e) => {
@@ -914,9 +915,9 @@ export default function WorkPage() {
                           </div>
                         </div>
                         <div className="flex items-center gap-4 text-sm text-slate-400">
-                          {po.customer && (
-                            <span className="px-2 py-0.5 rounded bg-slate-700 text-slate-200 text-xs" title={`Truck capacity for ${po.customer.name}`}>
-                              {po.customer.weightage} t
+                          {po.weightage != null && (
+                            <span className="px-2 py-0.5 rounded bg-slate-700 text-slate-200 text-xs" title={`Truck capacity for this PO`}>
+                              {po.weightage} t
                             </span>
                           )}
                           {po.salesOrders.length > 1 && (() => {
@@ -943,6 +944,20 @@ export default function WorkPage() {
                     {/* SO Level */}
                     {expandedPOs.has(po.id) && (
                       <div className="bg-slate-800/50 p-4 space-y-3">
+                        {po.bundles && po.bundles.length > 0 && (
+                          <div className="space-y-2">
+                            <p className="text-xs uppercase tracking-wide text-slate-400">
+                              Vehicle Details ({po.bundles.length} {po.bundles.length === 1 ? 'truck' : 'trucks'})
+                            </p>
+                            {po.bundles.map((b: Bundle) => (
+                              <BundleVehicleEditor
+                                key={b.id}
+                                bundle={b}
+                                onSaved={fetchOrders}
+                              />
+                            ))}
+                          </div>
+                        )}
                         {/* Add SO Button */}
                         <div className="flex justify-end mb-2">
                           <button

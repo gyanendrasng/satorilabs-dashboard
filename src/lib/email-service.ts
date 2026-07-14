@@ -1,5 +1,6 @@
 import { prisma } from './prisma';
-import { sendEmail } from './gmail';
+import { sendEmail, sendReplyEmailWithAttachment, getMessageRfc822Id } from './gmail';
+import { withPurposeLine } from './po-thread';
 
 interface VehicleDetails {
   vehicleNumber?: string | null;
@@ -20,15 +21,26 @@ export async function sendLSEmail(
   vehicleDetails: VehicleDetails,
   originalFilename?: string
 ): Promise<{ messageId: string; threadId: string }> {
-  const plantEmail = process.env.PLANT_EMAIL;
+  // Recipient resolution: prefer the per-LS plantEmail stored on LoadingSlip
+  // (set by /zload1-data via the 3-char plant-code lookup against the Plant
+  // table). Fall back to the legacy PLANT_EMAIL env when missing.
+  const lsiRow = await prisma.loadingSlipItem.findUnique({
+    where: { id: loadingSlipItemId },
+    select: {
+      loadingSlipId: true,
+      loadingSlip: { select: { plantEmail: true } },
+    },
+  });
+  const envPlantEmail = process.env.PLANT_EMAIL || '';
+  const plantEmail = lsiRow?.loadingSlip?.plantEmail || envPlantEmail;
   if (!plantEmail) {
-    console.error('[Email] PLANT_EMAIL environment variable not configured');
-    throw new Error('PLANT_EMAIL environment variable not configured');
+    console.error('[Email] No plantEmail on LoadingSlip and PLANT_EMAIL env not configured');
+    throw new Error('plantEmail unresolved (no LoadingSlip.plantEmail and PLANT_EMAIL env unset)');
   }
 
   console.log(`[Email] Preparing to send LS ${lsNumber} for SO ${soNumber} to ${plantEmail}`);
 
-  const subject = `Loading Slip ${lsNumber} - SO ${soNumber}`;
+  const purposeLabel = `Loading Slip ${lsNumber} - SO ${soNumber}`;
 
   const bodyLines = [
     `Please find attached the Loading Slip ${lsNumber} for Sales Order ${soNumber}.`,
@@ -47,7 +59,10 @@ export async function sendLSEmail(
   }
   bodyLines.push('', 'Please reply with the invoice PDF.');
 
-  const body = bodyLines.join('\n');
+  // Per-LS purpose line at the top — every LS to this plant shares ONE umbrella
+  // subject (so the plant sees one conversation), so the LS number lives in the
+  // body and the attachment filename instead of the subject.
+  const body = withPurposeLine(purposeLabel, bodyLines.join('\n'));
 
   // Determine filename and mime type
   const filename = originalFilename || `LS_${lsNumber}.pdf`;
@@ -60,11 +75,43 @@ export async function sendLSEmail(
       : 'application/pdf';
 
   try {
-    const { messageId, threadId } = await sendEmail(plantEmail, subject, body, {
-      filename,
-      content: fileBuffer,
-      mimeType,
-    });
+    // Plant threading is per-LOADING-SLIP, NOT unified per plant. Every LS gets
+    // its OWN conversation: the plant receives one email per LS (its own thread,
+    // its own subject) and replies to each with that LS's invoice — so every
+    // reply maps unambiguously to one LS + one invoice (no multi-invoice-in-one
+    // -thread ambiguity). The BRANCH side stays unified via a separate per-PO
+    // anchor; only the plant side is de-unified here.
+    //
+    // A re-send of the SAME LS (a modify re-forward) threads back into that LS's
+    // existing conversation; a brand-new LS opens a fresh thread. We find the
+    // existing thread from the FIRST plant_ls Email row for this loadingSlip.
+    const priorLsEmail = lsiRow?.loadingSlipId
+      ? await prisma.email.findFirst({
+          where: {
+            loadingSlipId: lsiRow.loadingSlipId,
+            emailType: 'plant_ls',
+            recipientEmail: plantEmail,
+          },
+          orderBy: { sentAt: 'asc' },
+          select: { gmailMessageId: true, gmailThreadId: true, subject: true },
+        })
+      : null;
+
+    const threadSubject = priorLsEmail?.subject ?? purposeLabel;
+    const attachment = { filename, content: fileBuffer, mimeType };
+
+    let sent: { messageId: string; threadId: string };
+    if (priorLsEmail?.gmailThreadId && priorLsEmail.gmailMessageId) {
+      // Reply into this LS's existing thread so the revision stays in context.
+      const priorRfc822 = await getMessageRfc822Id(priorLsEmail.gmailMessageId);
+      sent = priorRfc822
+        ? await sendReplyEmailWithAttachment(plantEmail, threadSubject, body, priorLsEmail.gmailThreadId, priorRfc822, attachment)
+        : await sendEmail(plantEmail, threadSubject, body, attachment);
+    } else {
+      // First email for this LS — open a fresh thread under the per-LS subject.
+      sent = await sendEmail(plantEmail, threadSubject, body, attachment);
+    }
+    const { messageId, threadId } = sent;
 
     console.log(`[Email] Successfully sent LS ${lsNumber} for SO ${soNumber} - messageId: ${messageId}, threadId: ${threadId}`);
 
@@ -72,15 +119,34 @@ export async function sendLSEmail(
     await prisma.email.create({
       data: {
         salesOrderId,
+        loadingSlipId: lsiRow?.loadingSlipId ?? null,
         loadingSlipItemId,
         gmailMessageId: messageId,
         gmailThreadId: threadId,
         recipientEmail: plantEmail,
-        subject,
+        subject: threadSubject,
         status: 'sent',
         emailType: 'plant_ls',
       },
     });
+
+    // Audit-trail event so the LLM planner sees the plant_ls milestone.
+    try {
+      const { emitEvent } = await import('./scenario-events');
+      await emitEvent({
+        salesOrderId,
+        type: 'email_sent',
+        payload: {
+          emailType: 'plant_ls',
+          recipient: plantEmail,
+          subject: threadSubject,
+          ls_number: lsNumber,
+          gmailMessageId: messageId,
+        },
+      });
+    } catch {
+      // Audit emission must never break the primary flow.
+    }
 
     console.log(`[Email] Created email record for LS ${lsNumber}`);
 

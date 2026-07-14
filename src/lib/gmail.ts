@@ -143,6 +143,84 @@ export async function getMessageRfc822Id(gmailMessageId: string): Promise<string
 }
 
 /**
+ * Build a multipart MIME message with In-Reply-To/References headers so the
+ * message threads under the supplied RFC822 Message-ID. Same body+attachment
+ * shape as createMimeMessage.
+ */
+export function createMimeReplyMessage(
+  to: string,
+  subject: string,
+  body: string,
+  inReplyToRfc822Id: string,
+  attachment: {
+    filename: string;
+    content: Buffer;
+    mimeType: string;
+  }
+): string {
+  const boundary = 'boundary_' + Date.now().toString(16);
+
+  const mimeMessage = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    `In-Reply-To: ${inReplyToRfc822Id}`,
+    `References: ${inReplyToRfc822Id}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    body,
+    '',
+    `--${boundary}`,
+    `Content-Type: ${attachment.mimeType}`,
+    'Content-Transfer-Encoding: base64',
+    `Content-Disposition: attachment; filename="${attachment.filename}"`,
+    '',
+    attachment.content.toString('base64'),
+    '',
+    `--${boundary}--`,
+  ].join('\r\n');
+
+  return Buffer.from(mimeMessage)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/**
+ * Send a reply-in-thread email with a file attachment. Used to forward an
+ * updated loading slip PDF to the plant on the existing plant_ls thread.
+ */
+export async function sendReplyEmailWithAttachment(
+  to: string,
+  subject: string,
+  body: string,
+  threadId: string,
+  inReplyToRfc822Id: string,
+  attachment: {
+    filename: string;
+    content: Buffer;
+    mimeType: string;
+  }
+): Promise<{ messageId: string; threadId: string }> {
+  const raw = createMimeReplyMessage(to, subject, body, inReplyToRfc822Id, attachment);
+
+  const response = await gmail.users.messages.send({
+    userId: 'me',
+    requestBody: { raw, threadId },
+  });
+
+  if (!response.data.id || !response.data.threadId) {
+    throw new Error('Failed to send reply with attachment: missing message or thread ID');
+  }
+
+  return { messageId: response.data.id, threadId: response.data.threadId };
+}
+
+/**
  * Send an HTML email (no attachments)
  */
 export async function sendHtmlEmail(
@@ -308,6 +386,32 @@ export async function getMessageBody(messageId: string): Promise<string> {
 }
 
 /**
+ * Remove the UNREAD label from one or more Gmail messages so they don't keep
+ * matching `is:unread` queries on subsequent cron ticks.
+ *
+ * Use `messages.batchModify` so multiple ids cost one API call. Failures
+ * never throw — marking-read is best-effort; the worst case is a
+ * harmlessly-retriggered processing attempt (which the ProcessedEmail
+ * dedup table catches on the DB side).
+ */
+export async function markMessagesAsRead(messageIds: string[]): Promise<void> {
+  if (messageIds.length === 0) return;
+  try {
+    await gmail.users.messages.batchModify({
+      userId: 'me',
+      requestBody: {
+        ids: messageIds,
+        removeLabelIds: ['UNREAD'],
+      },
+    });
+  } catch (err) {
+    console.warn(
+      `[Gmail] markMessagesAsRead failed for ${messageIds.length} message(s): ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+}
+
+/**
  * List recent messages matching a query (e.g. newer_than:1d, from:branch@example.com)
  */
 export async function listMessages(
@@ -341,6 +445,33 @@ export async function getMessageSubject(messageId: string): Promise<string> {
     (h) => h.name?.toLowerCase() === 'subject'
   );
   return subjectHeader?.value || '';
+}
+
+/**
+ * Pure predicate: a message is a REPLY (not a freshly-composed thread root) when
+ * it carries an `In-Reply-To` or `References` header. Split out from the Gmail
+ * fetch so it can be unit-tested.
+ */
+export function hasReplyHeaders(inReplyTo: string | null | undefined, references: string | null | undefined): boolean {
+  return !!(inReplyTo && inReplyTo.trim()) || !!(references && references.trim());
+}
+
+/**
+ * Is this Gmail message a reply (carries In-Reply-To / References) rather than a
+ * freshly-composed message? Used by `checkForNewEmails` to avoid treating a
+ * branch REPLY as a brand-new order — replies now share the unified
+ * "Re: New Order - <id>" subject, so subject alone can't tell them apart.
+ */
+export async function isReplyMessage(messageId: string): Promise<boolean> {
+  const message = await gmail.users.messages.get({
+    userId: 'me',
+    id: messageId,
+    format: 'metadata',
+    metadataHeaders: ['In-Reply-To', 'References'],
+  });
+  const headers = message.data.payload?.headers ?? [];
+  const get = (name: string) => headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? '';
+  return hasReplyHeaders(get('In-Reply-To'), get('References'));
 }
 
 /**

@@ -20,6 +20,19 @@ export async function GET(request: Request) {
       },
       include: {
         customer: true,
+        bundles: {
+          orderBy: { bundleNumber: 'asc' },
+          select: {
+            id: true,
+            bundleNumber: true,
+            vehicleNumber: true,
+            driverMobile: true,
+            containerNumber: true,
+            transportId: true,
+            sealNumber: true,
+            status: true,
+          },
+        },
         salesOrders: {
           orderBy: {
             createdAt: 'asc',

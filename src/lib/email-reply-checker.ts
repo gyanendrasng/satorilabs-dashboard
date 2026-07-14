@@ -1,13 +1,13 @@
+// ⚠️  BEFORE EDITING THIS FILE — read docs/email-reply-detection.md.
+// Reply detection has been broken & re-fixed several times when the matcher,
+// the poll filter, the ProcessedEmail dedup, and handleReplyV2's replyHtml
+// invariant were changed independently. The doc captures the invariants, the
+// failure modes that motivated each change, and the anti-patterns to avoid.
+// If you change anything in this file, also update that doc's change log.
+
 import { prisma } from './prisma';
-import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, listMessages, getMessageSubject } from './gmail';
+import { getThreadMessages, extractPdfAttachments, getMessageBody, sendPlainEmail, sendReplyEmail, getMessageRfc822Id, listMessages, getMessageSubject, markMessagesAsRead, isReplyMessage } from './gmail';
 import {
-  checkAndSendBatchToAman,
-  handleBranchReply,
-  handleProductionReply,
-  handleProductionConfirmation,
-  handleVehicleDetailsReply,
-  handleVehicleSplitConfirmation,
-  handleDispatchConfirmation,
   triggerZsoVisibility,
   assembleAndSendCombinedEmail,
 } from './auto-gui-trigger';
@@ -19,6 +19,7 @@ const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 const PRODUCTION_EMAIL = process.env.PRODUCTION_EMAIL || '';
 const BRANCH_EMAIL = process.env.BRANCH_EMAIL || '';
+const PLANT_EMAIL = process.env.PLANT_EMAIL || '';
 
 /**
  * Check for email replies and process them
@@ -40,23 +41,42 @@ export async function checkForReplies(): Promise<{
     logs.push(logMessage);
   };
 
-  // Get all emails that are still in "sent" status and not yet completed
-  // by a workflow handler (handleBranchReply marks workflowState='completed'
-  // after firing ZLOAD1 fire-and-forget — those should not be reprocessed).
-  // NOTE: workflowState is NULL for legacy/plant_ls emails, so we must
-  // explicitly include NULL — `{ not: 'completed' }` alone excludes NULL
-  // due to standard SQL three-valued logic.
+  // Get every outbound email that may still attract a reply. Two cases:
+  //   1. status='sent'      — first reply hasn't arrived yet (the original
+  //                           polling case).
+  //   2. status='replied'   — a prior reply has been handled, but the branch
+  //                           may follow up on the same thread (asking for a
+  //                           modification, sending a clarification, etc.).
+  //                           Without polling these we miss follow-ups
+  //                           entirely — the thread effectively goes dark
+  //                           after the first reply.
+  // The ProcessedEmail table (keyed by Gmail message id) dedups each inbound
+  // message, so re-polling 'replied' emails is safe — the same reply won't
+  // be reprocessed twice.
+  //
+  // We exclude workflowState='completed' for status='sent' rows (those are
+  // terminal — e.g. ZLOAD1 has been fired and we don't want to reprocess),
+  // but for status='replied' rows we DO want to keep polling regardless of
+  // workflowState because the thread is still open for follow-ups.
   const pendingEmails = await prisma.email.findMany({
     where: {
-      status: 'sent',
       OR: [
-        { workflowState: null },
-        { workflowState: { not: 'completed' } },
+        {
+          status: 'sent',
+          OR: [
+            { workflowState: null },
+            { workflowState: { not: 'completed' } },
+          ],
+        },
+        { status: 'replied' },
       ],
     },
     include: {
       salesOrder: true,
-      loadingSlipItem: true,
+      loadingSlip: { select: { id: true, bundleId: true, lsNumber: true } },
+      loadingSlipItem: {
+        include: { loadingSlip: { select: { id: true, bundleId: true } } },
+      },
     },
   });
 
@@ -80,6 +100,23 @@ export async function checkForReplies(): Promise<{
     log(`  - SO ${soNumber}: ${emails.length} pending emails`);
   }
 
+  // Fetch each Gmail thread AT MOST ONCE per tick. Many outbound Email rows
+  // share a thread (per-PO branch thread, per-(PO,plant) plant thread, plant_ls
+  // fan-out), so we used to re-download the whole thread once per email row —
+  // dozens of identical threads.get calls that tripped Gmail's per-user rate
+  // limit. The thread contents don't change within a single tick, and the
+  // per-outbound In-Reply-To matching below still runs per email row against
+  // this shared snapshot, so correctness is unchanged. If a fetch throws it is
+  // NOT cached, so the next email on that thread retries exactly as before.
+  const threadCache = new Map<string, Awaited<ReturnType<typeof getThreadMessages>>>();
+  const getThreadMessagesCached = async (threadId: string) => {
+    const cached = threadCache.get(threadId);
+    if (cached) return cached;
+    const msgs = await getThreadMessages(threadId);
+    threadCache.set(threadId, msgs);
+    return msgs;
+  };
+
   for (const email of pendingEmails) {
     const soNumber = email.salesOrder?.soNumber || 'unknown';
     const lsNumber = email.loadingSlipItem?.lsNumber || 'N/A';
@@ -87,165 +124,269 @@ export async function checkForReplies(): Promise<{
     try {
       log(`[EmailChecker] Checking thread ${email.gmailThreadId} for SO ${soNumber} / LS ${lsNumber}`);
 
-      // Get all messages in the thread
-      const messages = await getThreadMessages(email.gmailThreadId);
+      // Get all messages in the thread (deduped per tick — see threadCache above)
+      const messages = await getThreadMessagesCached(email.gmailThreadId);
 
-      // Find reply messages (only messages AFTER our dispatch email in the thread)
-      const dispatchIdx = messages.findIndex(
-        (msg) => msg.id === email.gmailMessageId
+      // CRITICAL: multiple of OUR outbound emails can sit on the same Gmail
+      // thread (e.g. when we fan out N plant_ls emails for N loading slips
+      // and the plant replies separately to each — every reply lives on the
+      // SAME thread but is addressed to a different outbound). We must match
+      // each reply to the SPECIFIC outbound it's responding to, not to the
+      // thread as a whole.
+      //
+      // We do this by walking the In-Reply-To chain UPWARDS until we hit
+      // an OUTBOUND (Gmail label=SENT) message. That's the inbound's
+      // "nearest outbound ancestor" — the specific outbound the reply
+      // belongs to. The reply is for THIS email iff that nearest outbound
+      // is THIS email's gmailMessageId.
+      //
+      // This handles three cases correctly:
+      //   (a) Plant clicks Reply directly on LS 373431's email → reply's
+      //       In-Reply-To points at LS 373431 → nearest outbound ancestor
+      //       is LS 373431 → matches only LS 373431. ✓
+      //   (b) Branch replies to vehicle_details, then replies AGAIN to
+      //       their own prior reply (an inbound) → chain walks: inbound 2
+      //       → inbound 1 → our vehicle_details outbound → nearest
+      //       outbound ancestor is vehicle_details → matches
+      //       vehicle_details. ✓
+      //   (c) Plant replies-to-all by hitting Reply on the latest
+      //       outbound LS 373437 then sending 7 messages → all have
+      //       In-Reply-To = LS 373437 → all match LS 373437 (correct,
+      //       the plant addressed them to that thread root).
+      //
+      // We do NOT match against the `References` header (which contains
+      // the full thread chain), because every reply in the thread would
+      // then look like a reply to every prior outbound — the false-
+      // positive bug we hit before with plant_ls fan-out.
+      // Our outbound's RFC822 Message-ID is immutable once sent, so read it from
+      // the cached column. Only on a cache miss (existing rows pre-dating this
+      // column, or a brand-new email's first poll) do we call Gmail once, then
+      // persist it so every future tick reads it from the DB. This removes the
+      // per-email getMessageRfc822Id call that ran every minute forever.
+      let ourRfc822Id = email.rfc822MessageId;
+      if (!ourRfc822Id) {
+        ourRfc822Id = await getMessageRfc822Id(email.gmailMessageId);
+        if (ourRfc822Id) {
+          try {
+            await prisma.email.update({
+              where: { id: email.id },
+              data: { rfc822MessageId: ourRfc822Id },
+            });
+          } catch (persistErr) {
+            // Non-fatal: we still have the value for this tick; we'll just
+            // re-fetch next tick if the write didn't land.
+            log(
+              `[EmailChecker] Failed to cache rfc822MessageId for email ${email.id}: ` +
+                `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`,
+            );
+          }
+        }
+      }
+      if (!ourRfc822Id) {
+        log(`[EmailChecker] Could not resolve RFC822 Message-ID for email ${email.id} (gmailMessageId=${email.gmailMessageId}) — skipping thread`);
+        continue;
+      }
+
+      // Helper: read a header value off a thread message (case-insensitive).
+      type ThreadMsg = (typeof messages)[number];
+      const readHeader = (msg: ThreadMsg, name: string): string => {
+        const headers = (msg.payload?.headers ?? []) as Array<{ name?: string | null; value?: string | null }>;
+        return headers.find((h) => h.name?.toLowerCase() === name.toLowerCase())?.value ?? '';
+      };
+
+      // Build an index of every thread message by its RFC822 Message-ID
+      // so we can resolve In-Reply-To → parent message in one hop.
+      // RFC822 Message-IDs are wrapped in <...>; we store the inner value
+      // for robust substring matching against In-Reply-To (which may or
+      // may not preserve the angle brackets).
+      const byRfc822Id = new Map<string, ThreadMsg>();
+      for (const msg of messages) {
+        const id = readHeader(msg, 'Message-ID') || readHeader(msg, 'Message-Id');
+        if (!id) continue;
+        // Store both the wrapped and unwrapped variants to be tolerant.
+        byRfc822Id.set(id, msg);
+        const unwrapped = id.replace(/^<|>$/g, '');
+        if (unwrapped !== id) byRfc822Id.set(unwrapped, msg);
+        byRfc822Id.set(`<${unwrapped}>`, msg);
+      }
+
+      const isOutbound = (msg: ThreadMsg): boolean => {
+        const labels = (msg.labelIds as string[] | undefined) ?? [];
+        return labels.includes('SENT');
+      };
+      const isInbound = (msg: ThreadMsg): boolean => {
+        const labels = (msg.labelIds as string[] | undefined) ?? [];
+        return labels.includes('INBOX') && !labels.includes('SENT');
+      };
+
+      // Walk In-Reply-To upwards from `msg` until we hit an outbound
+      // message. Returns that outbound's RFC822 Message-ID, or null if
+      // the chain dead-ends without reaching an outbound (e.g. a thread
+      // we didn't originate). Cycle-guarded.
+      const nearestOutboundAncestorRfc822 = (msg: ThreadMsg): string | null => {
+        const seen = new Set<string>();
+        let cur: ThreadMsg | undefined = msg;
+        let safety = 32; // thread-depth cap; threads this deep shouldn't exist
+        while (cur && safety-- > 0) {
+          const inReplyTo = readHeader(cur, 'In-Reply-To').trim();
+          if (!inReplyTo) return null;
+          if (seen.has(inReplyTo)) return null; // cycle
+          seen.add(inReplyTo);
+          // Try exact match first, then unwrapped variants.
+          let parent = byRfc822Id.get(inReplyTo);
+          if (!parent) {
+            const unwrapped = inReplyTo.replace(/^<|>$/g, '');
+            parent = byRfc822Id.get(unwrapped) ?? byRfc822Id.get(`<${unwrapped}>`);
+          }
+          if (!parent) return null; // parent not in this thread
+          if (isOutbound(parent)) {
+            return (
+              readHeader(parent, 'Message-ID') ||
+              readHeader(parent, 'Message-Id') ||
+              null
+            );
+          }
+          cur = parent;
+        }
+        return null;
+      };
+
+      // Find reply messages: true inbounds whose nearest outbound ancestor
+      // is THIS email's RFC822 Message-ID. Skip the dispatch message
+      // itself (it's outbound).
+      const candidates = messages.filter(
+        (msg) => msg.id !== email.gmailMessageId,
       );
-      const replyMessages = dispatchIdx >= 0
-        ? messages.slice(dispatchIdx + 1)
-        : messages.filter((msg) => msg.id !== email.gmailMessageId);
+      const replyMessages = candidates.filter((msg) => {
+        if (!isInbound(msg)) return false;
+        const ancestor = nearestOutboundAncestorRfc822(msg);
+        if (!ancestor) return false;
+        // Substring match handles angle-bracket variance.
+        return ancestor.includes(ourRfc822Id) || ourRfc822Id.includes(ancestor);
+      });
 
       if (replyMessages.length === 0) {
         log(`[EmailChecker] No reply yet for SO ${soNumber} / LS ${lsNumber}`);
         continue;
       }
 
-      log(`[EmailChecker] Found ${replyMessages.length} reply(s) for SO ${soNumber} / LS ${lsNumber}`);
+      // Per-message dedup. ProcessedEmail is keyed by gmailMessageId — any
+      // reply we've already handled is in there. Drop those before picking
+      // the latest. The header-scoped filter above means we won't poison
+      // our own poll by marking sibling replies on the same thread as
+      // processed when they belong to a different outbound.
+      const replyIds = replyMessages.map((m) => m.id).filter((id): id is string => !!id);
+      const alreadyProcessed = await prisma.processedEmail.findMany({
+        where: { gmailMessageId: { in: replyIds } },
+        select: { gmailMessageId: true },
+      });
+      const processedSet = new Set(alreadyProcessed.map((p) => p.gmailMessageId));
+      const unprocessed = replyMessages.filter((msg) => !!msg.id && !processedSet.has(msg.id));
 
-      // Get the latest reply
-      const latestReply = replyMessages[replyMessages.length - 1];
+      if (unprocessed.length === 0) {
+        log(`[EmailChecker] All ${replyMessages.length} reply(s) for SO ${soNumber} / LS ${lsNumber} already processed — skipping`);
+        continue;
+      }
+
+      log(`[EmailChecker] Found ${unprocessed.length} new reply(s) (of ${replyMessages.length} total) for SO ${soNumber} / LS ${lsNumber}`);
+
+      // Get the latest UNPROCESSED reply
+      const latestReply = unprocessed[unprocessed.length - 1];
       if (!latestReply.id) {
         continue;
       }
 
-      // Get reply HTML body for workflow classification
+      // Get reply HTML body for the planner.
       const replyBodyHtml = await getMessageBody(latestReply.id);
-
-      // Store replyHtml on the email record
-      await prisma.email.update({
-        where: { id: email.id },
-        data: { replyHtml: replyBodyHtml },
-      });
-
-      // Route based on emailType
       const emailType = (email as any).emailType as string | null;
 
-      if (emailType === 'vehicle_split_inquiry') {
-        log(`[EmailChecker] Routing to handleVehicleSplitConfirmation for PO email ${email.id}`);
-        const splitResult = await handleVehicleSplitConfirmation(email.id, replyBodyHtml);
-        logs.push(...splitResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'dispatch_confirmation') {
-        log(`[EmailChecker] Routing to handleDispatchConfirmation for PO email ${email.id}`);
-        const dcResult = await handleDispatchConfirmation(email.id, replyBodyHtml);
-        logs.push(...dcResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'production_inquiry') {
-        // Production team replied to our inquiry — extract days
-        log(`[EmailChecker] Routing to handleProductionReply for SO ${soNumber}`);
-        const prodResult = await handleProductionReply(email.id, replyBodyHtml);
-        logs.push(...prodResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'production_reminder') {
-        // Production team replied to our reminder — classify confirmation
-        log(`[EmailChecker] Routing to handleProductionConfirmation for SO ${soNumber}`);
-        const confResult = await handleProductionConfirmation(email.id, replyBodyHtml);
-        logs.push(...confResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'vehicle_details') {
-        // Branch replied with vehicle details
-        log(`[EmailChecker] Routing to handleVehicleDetailsReply for SO ${soNumber}`);
-        const vdResult = await handleVehicleDetailsReply(email.id, replyBodyHtml || '', email.salesOrderId!);
-        logs.push(...vdResult.logs);
-        processed++;
-        continue;
-      }
-
-      if (emailType === 'plant_ls') {
-        // Plant replied to LS email — only care about PDF attachment (invoice)
-        log(`[EmailChecker] Plant reply for SO ${soNumber} / LS ${lsNumber}`);
-        // Fall through to PDF extraction below (skip handleBranchReply)
-      } else if (replyBodyHtml) {
-        // Default: null or 'ls_dispatch' — this is a branch reply
-        log(`[EmailChecker] Routing to handleBranchReply for SO ${soNumber} / LS ${lsNumber}`);
-        // Fetch the original sent email body from Gmail
-        const originalEmailHtml = await getMessageBody(email.gmailMessageId);
-        const branchResult = await handleBranchReply(
-          email.id,
-          replyBodyHtml,
-          originalEmailHtml,
-          email.salesOrderId!
-        );
-        logs.push(...branchResult.logs);
-
-        // Branch replies are fully owned by handleBranchReply (ZLOAD1 result
-        // arrives via the zload1-data callback). Do NOT fall through to the
-        // legacy ZLOAD3-B1 PDF/BatchSender flow.
-        processed++;
-        continue;
-      }
-
-      // Also continue with existing PDF flow (legacy ZLOAD3-B path)
-      // Extract PDF attachments from the reply
+      // ─── PDF attachment pre-pass ───────────────────────────────────────
+      // Plant-side invoice replies carry the LS invoice as a PDF. Upload it
+      // to R2 and stamp `replyPdfUrl` on the Email row BEFORE handing off to
+      // the planner — the planner's `process_plant_invoice` step reads that
+      // column to find the bundle's PDF.
       const attachments = await extractPdfAttachments(latestReply.id);
-
-      if (attachments.length === 0) {
-        log(`[EmailChecker] Reply has no PDF attachment for SO ${soNumber} / LS ${lsNumber}`);
-        // Reply received but no PDF attachment
-        await prisma.email.update({
-          where: { id: email.id },
-          data: {
-            status: 'replied',
-            repliedAt: new Date(),
-          },
-        });
-
-        // Check if all emails for this (Bundle, SO) pair now have replies.
-        // bundleId comes from the LSI the email is tied to; null = legacy
-        // (whole-SO) behavior.
-        if (email.salesOrderId) {
-          const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
-          const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
-          logs.push(...batchResult.logs);
-        }
-        continue;
+      let replyPdfUrl: string | undefined;
+      if (attachments.length > 0) {
+        const invoicePdf = attachments[0];
+        const s3Key = `reply-pdfs/${soNumber}/${lsNumber}.pdf`;
+        await uploadToS3(s3Key, invoicePdf.content, 'application/pdf');
+        log(`[EmailChecker] Uploaded PDF to R2: ${s3Key} (${invoicePdf.content.length} bytes)`);
+        replyPdfUrl = s3Key;
       }
 
-      // Get the first PDF attachment (invoice)
-      const invoicePdf = attachments[0];
-
-      log(`[EmailChecker] Found PDF attachment (${invoicePdf.filename}, ${invoicePdf.content.length} bytes) for SO ${soNumber} / LS ${lsNumber}`);
-
-      // Store reply PDF to R2 instead of parsing immediately
-      const s3Key = `reply-pdfs/${soNumber}/${lsNumber}.pdf`;
-      await uploadToS3(s3Key, invoicePdf.content, 'application/pdf');
-
-      log(`[EmailChecker] Uploaded PDF to R2: ${s3Key}`);
-
-      // Update Email status to 'replied' with the PDF URL
+      // Persist reply + PDF in a single write so the planner sees consistent
+      // state. `repliedAt` flips the email from `sent` → `replied`.
       await prisma.email.update({
         where: { id: email.id },
         data: {
-          status: 'replied',
+          replyHtml: replyBodyHtml,
           repliedAt: new Date(),
-          replyPdfUrl: s3Key,
+          status: 'replied',
+          ...(replyPdfUrl ? { replyPdfUrl } : {}),
         },
       });
 
-      log(`[EmailChecker] Marked email as 'replied' for SO ${soNumber} / LS ${lsNumber}`);
+      // Clear UNREAD on the inbound so the same message doesn't keep matching
+      // `is:unread` on subsequent cron ticks.
+      await markMessagesAsRead([latestReply.id]);
 
-      processed++;
-
-      // Check if all emails for this (Bundle, SO) pair now have replies.
+      // ─── Planner ────────────────────────────────────────────────────────
+      // Every SO-tied reply goes through `handleReplyV2` → LLM planner. The
+      // planner reads the audit trail + thread and emits a step list. Sender
+      // is inferred from the outbound recipient (plant-bound outbounds reply
+      // from the plant; everything else is the branch).
       if (email.salesOrderId) {
-        const lsiBundleId = email.loadingSlipItem?.bundleId ?? null;
-        const batchResult = await checkAndSendBatchToAman(email.salesOrderId, lsiBundleId);
-        logs.push(...batchResult.logs);
+        log(`[EmailChecker] Planner → handleReplyV2 for emailType=${emailType ?? 'null'} SO ${soNumber}`);
+        const sender: 'branch' | 'plant' =
+          PLANT_EMAIL && email.recipientEmail === PLANT_EMAIL ? 'plant' : 'branch';
+        const { handleReplyV2 } = await import('./scenario-engine');
+        const originalEmailHtml = await getMessageBody(email.gmailMessageId);
+        const r = await handleReplyV2({
+          emailId: email.id,
+          replyHtml: replyBodyHtml || '',
+          originalEmailHtml,
+          sourceEmailType: sender,
+        });
+        logs.push(...r.logs);
+        processed++;
+      } else {
+        // No SO link → can only be the PO-level tonnage_inquiry / vehicle
+        // split inquiry threads. The planner still handles these once the PO
+        // is resolved; for now we just record the reply.
+        log(`[EmailChecker] Reply on PO-level email ${email.id} (no salesOrderId) — replyHtml stored, planner skip`);
+        processed++;
+      }
+
+      // Durably mark every reply we matched to THIS outbound as processed.
+      // Because the candidates list was already filtered by the In-Reply-To /
+      // References headers above, `unprocessed` only contains messages that
+      // target THIS email's RFC822 Message-ID — sibling replies on the same
+      // Gmail thread that respond to a DIFFERENT outbound are not in here
+      // and will be picked up by their own pending-email iteration.
+      // Older replies under the same parent are superseded by `latestReply`
+      // (the planner already saw them in the thread render), so they
+      // shouldn't trigger their own plan calls later.
+      for (const msg of unprocessed) {
+        if (!msg.id) continue;
+        try {
+          await prisma.processedEmail.upsert({
+            where: { gmailMessageId: msg.id },
+            create: {
+              gmailMessageId: msg.id,
+              gmailThreadId: email.gmailThreadId,
+              soNumbers: soNumber,
+            },
+            update: {}, // no-op when already there (race-safe)
+          });
+        } catch (dedupErr) {
+          // Non-fatal — if this fails the next cron tick will see the
+          // duplicate and skip via the in-Gmail labels filter. Log + move on.
+          log(
+            `[EmailChecker] ProcessedEmail upsert failed for ${msg.id}: ` +
+              `${dedupErr instanceof Error ? dedupErr.message : String(dedupErr)}`,
+          );
+        }
       }
     } catch (error) {
       const errorMsg = `Error processing email ${email.id} (SO ${soNumber} / LS ${lsNumber}): ${
@@ -287,7 +428,7 @@ export async function checkWorkflowTimers(): Promise<{
       waitUntil: { lte: new Date() },
     },
     include: {
-      salesOrder: true,
+      salesOrder: { include: { purchaseOrder: { select: { id: true, poNumber: true } } } },
       loadingSlipItem: true,
     },
   });
@@ -340,12 +481,38 @@ export async function checkWorkflowTimers(): Promise<{
         continue;
       }
 
-      // Send reminder to production
-      const sentResult = await sendPlainEmail(
-        PRODUCTION_EMAIL,
-        result.email_payload.subject,
-        result.email_payload.body
-      );
+      // Send reminder to production on the per-PO production thread so every
+      // reminder for this PO stays in one conversation (shared subject). The
+      // first reminder opens the thread; later ones reply into it.
+      const poId = email.salesOrder?.purchaseOrderId ?? null;
+      const poNumber = email.salesOrder?.purchaseOrder?.poNumber ?? null;
+      const { resolveRecipientThreadAnchor, captureRecipientThreadAnchor, productionThreadSubject } =
+        await import('./po-thread');
+      const prodAnchor = poId ? await resolveRecipientThreadAnchor(poId, PRODUCTION_EMAIL) : null;
+      const reminderSubject =
+        prodAnchor?.subject ?? (poNumber ? productionThreadSubject(poNumber) : result.email_payload.subject);
+
+      const sentResult = prodAnchor
+        ? await sendReplyEmail(
+            PRODUCTION_EMAIL,
+            reminderSubject,
+            result.email_payload.body,
+            prodAnchor.threadId,
+            prodAnchor.rfc822MessageId ?? '',
+          )
+        : await sendPlainEmail(PRODUCTION_EMAIL, reminderSubject, result.email_payload.body);
+
+      if (poId && !prodAnchor) {
+        const rfc822 = await getMessageRfc822Id(sentResult.messageId);
+        await captureRecipientThreadAnchor({
+          purchaseOrderId: poId,
+          recipientEmail: PRODUCTION_EMAIL,
+          kind: 'production',
+          threadId: sentResult.threadId,
+          rfc822MessageId: rfc822 ?? null,
+          subject: reminderSubject,
+        });
+      }
 
       log(`[TimerCheck] Reminder sent to ${PRODUCTION_EMAIL} for SO ${soNumber}`);
 
@@ -357,7 +524,7 @@ export async function checkWorkflowTimers(): Promise<{
           gmailMessageId: sentResult.messageId,
           gmailThreadId: sentResult.threadId,
           recipientEmail: PRODUCTION_EMAIL,
-          subject: result.email_payload.subject,
+          subject: reminderSubject,
           status: 'sent',
           emailType: 'production_reminder',
           workflowState: 'awaiting_confirmation',
@@ -426,9 +593,24 @@ export async function checkForNewEmails(): Promise<{
     const processedThreadIds = new Set(processedEmails.map((e) => e.gmailThreadId));
 
     for (const msg of messages) {
-      // Skip if already processed
+      // A genuine NEW ORDER is composed fresh (thread root, no In-Reply-To /
+      // References). A REPLY carries those headers. Since every branch outbound
+      // now shares the "Re: New Order - <id>" subject, branch replies match this
+      // query too — so subject can't distinguish them. Skip replies here and let
+      // checkForReplies own them (it reads the whole thread by label, not unread,
+      // so marking read is safe and frees the is:unread query budget). This is
+      // robust even after an SO teardown wiped the dedup rows.
+      if (await isReplyMessage(msg.id)) {
+        log(`[NewEmail] Skipping message ${msg.id} — it's a reply (In-Reply-To/References present), not a new order; checkForReplies will handle it`);
+        await markMessagesAsRead([msg.id]);
+        continue;
+      }
+
+      // Skip if already processed. Mark-read anyway so the same message
+      // doesn't keep matching `is:unread` and pollute every cron tick.
       if (processedMessageIds.has(msg.id) || processedThreadIds.has(msg.threadId)) {
         log(`[NewEmail] Skipping message ${msg.id} — already processed (thread: ${msg.threadId})`);
+        await markMessagesAsRead([msg.id]);
         continue;
       }
 
@@ -450,21 +632,27 @@ export async function checkForNewEmails(): Promise<{
 
         const stripped = body.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
 
-        // Extract customer_id + SO numbers via AI; fall back to regex on failure.
+        // Extract customer_id + SO numbers via the dedicated small LLM
+        // extraction (extractOrderInfoWithAI) with a regex fallback. The
+        // planner does NOT handle NEW ORDER intake — that's pure data
+        // extraction (customer_id + so_numbers), not workflow planning.
         let customerId: string | null = null;
         let soNumbers: string[] = [];
+        let vehicleTonnage: number | null = null;
         try {
           const extracted = await extractOrderInfoWithAI(stripped);
           customerId = extracted.customerId;
           soNumbers = extracted.soNumbers;
-          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+          vehicleTonnage = extracted.vehicleTonnage;
+          log(`[NewEmail] AI extracted from ${msg.id}: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}, vehicleTonnage=${vehicleTonnage ?? '(none)'}`);
         } catch (aiErr) {
           log(`[NewEmail] AI extraction failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}), falling back to regex`);
           const fb = extractOrderInfoFallback(stripped);
           customerId = fb.customerId;
           soNumbers = fb.soNumbers;
+          vehicleTonnage = fb.vehicleTonnage;
           if (soNumbers.length > 0) {
-            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}`);
+            log(`[NewEmail] Fallback regex extracted: customerId=${customerId ?? '(none)'}, soNumbers=${soNumbers.join(', ')}, vehicleTonnage=${vehicleTonnage ?? '(none)'}`);
           }
         }
 
@@ -473,7 +661,7 @@ export async function checkForNewEmails(): Promise<{
           continue;
         }
 
-        // Upsert Customer if we extracted an id; auto-create with generic name + default 45t capacity.
+        // Upsert Customer if we extracted an id; auto-create with generic name + default 35t capacity.
         let customer: { id: string; name: string } | null = null;
         if (customerId) {
           const existing = await prisma.customer.findUnique({ where: { id: customerId } });
@@ -485,7 +673,7 @@ export async function checkForNewEmails(): Promise<{
               data: { id: customerId, name: `Customer ${count + 1}` },
             });
             customer = { id: created.id, name: created.name };
-            log(`[NewEmail] Created new Customer ${customerId} ("${created.name}", default 45 tonne capacity)`);
+            log(`[NewEmail] Created new Customer ${customerId} ("${created.name}", default 35 tonne capacity)`);
           }
         }
 
@@ -500,13 +688,34 @@ export async function checkForNewEmails(): Promise<{
         const subject = await getMessageSubject(msg.id);
         const purchaseOrder = await prisma.purchaseOrder.upsert({
           where: { poNumber },
-          update: customer ? { customerId: customer.id } : {},
+          update: {
+            ...(customer ? { customerId: customer.id } : {}),
+            // Only set weightage on update if extraction succeeded; never
+            // overwrite a previously-stored value with null (a later cron
+            // pass shouldn't undo a successful first extraction).
+            ...(vehicleTonnage !== null ? { weightage: vehicleTonnage } : {}),
+            // Backfill the canonical branch thread on this PO from the
+            // NEW ORDER message if we haven't claimed one yet.
+            branchThreadId: msg.threadId,
+            // Backfill the branch subject (same NEW ORDER message → same
+            // subject); guard against clobbering with an empty transient read.
+            ...(subject ? { branchSubject: subject } : {}),
+          },
           create: {
             poNumber,
             customerName: customer?.name || subject || `Branch Order (${soNumbers.length} SOs)`,
             customerId: customer?.id,
             status: 'in-progress',
             stage: 1,
+            weightage: vehicleTonnage,
+            // The branch thread for this PO is the NEW ORDER thread. The
+            // anchor RFC822 id is resolved lazily on the first outbound
+            // (see resolvePoThreadAnchor) — Gmail message-id lookups are
+            // cheap but not free, and many POs never send into the thread.
+            branchThreadId: msg.threadId,
+            // The NEW ORDER subject. Every branch outbound replies as
+            // "Re: <branchSubject>" so the branch sees one conversation.
+            branchSubject: subject || null,
           },
         });
 
@@ -541,6 +750,179 @@ export async function checkForNewEmails(): Promise<{
         }
         log(`[NewEmail] PO ${poNumber}: ${createdSoNumbers.length} new SO(s), ${soNumbers.length - createdSoNumbers.length} already existed (total ${soNumbers.length})`);
 
+        // Persist `email_received` + `classifier_decision` events per SO so
+        // the LLM planner's audit trail captures the NEW ORDER inbound as
+        // the first link in the event chain.
+        if (soNumbers.length > 0) {
+          try {
+            const { emitEvent } = await import('./scenario-events');
+            const allSos = await prisma.salesOrder.findMany({
+              where: { purchaseOrderId: purchaseOrder.id, soNumber: { in: soNumbers } },
+              select: { id: true, soNumber: true },
+            });
+            for (const so of allSos) {
+              await emitEvent({
+                salesOrderId: so.id,
+                type: 'email_received',
+                payload: {
+                  emailType: 'new_order',
+                  sender: 'branch',
+                  subject: subject ?? '',
+                  body_excerpt: stripped.slice(0, 300),
+                  gmailMessageId: msg.id,
+                },
+              });
+              await emitEvent({
+                salesOrderId: so.id,
+                type: 'classifier_decision',
+                payload: {
+                  action: 'new_order',
+                  customer_id: customerId,
+                  so_numbers: soNumbers,
+                  gmail_message_id: msg.id,
+                  via: 'checkForNewEmails',
+                },
+              });
+            }
+          } catch (evErr) {
+            log(`[NewEmail] audit-trail event emit warning: ${evErr instanceof Error ? evErr.message : evErr}`);
+          }
+        }
+
+        // If the NEW ORDER didn't include vehicle tonnage, fire a
+        // tonnage_inquiry email to branch right away (in the NEW ORDER
+        // thread). ZSO-VISIBILITY still runs in parallel — visibility is
+        // independent of bundling. The bundler later refuses to compute
+        // bundles until po.weightage is set, so dispatch_confirmation
+        // naturally waits for the branch reply.
+        if (vehicleTonnage === null) {
+          try {
+            // NOTE: Do NOT include numeric examples in the inquiry body.
+            // Gmail clients quote the prior thread inline on reply, and the
+            // tonnage parser in process_tonnage_reply would otherwise match
+            // our example number instead of the branch's actual answer.
+            // Keep the ask in plain prose so the reply has only one numeric
+            // candidate above the quote line.
+            const tonnageBodyRaw = [
+              `Hi,`,
+              ``,
+              `We received your dispatch request for SO ${soNumbers.join(', ')}.`,
+              ``,
+              `Could you please share the vehicle/truck tonnage (capacity) for this dispatch? We need it to plan the bundle/truck split.`,
+              ``,
+              `Please reply with the tonnage in tonnes (e.g. just the number followed by "t").`,
+              ``,
+              `Thanks.`,
+            ].join('\n');
+            const tonnagePurpose = `Vehicle Tonnage Required - PO ${poNumber}`;
+            // Reuse the NEW ORDER subject (Re: <subject>) so this — the first
+            // branch outbound — opens the single conversation the branch sees.
+            const { branchReplySubject, withPurposeLine } = await import('./po-thread');
+            const tonnageSubject = subject ? branchReplySubject(subject) : tonnagePurpose;
+            const tonnageBody = withPurposeLine(tonnagePurpose, tonnageBodyRaw);
+            const rfc822Id = await getMessageRfc822Id(msg.id);
+            const sent = rfc822Id && BRANCH_EMAIL
+              ? await sendReplyEmail(BRANCH_EMAIL, tonnageSubject, tonnageBody, msg.threadId, rfc822Id)
+              : BRANCH_EMAIL
+                ? await sendPlainEmail(BRANCH_EMAIL, tonnageSubject, tonnageBody)
+                : null;
+            if (sent) {
+              // Stamp the canonical branch anchor for this PO so downstream
+              // outbounds don't have to re-fetch the RFC822 id.
+              if (rfc822Id) {
+                const { capturePoThreadAnchor } = await import('./po-thread');
+                await capturePoThreadAnchor(purchaseOrder.id, 'branch', msg.threadId, rfc822Id);
+              }
+              // ─── PROJECT CONVENTION: PO-scoped emails anchor to lead SO ───
+              // tonnage_inquiry is logically a PO-level email — the truck
+              // tonnage is stored on PurchaseOrder.weightage and applies to
+              // every SO of the PO. But the engine's routing layer
+              // (handleReplyV2) was built around per-SO replies and still
+              // refuses to process an Email with a null salesOrderId.
+              //
+              // The agreed convention for any email that conceptually scopes
+              // to the PO (not a single SO) is to anchor it on the PO's lead
+              // SO — the SO that joined the PO first (oldest createdAt).
+              // The reply then routes through the planner attached to that
+              // SO. The actual side-effect (here: writing PO.weightage) is
+              // PO-scoped and benefits every SO automatically.
+              //
+              // Future PO-level emails (multi-SO clarifications, supervisor
+              // questions about the whole order, etc.) should follow this
+              // same pattern: link to lead SO + carry purchaseOrderId.
+              const leadSo = await prisma.salesOrder.findFirst({
+                where: { purchaseOrderId: purchaseOrder.id, soNumber: { in: soNumbers } },
+                orderBy: { createdAt: 'asc' },
+                select: { id: true },
+              });
+              await prisma.email.create({
+                data: {
+                  purchaseOrderId: purchaseOrder.id,
+                  salesOrderId: leadSo?.id ?? null,
+                  gmailMessageId: sent.messageId,
+                  gmailThreadId: sent.threadId,
+                  recipientEmail: BRANCH_EMAIL,
+                  subject: tonnageSubject,
+                  status: 'sent',
+                  emailType: 'tonnage_inquiry',
+                  workflowState: 'awaiting_reply',
+                  sentBody: tonnageBody,
+                },
+              });
+              log(`[NewEmail] No tonnage in NEW ORDER for PO ${poNumber} — sent tonnage_inquiry to ${BRANCH_EMAIL}`);
+
+              // ONE PO-scoped audit event — tonnage is a single per-PO ask
+              // that affects every SO under the PO. Emitting per-SO would
+              // make the planner see N "we asked for tonnage" events for a
+              // multi-SO NEW ORDER when the reality is one ask. Attach the
+              // event to the lead SO (matches the Email row's salesOrderId)
+              // and put the full affected-SO list in the payload so the
+              // dashboard / planner can fan out if needed.
+              try {
+                if (leadSo) {
+                  const { emitEvent } = await import('./scenario-events');
+                  await emitEvent({
+                    salesOrderId: leadSo.id,
+                    type: 'email_sent',
+                    payload: {
+                      emailType: 'tonnage_inquiry',
+                      recipient: BRANCH_EMAIL,
+                      subject: tonnageSubject,
+                      body_excerpt: tonnageBody.slice(0, 200),
+                      gmailMessageId: sent.messageId,
+                      purchaseOrderId: purchaseOrder.id,
+                      affectsSos: soNumbers,
+                    },
+                  });
+                }
+              } catch {
+                // event emission must never break primary flow
+              }
+            } else {
+              log(`[NewEmail] BRANCH_EMAIL not configured — cannot send tonnage_inquiry for PO ${poNumber}`);
+            }
+          } catch (tonnageErr) {
+            log(`[NewEmail] tonnage_inquiry send failed for PO ${poNumber}: ${tonnageErr instanceof Error ? tonnageErr.message : String(tonnageErr)}`);
+          }
+        }
+
+        // ─── Tonnage gate ───────────────────────────────────────────────
+        // Strict gating: no SAP / customer-facing step proceeds until the
+        // branch has shared the truck tonnage for this PO. ZSO-VISIBILITY
+        // is read-only but it produces an ls_dispatch email; running it
+        // before tonnage is known leaks "we're processing your order" to
+        // the branch before we know the load fits any truck.
+        //
+        // SOs stay in visibilityState='queued'. The process_tonnage_reply
+        // handler kicks ZSO-VISIBILITY for every queued SO of the PO once
+        // PO.weightage lands.
+        if (vehicleTonnage === null) {
+          log(`[NewEmail] PO ${poNumber}: tonnage missing — ZSO-VISIBILITY deferred until branch replies on tonnage_inquiry`);
+          triggered++;
+          await markMessagesAsRead([msg.id]);
+          continue;
+        }
+
         // Enqueue ZSO-VISIBILITY for every queued SO of this PO. The global
         // WorkQueue ensures only one fires at a time across the whole system,
         // even when multiple POs land at once.
@@ -552,6 +934,7 @@ export async function checkForNewEmails(): Promise<{
         if (queuedSOs.length === 0) {
           log(`[NewEmail] No queued SOs for PO ${poNumber} (already in progress?), skipping`);
           triggered++;
+          await markMessagesAsRead([msg.id]);
           continue;
         }
 
@@ -570,6 +953,11 @@ export async function checkForNewEmails(): Promise<{
         log(`[NewEmail] PO ${poNumber}: enqueued ZSO-VISIBILITY for ${queuedSOs.length} SO(s)`);
 
         triggered++;
+        // Clear UNREAD so the same NEW ORDER doesn't keep matching is:unread.
+        // The ProcessedEmail row created at the top of this iteration is the
+        // DB-side dedup; mark-read is the Gmail-side dedup. Best-effort —
+        // markMessagesAsRead swallows errors internally.
+        await markMessagesAsRead([msg.id]);
       } catch (error) {
         const cause = error instanceof Error && (error as any).cause ? ` cause: ${String((error as any).cause)}` : '';
         const errorMsg = `Error processing message ${msg.id}: ${
@@ -717,7 +1105,13 @@ export async function checkStaleVisibility(): Promise<{
     await pumpQueue();
   }
 
-  // Step 3: sweep POs whose every SO is in {received, failed} but no sent ls_dispatch yet
+  // Step 3: sweep POs whose every SO is in {received, failed} but no
+  // ls_dispatch has been sent yet for the current round.
+  //
+  // The filter must match BOTH `sent` and `replied` rows — once the branch
+  // replies on the ls_dispatch the row flips to `replied`, and a `sent`-only
+  // filter would falsely report "no ls_dispatch yet" and re-fire one. The
+  // round guard inside assembleAndSendCombinedEmail does the same widen.
   const candidatePOs = await prisma.purchaseOrder.findMany({
     where: {
       salesOrders: {
@@ -727,7 +1121,7 @@ export async function checkStaleVisibility(): Promise<{
     },
     include: {
       emails: {
-        where: { emailType: 'ls_dispatch', status: 'sent' },
+        where: { emailType: 'ls_dispatch', status: { in: ['sent', 'replied'] } },
         take: 1,
       },
     },

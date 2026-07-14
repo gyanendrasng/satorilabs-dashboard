@@ -17,7 +17,21 @@ Next.js dashboard for managing sales orders, loading slips, and dispatch email w
 - `CRON_SECRET` — optional auth token for cron endpoint
 - `AUTO_GUI_HOST` / `AUTO_GUI_PORT` — auto_gui2 backend connection
 
+### LLM provider (planner + new-order extractor)
+Every LLM call goes through `src/lib/llm-service.ts`. Provider + model are picked from env at boot:
+- `LLM_PROVIDER` — one of `openai` | `groq` | `together` | `deepinfra` | `runpod` | `gemini` (default `openai`)
+- `LLM_MODEL` — model id (defaults per provider; e.g. `gpt-4o` for openai, `gemini-2.5-flash` for gemini)
+- `LLM_TEMPERATURE` — default 0.7 (per-call override available)
+- `LLM_MAX_TOKENS` — default 16000 (planner emits long structured JSON; smaller caps truncate the response and break the Zod parse). Per-call override available; the planner itself locks 16000 regardless of env and retries up to 3 times on parse / Zod failure with exponential backoff.
+- `LLM_BASE_URL` — optional override for OpenAI-compatible providers (self-hosted vLLM etc.)
+
+API keys (only the one matching the active provider is required):
+- `OPENAI_API_KEY`, `GROQ_API_KEY`, `TOGETHER_API_KEY`, `DEEPINFRA_API_KEY`, `RUNPOD_API_KEY`, `GEMINI_API_KEY`
+
 ## Email Monitoring Cron
+
+> **Before editing anything in this area — read [docs/email-reply-detection.md](docs/email-reply-detection.md).**
+> The reply detection has been broken & re-fixed several times when the matcher, the poll filter, the `ProcessedEmail` dedup, and `handleReplyV2`'s `replyHtml` invariant were changed independently. The doc captures the invariants, failure modes, and anti-patterns. If you change `src/lib/email-reply-checker.ts` or `handleReplyV2` in `src/lib/scenario-engine.ts`, update that doc's change log.
 
 ### How It Works
 The cron is defined in `vercel.json` and hits `GET /backend/cron/check-emails` every minute.
@@ -73,6 +87,28 @@ npx prisma db push --schema prisma/schema.prisma && npx prisma generate --schema
 - `workflowState: 'waiting_timer'` → waiting for timer to elapse before sending reminder
 - `workflowState: 'awaiting_confirmation'` → reminder sent, waiting for production confirmation
 - `workflowState: 'completed'` → workflow finished
+
+## Modify-after-bundling (branch asks to change qty after loading slips exist)
+The planner (`src/lib/llm-planner.ts`) routes a branch increase based on whether
+loading slips already exist (`loading slips exist (bundles frozen): yes` in SO
+state) and, when they do but plant_ls is NOT yet sent, on what the BRANCH chooses:
+
+- **No LS yet** (bundles computed, ZLOAD1 not fired) → Rule 6 (normal pre-LS).
+- **LS exist, plant_ls NOT sent** → ask the branch "preserve or recreate?" (Rule 6b fork):
+  - **recreate** → Path [A] (Rule 6b-A): `zloading_close(all)` wipe → re-bundle →
+    redo pipeline. Stock precheck is 3-way (fully/partial/none); partial/none
+    inform the branch and wait.
+  - **preserve** → Path [B] = Rule 6e surgical flow (same as post-plant_ls), EXCEPT
+    overflow creates an **extra vehicle (new bundle)** on the same PO instead of a
+    new SO, and the terminal `email_modified_ls_to_plant` sends the FULL LS set
+    (first intimation).
+- **LS sent to plant** → Rule 6e surgical flow; overflow → new SO.
+
+Key plumbing: `bundle_capacity_assessment` takes `overflowMode: 'new_so'|'new_bundle'`;
+the `new_bundle` verdict is `allocated_with_new_bundle`; `createSingleBundleForPo`
+(`src/lib/bundler.ts`) adds one bundle without wiping; the Phase-3 overflow leg is a
+`zload1` step with `args.createNewBundle=true`. Every "inform the branch" step is a
+WAIT point (send + stop, resume on reply).
 
 ## auto_gui2 Backend Endpoints Used
 - `POST /chat` — Triggers SAP transactions (ZSO-VISIBILITY, ZLOAD3, etc.)

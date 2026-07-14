@@ -37,9 +37,21 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# Google OAuth client secrets
+client_secret_*.json
+
 # vercel
 .vercel
 
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# nested clones
+/auto-gui2
+
+# local PDF dumps from missing-LS debug runs
+/missing_pdfs
+
+# local planner-prompt dumps (PLANNER_DUMP_PROMPTS=true)
+/test_artifacts/planner-prompts

@@ -108,6 +108,31 @@ model PurchaseOrder {
   customerId   String?
   status       String   @default("in-progress") // pending, in-progress, completed
   stage        Int      @default(1) // 1-6 workflow stages
+  // Dispatch round counter. 1 = original NEW ORDER → ls_dispatch cycle. After
+  // each `email_2nd_release` fires (post-VA02 modification), the engine
+  // increments this so the next ls_dispatch / dispatch_confirmation on the PO
+  // belong to a fresh round and are not skipped by idempotency guards.
+  dispatchRound Int    @default(1)
+  // Vehicle capacity (tonnes). Extracted from the NEW ORDER email; if absent,
+  // we email the branch to ask and stay NULL until they reply. The bundler
+  // requires this to compute bundles — when NULL, bundling is blocked.
+  weightage    Decimal?
+  // Per-PO stakeholder thread anchors. All outbound emails to BRANCH for this
+  // PO reply into branchThreadId (set from the NEW ORDER thread on intake);
+  // all outbound emails to PLANT reply into plantThreadId (captured the first
+  // time we send to PLANT_EMAIL for this PO). The *AnchorMsgId is the RFC822
+  // Message-ID of the first outbound on that thread, used as In-Reply-To
+  // so Gmail keeps replies stitched.
+  branchThreadId    String?
+  branchAnchorMsgId String?
+  // Original NEW ORDER subject (e.g. "New Order - 3382187"). Every branch
+  // outbound for this PO replies as "Re: <branchSubject>" so Gmail collapses
+  // all of the PO's branch emails into the conversation the branch started.
+  branchSubject     String?
+  // DEPRECATED — plant threads are now per (PO, plant) in PoRecipientThread.
+  // Kept (unused) to avoid a destructive column drop on existing rows.
+  plantThreadId     String?
+  plantAnchorMsgId  String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
@@ -115,8 +140,32 @@ model PurchaseOrder {
   emails      Email[]
   customer    Customer? @relation(fields: [customerId], references: [id])
   bundles     Bundle[]
+  recipientThreads PoRecipientThread[]
 
   @@map("purchase_order")
+}
+
+// Per-recipient Gmail thread anchor for a PO. One row per (PO, recipientEmail).
+// Used for PLANT (one thread per plant a PO dispatches from) and PRODUCTION
+// (one thread per PO). BRANCH does not use this table — it stays on the
+// PurchaseOrder.branchThreadId/branchSubject columns. Every outbound to that
+// recipient replies into `threadId` with `In-Reply-To: anchorMsgId` and the
+// fixed `subject`, so the recipient sees a single conversation.
+model PoRecipientThread {
+  id              String   @id @default(cuid())
+  purchaseOrderId String
+  recipientEmail  String // plant email or PRODUCTION_EMAIL
+  kind            String // 'plant' | 'production'
+  threadId        String
+  anchorMsgId     String? // RFC822 Message-ID of the first outbound (In-Reply-To)
+  subject         String // fixed subject every email in this thread shares
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([purchaseOrderId, recipientEmail])
+  @@map("po_recipient_thread")
 }
 
 // One Bundle = one truck/vehicle worth of LoadingSlipItems. Computed from
@@ -141,8 +190,8 @@ model Bundle {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  items         LoadingSlipItem[]
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  loadingSlips  LoadingSlip[]
   materials     Material[]
   emails        Email[]
   shipments     Shipment[]
@@ -160,8 +209,8 @@ model Shipment {
   id                  String    @id @default(cuid())
   bundleId            String
   salesOrderId        String
-  obdNumber           String?   // delivery_no — the Outbound Delivery / Dispatch Document
-  invoiceNumber       String?   // invoice_no — the HRJ Invoice
+  obdNumber           String?   @unique // delivery_no — ONE Shipment per OBD (a delivery groups several LSs); the VT01N unit
+  invoiceNumber       String?   // invoice_no — representative HRJ invoice for the OBD (per-LS invoices live on LoadingSlip)
   invoiceDate         DateTime?
   sapResults          String?   // JSON: full /processing-data rows for forensics
   status              String    @default("created") // created | shipment-triggered | shipped
@@ -178,17 +227,17 @@ model Shipment {
   salesOrder SalesOrder       @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   items      LoadingSlipItem[]
 
-  @@unique([bundleId, salesOrderId])
   @@map("shipment")
 }
 
 // Customer record keyed by the externally-provided customer_id from the
 // NEW ORDER email. Auto-created on first sight with a generic name.
-// `weightage` is the customer's truck capacity in tonnes (default 45).
+// Customer is just an identity record now. Truck capacity (`weightage`) is
+// stored per-PurchaseOrder, extracted from the NEW ORDER email — different
+// orders from the same customer can use different vehicle sizes.
 model Customer {
   id        String   @id
   name      String   @default("New Customer")
-  weightage Decimal  @default(45)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -224,19 +273,89 @@ model SalesOrder {
   // For 'wait' branch reply intents: re-fire ZSO-VISIBILITY when this passes.
   waitUntil           DateTime?
   waitRechecks        Int       @default(0)
+  // Denormalised latest scenarioKey from ScenarioProgress for fast dashboard reads.
+  intentLabel         String?
+  // SAP plant code (e.g. "7581"). Used to scope inventory pre-checks. Null →
+  // fall back to SAP_DEFAULT_PLANT env var.
+  plant               String?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
-  purchaseOrder PurchaseOrder     @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  items         LoadingSlipItem[]
-  emails        Email[]
-  invoice       Invoice?
-  materials     Material[]
-  workItems     WorkQueue[]
-  shipments     Shipment[]
-  shortages     MaterialShortage[]
+  purchaseOrder      PurchaseOrder      @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  loadingSlips       LoadingSlip[]
+  items              LoadingSlipItem[]
+  emails             Email[]
+  invoice            Invoice?
+  materials          Material[]
+  workItems          WorkQueue[]
+  shipments          Shipment[]
+  shortages          MaterialShortage[]
+  scenarioProgresses ScenarioProgress[]
+  scenarioEvents     ScenarioEvent[]
 
   @@map("sales_order")
+}
+
+// One row per scenario RUN per SalesOrder. The unique constraint on
+// salesOrderId was dropped in Phase E to support mid-flow re-entry: when a
+// new reply supersedes an active scenario, we mark the old row 'aborted' and
+// create a fresh row. The dashboard reads every row to show full audit
+// history. The engine reads the most recent non-terminal row to find the
+// "active" scenario.
+model ScenarioProgress {
+  id               String   @id @default(cuid())
+  salesOrderId     String
+  scenarioKey      String              // e.g. "branch|before_ls|modify|increase"
+  currentStepIndex Int      @default(0)
+  // 'ready' | 'awaiting_callback' | 'awaiting_reply'
+  // | 'awaiting_plant_invoice' | 'awaiting_vt01n'
+  // | 'completed' | 'aborted' | 'failed'
+  state            String   @default("ready")
+  classifierOutput String              // JSON of ScenarioSelection (or legacy BranchReplyClassification)
+  // LLM planner mode (scenarioKey='llm-planned'):
+  //   generatedSteps   = JSON array of PlannedStep { kind, rationale?, args? }
+  //   stopAfterIndex   = index in generatedSteps where the walker pauses
+  //                      (typically the index of the last outbound email)
+  //   plannerRationale = the LLM's overall reasoning, kept for audit
+  generatedSteps   String?
+  stopAfterIndex   Int?
+  plannerRationale String?
+  triggerEmailId   String?
+  lastWorkId       String?
+  lastEmailId      String?
+  error            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  salesOrder       SalesOrder       @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  events           ScenarioEvent[]
+
+  @@index([salesOrderId, state])
+  @@index([state, updatedAt])
+  @@map("scenario_progress")
+}
+
+// Append-only chronological log of everything that happens to a SO inside
+// the scenario engine. Used by:
+//   - the dashboard to render a timeline
+//   - the classifier to give the LLM mid-flow context (recent events)
+// Types: email_received | classifier_decision | scenario_started | step_fired |
+//        step_completed | email_sent | scenario_completed | scenario_aborted |
+//        scenario_failed.
+// `payload` is JSON whose shape depends on `type`.
+model ScenarioEvent {
+  id                 String   @id @default(cuid())
+  salesOrderId       String
+  scenarioProgressId String?
+  type               String
+  payload            String
+  createdAt          DateTime @default(now())
+
+  salesOrder         SalesOrder        @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  scenarioProgress   ScenarioProgress? @relation(fields: [scenarioProgressId], references: [id], onDelete: SetNull)
+
+  @@index([salesOrderId, createdAt])
+  @@map("scenario_event")
 }
 
 // Global FIFO work queue. One row per pending /chat fire to auto_gui2.
@@ -268,6 +387,20 @@ model WorkQueue {
   @@map("work_queue")
 }
 
+// Static catalog of SAP plants. The primary key IS the SAP plant code
+// (e.g. "7651"), so callers that already know the code can look up the
+// plant email directly without an extra join.
+model Plant {
+  id        String   @id  // SAP plant code (e.g. "7651")
+  name      String
+  location  String
+  email     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("plant")
+}
+
 // SO-level material visibility data returned by ZSO-VISIBILITY.
 // Distinct from LoadingSlipItem (which is per-LS, created after ZLOAD1).
 model Material {
@@ -289,31 +422,87 @@ model Material {
   // persistDispatchPlan. Used by the FCFS shortage reactivator to subtract
   // our own outflow from the inflow pool — see shortage-reactivator.ts.
   releasedAt          DateTime?
+  // Pending SO-line change requested by the branch (dec/del), applied to the
+  // loading slip immediately (zload2 / zloading_close) but NOT yet to the SO
+  // line in SAP. Flushed by the next VA02 run (which otherwise only handles
+  // increases). Latest-wins, one pending change per material.
+  //   pendingSoOp='dec' → set the SO line to pendingSoQty on next VA02
+  //   pendingSoOp='del' → delete the SO line on next VA02 (pendingSoQty null)
+  //   pendingSoOp=null  → nothing pending
+  pendingSoOp         String?  // 'dec' | 'del'
+  pendingSoQty        Int?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
   bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
 
-  @@unique([salesOrderId, material, batch])
+  // One Material row per (SO, material). `batch` is informational — SAP
+  // returns it as a (possibly comma-joined, possibly reordered) string that
+  // changes across ZSO_Visibility / ZMatana runs, so it must NOT be part of
+  // the identity. Keying on batch previously let a reordered batch string
+  // create a duplicate row for the same material, surfacing the same item
+  // twice in the dispatch email. No reader filters Material by batch.
+  @@unique([salesOrderId, material])
   @@map("material")
 }
 
-model LoadingSlipItem {
-  id           String  @id @default(cuid())
+// One LoadingSlip = one plant's shipment within a bundle. A bundle (= one
+// truck) may carry multiple LSs when SKUs in the bundle come from different
+// plants. ZLOAD1 creates these in SAP; we mirror them here keyed on lsNumber.
+//
+// Lifecycle:
+//   ZLOAD1 returns LS numbers + a PDF per LS → row created with bundleId set.
+//   plant_ls email sent → status='sent_to_plant'.
+//   plant invoice PDF arrives + ZLOAD3-B1 done → status='invoiced'.
+//   VT01N done → status='completed'.
+model LoadingSlip {
+  id           String   @id @default(cuid())
+  lsNumber     String   @unique
+  bundleId     String
   salesOrderId String
-  bundleId     String?
-  shipmentId   String?
-  lsNumber     String
-  material     String
-  status       String  @default("pending") // pending, in-progress, completed
+  plantEmail   String   // recipient of plant_ls email (today: process.env.PLANT_EMAIL)
+  fileUrl      String?  // R2 key for the LS PDF returned by ZLOAD1
+  status       String   @default("pending") // pending, sent_to_plant, invoiced, completed
+  // Per-LS invoice mapping — RESERVED, populated later. The ZLOAD3 payload has
+  // no ls_number (rows are keyed by material_doc), so we can't yet reliably pin
+  // an invoice to its loading slip; these stay null until the SAP LS→invoice
+  // mapping is supplied, then backfilled. Meanwhile the delivery/OBD + its
+  // invoices are captured on Shipment (per OBD).
+  obdNumber     String?
+  invoiceNumber String?
+  invoiceDate   DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  bundle     Bundle            @relation(fields: [bundleId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder        @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  items      LoadingSlipItem[]
+  emails     Email[]
+
+  @@map("loading_slip")
+}
+
+model LoadingSlipItem {
+  id            String  @id @default(cuid())
+  salesOrderId  String
+  loadingSlipId String? // FK to LoadingSlip (NULL only transiently during back-fill)
+  shipmentId    String?
+  lsNumber      String  // Denormalised from LoadingSlip.lsNumber for back-compat queries
+  material      String
+  // Batch identifier as printed on the SAP loading slip. The same material
+  // code can appear on the same LS multiple times under different batches
+  // (e.g. OV5FJ × {C8, C11, C14}). Batch is therefore part of the LSI's
+  // composite identity, not optional metadata. Defaults to empty string
+  // for legacy / fallback rows where the batch isn't known.
+  batch         String  @default("")
+  status        String  @default("pending") // pending, in-progress, completed
 
   // Aman fields (read-only, populated via API later)
   materialDescription String?
   orderQuantity       Int?
   orderWeight         Decimal?
   grnNumber           String? // GRN Number (from Aman Stage 4)
-  fileUrl             String? // R2 key for the LS file (XLS/PDF)
 
   // Per-LS SAP fields populated by /processing-data (ZLOAD3-B1 callback).
   // Material doc and loaded quantity legitimately vary per LS in a request.
@@ -334,29 +523,47 @@ model LoadingSlipItem {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
-  emails     Email[]
-  bundle     Bundle?    @relation(fields: [bundleId], references: [id], onDelete: SetNull)
-  shipment   Shipment?  @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
+  salesOrder  SalesOrder   @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  emails      Email[]
+  loadingSlip LoadingSlip? @relation(fields: [loadingSlipId], references: [id], onDelete: SetNull)
+  shipment    Shipment?    @relation(fields: [shipmentId], references: [id], onDelete: SetNull)
 
-  @@unique([lsNumber, material])
+  // LSI is uniquely (loadingSlipId, material, batch) — same material on
+  // the same LS but different batches counts as separate rows.
+  // (lsNumber, material, batch) is a back-compat index while loadingSlipId
+  // can still be NULL during back-fill.
+  @@unique([loadingSlipId, material, batch])
+  @@unique([lsNumber, material, batch])
   @@map("loading_slip_item")
 }
 
 model Email {
   id                String    @id @default(cuid())
   salesOrderId      String?   // Direct link to SalesOrder (lead SO for combined dispatch emails)
-  loadingSlipItemId String?   // Optional link to LoadingSlipItem (for LS-specific emails)
+  loadingSlipId     String?   // For plant_ls emails — links to a LoadingSlip (one per plant per bundle)
+  loadingSlipItemId String?   // Optional link to LoadingSlipItem (legacy; prefer loadingSlipId for plant_ls)
   purchaseOrderId   String?   // For multi-SO dispatch emails grouped under one PO
   bundleId          String?   // For per-bundle (per-truck) emails — vehicle details, etc.
   gmailMessageId    String    @unique // Gmail message ID for reply tracking
   gmailThreadId     String             // Thread ID to find replies
+  // RFC822 Message-ID header of this outbound (e.g. <CAh...@mail.gmail.com>).
+  // Immutable once sent; it's the join key inbound replies point at via
+  // In-Reply-To. Cached here so the reply-checker reads it from the DB instead
+  // of calling Gmail (getMessageRfc822Id) once per email on every cron tick.
+  // Backfilled lazily by checkForReplies on first poll of each email.
+  rfc822MessageId   String?
   recipientEmail    String
   subject           String
   status            String    @default("sent") // sent, replied, processed, queued, consumed
   sentAt            DateTime  @default(now())
   repliedAt         DateTime?
   replyPdfUrl       String?   // R2 key for the reply PDF attachment
+
+  // Dispatch-round tag. Set on ls_dispatch / dispatch_confirmation / 2nd_release
+  // emails so the engine can scope idempotency guards and reply detection to
+  // the current round (see PurchaseOrder.dispatchRound). Null for emails that
+  // aren't part of the dispatch cycle (vehicle_details, plant_ls, etc.).
+  dispatchRound     Int?
 
   // Workflow fields
   emailType         String?   // 'ls_dispatch' | 'ls_dispatch_buffered' | 'production_inquiry' | 'production_reminder' | null (legacy)
@@ -366,7 +573,16 @@ model Email {
   sentBody          String?   // Plain text body of the sent email
   replyHtml         String?   // Reply body HTML (for forwarding to auto_gui2)
 
+  // Supervisor-escalation tracking. When the unified classifier returns
+  // action='other', the engine sends a `supervisor_inquiry` email and sets
+  // `awaitingSupervisor=true` on the original trigger Email. `supervisorHops`
+  // counts how many times this thread has bounced through supervisor review;
+  // hard cap at 3 to prevent infinite loops on broken threads.
+  awaitingSupervisor Boolean @default(false)
+  supervisorHops     Int     @default(0)
+
   salesOrder      SalesOrder?      @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  loadingSlip     LoadingSlip?     @relation(fields: [loadingSlipId], references: [id], onDelete: Cascade)
   loadingSlipItem LoadingSlipItem? @relation(fields: [loadingSlipItemId], references: [id], onDelete: Cascade)
   purchaseOrder   PurchaseOrder?   @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   bundle          Bundle?          @relation(fields: [bundleId], references: [id], onDelete: Cascade)
@@ -462,4 +678,31 @@ model Invoice {
   salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
 
   @@map("invoice")
+}
+
+// Free-stock snapshot synced from SAP every ~2 hours via auto_gui2. Upserted
+// by (material, plant). Drives the stock pre-check that gates VA02 for
+// increase-shaped modifications (replaces the old "Zmatana" SAP transaction).
+model InventorySnapshot {
+  id                  String   @id @default(cuid())
+  material            String
+  materialDescription String?
+  vertical            String?
+  plant               String
+  freeStock           Int
+  syncedAt            DateTime @default(now())
+
+  @@unique([material, plant])
+  @@index([material])
+  @@map("inventory_snapshot")
+}
+
+// Singleton row tracking which CSV file label was last ingested, so we don't
+// re-ingest the same file on every poll.
+model InventorySyncState {
+  id            String   @id @default("singleton")
+  lastFileLabel String?
+  lastSyncedAt  DateTime @updatedAt
+
+  @@map("inventory_sync_state")
 }

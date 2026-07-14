@@ -7,29 +7,29 @@ import { uploadToS3 } from '@/lib/s3';
  * POST /backend/orders/aman/initial-data
  *
  * Receives LS files (XLS/PDF) from Aman (auto_gui2) after executing ZLOAD3-A.
- * For each file received:
- * 1. Reads SO number from CurrentSO singleton (or uses provided soNumber)
- * 2. Uploads file to R2: ls-files/{soNumber}/{filename}
- * 3. Creates/updates LoadingSlipItem with fileUrl
- * 4. Sends email to plant with LS file attached
- * 5. Creates Email record for tracking
+ * Per file:
+ *   1. Resolve SO from `so_number` form field (legacy: `soNumber` / CurrentSO).
+ *   2. Upload the file to R2 at `ls-files/{soNumber}/{filename}`.
+ *   3. Find the LoadingSlip created earlier by /zload1-data and update its
+ *      fileUrl. If it doesn't exist, log and store the file on a bare LSI
+ *      (loadingSlipId=NULL) — the LS link will get repaired on the next
+ *      ZLOAD1 callback for the same lsNumber.
+ *   4. Find-or-create LoadingSlipItem, populate the `items` metadata.
+ *   5. Send the plant_ls email tagged to the LoadingSlip (so per-LS replies
+ *      route cleanly).
  *
- * Expected: multipart/form-data with:
- * - so_number: string (preferred - SAP sales order number from auto_gui2)
- * - soNumber: string (legacy fallback - will read from CurrentSO if neither provided)
- * - file: File (single LS file, filename is the LS number e.g., "1001234.xls")
- * OR
- * - files: File[] (multiple LS files)
- *
- * Optional JSON fields in form data:
- * - items: JSON string of InitialDataItem[] for additional item data
+ * Schema (post-refactor):
+ *   LoadingSlip = one plant's shipment within a bundle. Owns `fileUrl`.
+ *   LoadingSlipItem = one SKU line on an LS.
  */
 export async function POST(request: Request) {
   try {
     const formData = await request.formData();
 
     // SO lookup priority: so_number → soNumber → CurrentSO singleton
-    let soNumber = (formData.get('so_number') as string | null) || (formData.get('soNumber') as string | null);
+    let soNumber =
+      (formData.get('so_number') as string | null) ||
+      (formData.get('soNumber') as string | null);
 
     if (!soNumber) {
       const currentSO = await prisma.currentSO.findFirst();
@@ -42,7 +42,6 @@ export async function POST(request: Request) {
       soNumber = currentSO.soNumber;
     }
 
-    // Find the sales order
     const salesOrder = await prisma.salesOrder.findFirst({
       where: { soNumber },
       select: {
@@ -54,7 +53,6 @@ export async function POST(request: Request) {
         transportId: true,
       },
     });
-
     if (!salesOrder) {
       return NextResponse.json(
         { error: `Sales order not found: ${soNumber}` },
@@ -62,9 +60,9 @@ export async function POST(request: Request) {
       );
     }
 
-    // Parse optional items JSON for additional metadata
+    // Optional `items` JSON: per-LS metadata (material, qty, weight).
     const itemsJson = formData.get('items') as string | null;
-    let itemsData: Record<
+    const itemsData: Record<
       string,
       {
         material?: string;
@@ -91,16 +89,13 @@ export async function POST(request: Request) {
       }
     }
 
-    // Get files - support both single 'file' and multiple 'files'
+    // Accept either a single `file` or multiple `files`.
     const singleFile = formData.get('file') as File | null;
     const multipleFiles = formData.getAll('files') as File[];
     const files = singleFile ? [singleFile] : multipleFiles;
 
     if (files.length === 0) {
-      return NextResponse.json(
-        { error: 'No files received' },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: 'No files received' }, { status: 400 });
     }
 
     const results: Array<{
@@ -112,11 +107,9 @@ export async function POST(request: Request) {
     }> = [];
 
     for (const file of files) {
-      // Extract LS number from filename (e.g., "1001234.xls" or "1001234.pdf" -> "1001234")
       const lsNumber = file.name.replace(/\.(xls|xlsx|pdf)$/i, '').trim();
       const itemMeta = itemsData[lsNumber] || {};
 
-      // Determine content type
       const isXls = /\.xls$/i.test(file.name);
       const isXlsx = /\.xlsx$/i.test(file.name);
       const contentType = isXls
@@ -126,50 +119,66 @@ export async function POST(request: Request) {
           : 'application/pdf';
 
       try {
-        // Get file buffer
         const fileBuffer = Buffer.from(await file.arrayBuffer());
-
-        // Upload to R2: ls-files/{soNumber}/{filename}
         const s3Key = `ls-files/${salesOrder.soNumber}/${file.name}`;
         await uploadToS3(s3Key, fileBuffer, contentType);
 
-        // Create or update LoadingSlipItem
+        // Try to find the LoadingSlip created earlier by /zload1-data.
+        // If found, update its fileUrl (the file from ZLOAD3-A often has
+        // more detail than the ZLOAD1 file).
+        const loadingSlip = await prisma.loadingSlip.findUnique({
+          where: { lsNumber },
+          select: { id: true },
+        });
+        if (loadingSlip) {
+          await prisma.loadingSlip.update({
+            where: { id: loadingSlip.id },
+            data: { fileUrl: s3Key },
+          });
+        } else {
+          console.warn(
+            `[Initial Data] No LoadingSlip row for LS ${lsNumber} (SO ${soNumber}). ` +
+              `ZLOAD1 callback may not have landed yet. Storing LSI with loadingSlipId=NULL; ` +
+              `/zload1-data will link it when it arrives.`
+          );
+        }
+
+        // Find-or-create the LSI. The unique index on (lsNumber, material)
+        // means we can't blindly create — search first.
         let loadingSlipItem = await prisma.loadingSlipItem.findFirst({
-          where: {
-            salesOrderId: salesOrder.id,
-            lsNumber,
-          },
+          where: { salesOrderId: salesOrder.id, lsNumber },
         });
 
         if (!loadingSlipItem) {
-          // Create new LoadingSlipItem
           loadingSlipItem = await prisma.loadingSlipItem.create({
             data: {
               salesOrderId: salesOrder.id,
+              loadingSlipId: loadingSlip?.id ?? null,
               lsNumber,
               material: itemMeta.material || 'PENDING',
               materialDescription: itemMeta.materialDescription || null,
               orderQuantity: itemMeta.orderQuantity || null,
               orderWeight: itemMeta.orderWeight || null,
-              fileUrl: s3Key,
               status: 'pending',
             },
           });
         } else {
-          // Update existing LoadingSlipItem with fileUrl and optional metadata
           loadingSlipItem = await prisma.loadingSlipItem.update({
             where: { id: loadingSlipItem.id },
             data: {
-              fileUrl: s3Key,
+              ...(loadingSlip && { loadingSlipId: loadingSlip.id }),
               ...(itemMeta.material && { material: itemMeta.material }),
-              ...(itemMeta.materialDescription && { materialDescription: itemMeta.materialDescription }),
+              ...(itemMeta.materialDescription && {
+                materialDescription: itemMeta.materialDescription,
+              }),
               ...(itemMeta.orderQuantity && { orderQuantity: itemMeta.orderQuantity }),
               ...(itemMeta.orderWeight && { orderWeight: itemMeta.orderWeight }),
             },
           });
         }
 
-        // Send email to plant
+        // Send the plant_ls email. The Email row gets `loadingSlipId` set
+        // inside sendLSEmail so per-LS replies route to the right LS.
         const { messageId } = await sendLSEmail(
           loadingSlipItem.id,
           salesOrder.id,
@@ -182,14 +191,20 @@ export async function POST(request: Request) {
             containerNumber: salesOrder.containerNumber,
             transportId: salesOrder.transportId,
           },
-          file.name // pass original filename for email attachment
+          file.name
         );
 
-        // Update LoadingSlipItem status
         await prisma.loadingSlipItem.update({
           where: { id: loadingSlipItem.id },
           data: { status: 'in-progress' },
         });
+
+        if (loadingSlip) {
+          await prisma.loadingSlip.update({
+            where: { id: loadingSlip.id },
+            data: { status: 'sent_to_plant' },
+          });
+        }
 
         results.push({
           lsNumber,
@@ -208,7 +223,6 @@ export async function POST(request: Request) {
       }
     }
 
-    // Update sales order status
     await prisma.salesOrder.update({
       where: { id: salesOrder.id },
       data: { status: 'in-progress' },

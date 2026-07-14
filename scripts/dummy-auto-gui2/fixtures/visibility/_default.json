@@ -1,28 +1,92 @@
 {
   "materials": [
     {
-      "material": "OP7WJ300X450-5",
-      "material_description": "LUNIA BROWN HT ELV MDR-P",
-      "batch": "B001",
-      "order_quantity": 20,
-      "available_stock_for_so": 20,
-      "order_weight_kg": 480
+      "material": "YE1EDWO00001APJP",
+      "material_description": "OE1FJ 600x1200-2 EDISS WOOD MDR-P",
+      "order_quantity": 50,
+      "available_stock_for_so": 50,
+      "batch": "A-26",
+      "order_weight_kg": 1320
     },
     {
-      "material": "OOWJ300X450-6",
-      "material_description": "DOVER LT GL-P",
-      "batch": "B002",
-      "order_quantity": 20,
-      "available_stock_for_so": 13,
-      "order_weight_kg": 240
+      "material": "YV6FRYENE0000PJP",
+      "material_description": "OV6FJ 600x1200-2 FRYETT NERO CRVMDR-P",
+      "order_quantity": 100,
+      "available_stock_for_so": 100,
+      "batch": "30-07-2025",
+      "order_weight_kg": 2720
     },
     {
-      "material": "OA4FJ600X600-4",
-      "material_description": "ABESCATO WHITE MT REC-P",
-      "batch": "B003",
-      "order_quantity": 20,
-      "available_stock_for_so": 20,
-      "order_weight_kg": 600
+      "material": "YODOVMEHL0000ZZP",
+      "material_description": "OOWJ 300X450-6 DOVER MESH HL GL -P",
+      "order_quantity": 200,
+      "available_stock_for_so": 0,
+      "batch": "N/A",
+      "order_weight_kg": 2100
+    },
+    {
+      "material": "YA4COWOCR000043P",
+      "material_description": "OA4FJ 600X600-4 COSTA WOOD CREMA SUMDR-P",
+      "order_quantity": 250,
+      "available_stock_for_so": 250,
+      "batch": "20",
+      "order_weight_kg": 6625
+    },
+    {
+      "material": "YE1ROST000000PJP",
+      "material_description": "OE1FJ 600X1200-2 ROYAL STATUARIO GLDGR-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 76,
+      "batch": "A-38, A-39",
+      "order_weight_kg": 5280
+    },
+    {
+      "material": "YA4COLA22000043P",
+      "material_description": "OA4FJ 600X600-4 COLABA COFFEE MT REC-P",
+      "order_quantity": 150,
+      "available_stock_for_so": 150,
+      "batch": "38",
+      "order_weight_kg": 3975
+    },
+    {
+      "material": "YE1MAZO150000PJP",
+      "material_description": "OE1FJ 600X1200-2 MAZONITE BLUE HGDGRE-P",
+      "order_quantity": 300,
+      "available_stock_for_so": 300,
+      "batch": "A-107",
+      "order_weight_kg": 7920
+    },
+    {
+      "material": "YV7FIRMBLAN00PJP",
+      "material_description": "OV7FJ 600X1200-2 FIRMIN BLISS ANANSPDR-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 200,
+      "batch": "CP-09",
+      "order_weight_kg": 5460
+    },
+    {
+      "material": "YE1REXWBZ001APJP",
+      "material_description": "OE1FJ 600x1200-2 REXWOOD BRONZ MDR-P",
+      "order_quantity": 150,
+      "available_stock_for_so": 150,
+      "batch": "A-18",
+      "order_weight_kg": 3960
+    },
+    {
+      "material": "YE1THOM150000PJP",
+      "material_description": "OE1FJ 600X1200-2 THOM BLUE HGDGRE-P",
+      "order_quantity": 100,
+      "available_stock_for_so": 100,
+      "batch": "A-65",
+      "order_weight_kg": 2640
+    },
+    {
+      "material": "YA4COWOWE000043P",
+      "material_description": "OA4FJ 600X600-4 COSTA WOOD WENGE SUMDR-P",
+      "order_quantity": 200,
+      "available_stock_for_so": 200,
+      "batch": "32",
+      "order_weight_kg": 5300
     }
   ]
 }

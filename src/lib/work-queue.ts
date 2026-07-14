@@ -4,7 +4,14 @@ import type { WorkQueue } from '@prisma/client';
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
 
-export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51';
+/**
+ * When NEXT_PUBLIC_SAP_TEST_MODE is "true", every /chat request carries
+ * `test_mode: true` so auto_gui2 replays fixtures instead of driving real SAP
+ * (see TEST_MODE.md). Anything else (unset, "false", "0") means live SAP.
+ */
+export const SAP_TEST_MODE = process.env.NEXT_PUBLIC_SAP_TEST_MODE === 'true';
+
+export type WorkStep = 'visibility' | 'zload1' | 'zload3b1' | 'vto1n' | 'mb51' | 'zloading_close' | 'va02' | 'zload2' | 'lone_zmatana';
 
 /**
  * Retry policy: 1 initial attempt + 3 retries = 4 total. Uniform across all
@@ -71,6 +78,7 @@ export async function pumpQueue(): Promise<WorkQueue | null> {
       OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: new Date() } }],
     },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    include: { salesOrder: { select: { soNumber: true } } },
   });
   if (!next) return null;
 
@@ -91,12 +99,20 @@ export async function pumpQueue(): Promise<WorkQueue | null> {
   const wireBody = {
     work_id: next.id,
     ...payload,
+    ...(SAP_TEST_MODE ? { test_mode: true } : {}),
     meta: { ...(payload.meta ?? {}), work_id: next.id },
   };
 
-  const soNumber = (payload.meta?.so_number as string | undefined) ?? payload.so_number ?? 'unknown';
+  // SO number for the log: the WorkQueue row's FK is the source of truth.
+  // The payload-meta fallback is only useful for rows enqueued without a
+  // salesOrderId set (rare — mostly PO-level steps).
+  const soNumber =
+    next.salesOrder?.soNumber ??
+    (payload.meta?.so_number as string | undefined) ??
+    payload.so_number ??
+    'unknown';
 
-  console.log(`[WorkQueue] → SEND work ${next.id} (${next.step}, SO ${soNumber}) → auto_gui2`);
+  console.log(`[WorkQueue] → SEND work ${next.id} (${next.step}, SO ${soNumber})${SAP_TEST_MODE ? ' [TEST_MODE]' : ''} → auto_gui2`);
 
   fetch(`http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/chat`, {
     method: 'POST',
@@ -212,4 +228,58 @@ export async function cancelWork(
  */
 export function getFiringWork() {
   return prisma.workQueue.findFirst({ where: { state: 'firing' } });
+}
+
+export class WorkCompletionTimeoutError extends Error {
+  constructor(public unfinishedWorkIds: string[], public timeoutMs: number) {
+    super(
+      `awaitWorkCompletion: ${unfinishedWorkIds.length} work row(s) still pending after ${timeoutMs}ms: ${unfinishedWorkIds.join(', ')}`,
+    );
+    this.name = 'WorkCompletionTimeoutError';
+  }
+}
+
+/**
+ * Poll until every work id has reached a terminal state (done | failed |
+ * cancelled). Throws `WorkCompletionTimeoutError` if the timeout elapses
+ * with rows still in `queued` or `firing`.
+ *
+ * pollIntervalMs default is 500ms — short enough to feel responsive in
+ * tests, long enough to keep DB load minimal in prod. Override per call
+ * if needed.
+ *
+ * Note: previously used by `computeBundlesForPo` to block on SAP-side
+ * ZLOADING_CLOSE before wiping the DB. That dependency was removed when
+ * the bundler became pure-DB (planner now drives ZLOADING_CLOSE upstream);
+ * the helper is kept as a general-purpose utility for any caller that
+ * needs to block on a batch of work rows.
+ */
+export async function awaitWorkCompletion(
+  workIds: string[],
+  opts: { timeoutMs?: number; pollIntervalMs?: number } = {},
+): Promise<void> {
+  if (workIds.length === 0) return;
+  const timeoutMs = opts.timeoutMs ?? 120_000;
+  const pollIntervalMs = opts.pollIntervalMs ?? 500;
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    // Keep the pump running each iteration. markDone / markFailed don't
+    // pump on their own — the cron's per-minute tick is normally what
+    // advances the queue, but waiting up to a minute per row here would
+    // dominate the bundler's latency. Pumping at our poll cadence makes
+    // back-to-back closes complete in ~ pollIntervalMs.
+    await pumpQueue();
+
+    const rows = await prisma.workQueue.findMany({
+      where: { id: { in: workIds } },
+      select: { id: true, state: true },
+    });
+    const pending = rows.filter((r) => r.state !== 'done' && r.state !== 'failed' && r.state !== 'cancelled');
+    if (pending.length === 0) return;
+    if (Date.now() >= deadline) {
+      throw new WorkCompletionTimeoutError(pending.map((r) => r.id), timeoutMs);
+    }
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
 }

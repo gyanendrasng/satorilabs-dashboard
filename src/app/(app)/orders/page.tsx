@@ -208,6 +208,9 @@ export default function OrdersPage() {
 
     try {
       const instruction = `VPN is connected and SAP is logged in. Just go ahead and run the SAP Transaction ZLOAD3-A for Sales order number ${soNumber}`;
+      // When SAP test mode is on, auto_gui2 replays fixtures instead of driving
+      // real SAP (see TEST_MODE.md). Same flag the server-side work queue reads.
+      const testMode = process.env.NEXT_PUBLIC_SAP_TEST_MODE === 'true';
 
       const res = await fetch(`${amanUrl}/chat`, {
         method: 'POST',
@@ -215,6 +218,7 @@ export default function OrdersPage() {
         body: JSON.stringify({
           instruction,
           transaction_code: 'ZLOAD3-A',
+          ...(testMode ? { test_mode: true, meta: { so_number: soNumber } } : {}),
         }),
       });
 
@@ -292,9 +296,9 @@ export default function OrdersPage() {
                         </CardTitle>
                       </div>
                       <div className="flex items-center gap-3 text-sm text-muted-foreground">
-                        {po.customer && (
-                          <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs" title={`Truck capacity for ${po.customer.name}`}>
-                            {po.customer.weightage} t
+                        {po.weightage != null && (
+                          <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 text-xs" title={`Truck capacity for this PO`}>
+                            {po.weightage} t
                           </span>
                         )}
                         {po.salesOrders.length > 1 && (() => {

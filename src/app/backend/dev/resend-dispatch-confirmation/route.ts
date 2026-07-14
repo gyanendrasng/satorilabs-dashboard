@@ -89,10 +89,6 @@ export async function POST(req: Request) {
     twoVehicles: meta.twoVehicles,
     totalTonnes: meta.totalTonnes,
     capacityTonnes: meta.capacityTonnes,
-    threadAnchor: {
-      gmailThreadId: lsDispatch.gmailThreadId,
-      gmailMessageId: lsDispatch.gmailMessageId,
-    },
     log,
   });
 

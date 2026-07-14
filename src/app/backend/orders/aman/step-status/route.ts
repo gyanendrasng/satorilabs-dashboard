@@ -201,6 +201,67 @@ export async function POST(request: Request) {
     }
   }
 
+  // Scenario engine: when a SAP step completes successfully, advance any
+  // active ScenarioProgress whose current step matches this work step. Safe
+  // no-op when the engine is disabled, no progress row exists, or the
+  // current step doesn't match. `existing.step` is the same WorkStep union
+  // literal used at enqueue time, so narrow it to that type for the call.
+  if (status === 'done' && existing.salesOrderId) {
+    // First — always emit a standalone step_completed event so the LLM
+    // planner's audit trail captures the SAP transaction even when there
+    // is no active scenario to advance (cron-driven ZSO-VISIBILITY, legacy
+    // ZLOAD1 fired from handleBranchReply, etc.). maybeAdvanceScenario
+    // emits its OWN step_completed when it actually advances a scenario,
+    // so we emit here only when there is no non-terminal scenario row.
+    try {
+      const { prisma } = await import('@/lib/prisma');
+      const active = await prisma.scenarioProgress.findFirst({
+        where: {
+          salesOrderId: existing.salesOrderId,
+          state: { notIn: ['completed', 'aborted', 'failed'] },
+        },
+        select: { id: true },
+      });
+      if (!active) {
+        // Map WorkStep → engine StepKind for the audit payload.
+        const stepKindMap: Record<string, string> = {
+          visibility: 'zso_visibility',
+          va02: 'va02',
+          zload1: 'zload1',
+          zload2: 'zload2',
+          zloading_close: 'zloading_close',
+          mb51: 'mb51',
+        };
+        const kind = stepKindMap[existing.step] ?? existing.step;
+        const { emitEvent } = await import('@/lib/scenario-events');
+        await emitEvent({
+          salesOrderId: existing.salesOrderId,
+          type: 'step_completed',
+          payload: {
+            kind,
+            scenario_key: 'cron-driven',
+            work_id: workId,
+          },
+        });
+      }
+    } catch (evErr) {
+      console.error(`[StepStatus] standalone step_completed warning for work ${workId}:`, evErr);
+    }
+
+    try {
+      const { maybeAdvanceScenario } = await import('@/lib/scenario-engine');
+      await maybeAdvanceScenario(
+        existing.salesOrderId,
+        existing.step as import('@/lib/work-queue').WorkStep,
+      );
+    } catch (engineErr) {
+      console.error(
+        `[StepStatus] maybeAdvanceScenario warning for work ${workId}:`,
+        engineErr
+      );
+    }
+  }
+
   const next = await pumpQueue();
 
   if (next) {

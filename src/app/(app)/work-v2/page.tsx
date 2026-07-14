@@ -1,0 +1,2441 @@
+'use client';
+
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { WorkChat } from '@/components/work/WorkChat';
+import {
+  Monitor,
+  Eye,
+  EyeOff,
+  RotateCcw,
+  ZoomIn,
+  ZoomOut,
+  Loader2,
+  Play,
+  Pause,
+  AlertCircle,
+  CheckCircle2,
+  Clock,
+  FileText,
+  Package,
+  ChevronDown,
+  ChevronRight,
+  Edit,
+  Plus,
+  Save,
+  X,
+  MessageSquare,
+  Layers,
+  Bot,
+  Truck,
+  ScrollText,
+  Trash2,
+  ArrowDown,
+  ListChecks,
+  Boxes,
+} from 'lucide-react';
+import { PurchaseOrder, SalesOrder, LoadingSlipItem, Invoice, Shipment, Bundle, groupItemsByLsNumber } from '@/components/orders/types';
+import { BundleVehicleEditor } from '@/components/orders/BundleVehicleEditor';
+import { AGENT_SCREENS } from '@/lib/agent-screens';
+import { SatoriWordmark } from '@/components/work/SatoriBrand';
+import { InventoryEditor } from '@/components/inventory/InventoryEditor';
+
+interface ChatMessage {
+  id: string;
+  role: string;
+  content: string;
+  createdAt?: string;
+}
+
+interface WorkSession {
+  id: string;
+  title: string;
+  mode?: string;
+  lastMessageAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  messages: ChatMessage[];
+}
+
+export default function WorkV2Page() {
+  // Active tab state
+  const [activeTab, setActiveTab] = useState<'hierarchy' | 'chat' | 'screen' | 'queue' | 'logs' | 'inventory'>('hierarchy');
+
+  // Work queue state
+  interface QueueItem {
+    id: string;
+    step: string;
+    state: string;
+    soNumber: string | null;
+    attemptCount: number;
+    error: string | null;
+    createdAt: string;
+    startedAt: string | null;
+    finishedAt: string | null;
+    cancellable: boolean;
+  }
+  const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
+  const [queueLoading, setQueueLoading] = useState(true);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+
+  // Chat state
+  const [chat, setChat] = useState<WorkSession | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // Orders state
+  const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([]);
+  const [ordersLoading, setOrdersLoading] = useState(true);
+  const [expandedPOs, setExpandedPOs] = useState<Set<string>>(new Set());
+  const [expandedSOs, setExpandedSOs] = useState<Set<string>>(new Set());
+
+  // Modal state
+  const [showInputModal, setShowInputModal] = useState(false);
+  const [inputType, setInputType] = useState<'new-po' | 'new-so' | 'so-details' | 'shipment-details'>('new-po');
+  const [selectedPO, setSelectedPO] = useState<PurchaseOrder | null>(null);
+  const [selectedSO, setSelectedSO] = useState<SalesOrder | null>(null);
+  const [selectedInvoice, setSelectedInvoice] = useState<Invoice | null>(null);
+  const [selectedShipment, setSelectedShipment] = useState<Shipment | null>(null);
+
+  // Form state for new PO
+  const [newPOForm, setNewPOForm] = useState({ customerName: '', poNumber: '' });
+
+  // Track multiple SOs being added to new PO
+  const [newPOSOs, setNewPOSOs] = useState<Array<{
+    id: number;
+    customerName: string;
+    soNumbers: string[]; // Changed to array for multiple SO numbers
+    weight: string;
+    containerType: string;
+    deliveryLocations: string;
+    vehicleNumber: string;
+    driverMobile: string;
+    containerNumber: string;
+    sealNumber: string;
+    specialInstructions: string;
+  }>>([{
+    id: 1,
+    customerName: '',
+    soNumbers: [''], // Array with one empty string
+    weight: '',
+    containerType: '',
+    deliveryLocations: '',
+    vehicleNumber: '',
+    driverMobile: '',
+    containerNumber: '',
+    sealNumber: '',
+    specialInstructions: '',
+  }]);
+
+  // Form state for new SO
+  const [newSOForm, setNewSOForm] = useState({
+    soNumber: '',
+    vehicleNumber: '',
+    transportId: '',
+    driverMobile: '',
+    containerNumber: '',
+    sealNumber: '',
+    weight: '',
+    containerType: '',
+    deliveryLocations: '',
+    specialInstructions: '',
+  });
+
+  // Form state for SO details
+  const [soDetailsForm, setSODetailsForm] = useState({
+    vehicleNumber: '',
+    transportId: '',
+    driverMobile: '',
+    containerNumber: '',
+    sealNumber: '',
+    weight: '',
+    containerType: '',
+    deliveryLocations: '',
+    specialInstructions: '',
+  });
+
+  // Form state for shipment details
+  const [shipmentForm, setShipmentForm] = useState({
+    lrNumber: '',
+    lrDate: '',
+    vehicleNumber: '',
+    shipmentType: '',
+    plantCode: '',
+    notes: '',
+  });
+
+  // VM screen state
+  const [showVmScreen, setShowVmScreen] = useState(true);
+  const [screenZoom, setScreenZoom] = useState(100);
+  const [activeScreenId, setActiveScreenId] = useState<string | undefined>(AGENT_SCREENS[0]?.id);
+  const activeScreen = AGENT_SCREENS.find((s) => s.id === activeScreenId);
+
+  // Logs state
+  interface LogEntry {
+    timestamp: string;
+    level: string;
+    message: string;
+    logger?: string;
+    receivedAt: number;
+    source: 'log' | 'status';
+    statusType?: string;
+    step?: number;
+    totalSteps?: number;
+    agent?: string;
+    details?: Record<string, unknown>;
+  }
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [autoScroll, setAutoScroll] = useState(true);
+  // Mirror of autoScroll for use inside the SSE handler (which is set up once).
+  const autoScrollRef = useRef(true);
+  useEffect(() => { autoScrollRef.current = autoScroll; }, [autoScroll]);
+  const [hasNewLogs, setHasNewLogs] = useState(false);
+  const [logFilter, setLogFilter] = useState<string>('');
+  const [expandedDetails, setExpandedDetails] = useState<Set<number>>(new Set());
+  const logContainerRef = useRef<HTMLDivElement>(null);
+  // True while we set scrollTop programmatically, so the onScroll handler
+  // doesn't misread our own scroll as the user scrolling away from the bottom.
+  const programmaticScrollRef = useRef(false);
+  const [connected, setConnected] = useState(false);
+
+  // Jump the log view to the bottom (latest) and re-pin auto-scroll.
+  const scrollLogsToBottom = useCallback(() => {
+    const el = logContainerRef.current;
+    if (!el) return;
+    programmaticScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    requestAnimationFrame(() => {
+      programmaticScrollRef.current = false;
+    });
+    setHasNewLogs(false);
+  }, []);
+
+  // SSE connection for logs
+  useEffect(() => {
+    const es = new EventSource('/backend/logs/stream');
+
+    es.onopen = () => setConnected(true);
+
+    es.onmessage = (event) => {
+      try {
+        const log: LogEntry = JSON.parse(event.data);
+        setLogs((prev) => {
+          const next = [...prev, log];
+          // Only trim old entries off the top while the user is pinned to the
+          // bottom (auto-scroll on). When they've scrolled up to read, trimming
+          // would shift content out from under them — so we let the list grow
+          // and trim later, once they scroll back down. HARD_CAP keeps it from
+          // growing without bound if they stay scrolled up indefinitely.
+          const limit = autoScrollRef.current ? 500 : 5000;
+          return next.length > limit ? next.slice(-limit) : next;
+        });
+        // If the user has scrolled up (auto-scroll paused), surface a
+        // "new logs" affordance instead of yanking the view down.
+        if (!autoScrollRef.current) setHasNewLogs(true);
+      } catch {
+        // ignore malformed events
+      }
+    };
+
+    es.onerror = () => {
+      setConnected(false);
+    };
+
+    return () => es.close();
+  }, []);
+
+  // Auto-scroll logs: while pinned to the bottom, follow new entries.
+  // Guard the scroll so the onScroll handler doesn't read it as a user scroll.
+  useEffect(() => {
+    if (!autoScroll) return;
+    // Re-pinned to the bottom: reclaim any overflow we allowed to accumulate
+    // while scrolled up. Trimming here is invisible because we're at the
+    // bottom and about to jump to the bottom anyway.
+    setLogs((prev) => (prev.length > 500 ? prev.slice(-500) : prev));
+    const el = logContainerRef.current;
+    if (!el) return;
+    programmaticScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    requestAnimationFrame(() => { programmaticScrollRef.current = false; });
+  }, [logs, autoScroll]);
+
+  // On landing the Logs tab, jump to the latest (bottom) and re-pin.
+  useEffect(() => {
+    if (activeTab !== 'logs') return;
+    setAutoScroll(true);
+    requestAnimationFrame(() => scrollLogsToBottom());
+  }, [activeTab, scrollLogsToBottom]);
+
+
+  // Fetch orders
+  const fetchOrders = useCallback(async () => {
+    try {
+      const res = await fetch('/backend/orders');
+      const data = await res.json();
+      if (!data.error) {
+        setPurchaseOrders(data.purchaseOrders);
+        // Auto-expand all POs
+        setExpandedPOs(new Set(data.purchaseOrders.map((po: PurchaseOrder) => po.id)));
+      }
+    } catch (err) {
+      console.error('Failed to fetch orders:', err);
+    } finally {
+      setOrdersLoading(false);
+    }
+  }, []);
+
+  const fetchQueue = useCallback(async () => {
+    try {
+      const res = await fetch('/backend/work-queue');
+      const data = await res.json();
+      if (Array.isArray(data.items)) setQueueItems(data.items);
+    } catch (err) {
+      console.error('Failed to fetch work queue:', err);
+    } finally {
+      setQueueLoading(false);
+    }
+  }, []);
+
+  const cancelQueueItem = useCallback(async (id: string) => {
+    setCancellingId(id);
+    try {
+      const res = await fetch(`/backend/work-queue/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || 'Could not cancel — it may already be running.');
+      }
+    } catch (err) {
+      console.error('Failed to cancel work item:', err);
+    } finally {
+      setCancellingId(null);
+      fetchQueue();
+    }
+  }, [fetchQueue]);
+
+  // Poll the work queue while the Queue tab is open.
+  useEffect(() => {
+    if (activeTab !== 'queue') return;
+    fetchQueue();
+    const interval = setInterval(fetchQueue, 3000);
+    return () => clearInterval(interval);
+  }, [activeTab, fetchQueue]);
+
+  // Fetch work chat
+  useEffect(() => {
+    async function fetchWorkChat() {
+      try {
+        const response = await fetch('/backend/work-chat');
+        if (!response.ok) {
+          if (response.status === 401) {
+            throw new Error('Please sign in to access Work Station');
+          }
+          throw new Error('Failed to load work chat');
+        }
+        const data = await response.json();
+        setChat(data.chat);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load');
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchWorkChat();
+    fetchOrders();
+  }, [fetchOrders]);
+
+  // Agent screen: connect directly to the active screen's /video WebSocket and
+  // render each JPEG frame into an <img>. Only the currently-viewed screen is
+  // connected; switching screens tears down the old socket and opens the new.
+  const agentImgRef = useRef<HTMLImageElement>(null);
+  const [agentFps, setAgentFps] = useState<number | null>(null);
+  const [agentStatus, setAgentStatus] = useState<'connecting' | 'live' | 'reconnecting'>('connecting');
+
+  useEffect(() => {
+    if (activeTab !== 'screen' || !showVmScreen || !activeScreen) return;
+    // Reset per-feed indicators so stale FPS/status from a previous screen
+    // don't linger while the new socket connects.
+    setAgentFps(null);
+    setAgentStatus('connecting');
+    let ws: WebSocket | null = null;
+    let prevUrl: string | null = null;
+    let frames = 0;
+    let lastReport = Date.now();
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+
+    const connect = () => {
+      ws = new WebSocket(activeScreen.url);
+      ws.binaryType = 'blob';
+      ws.onopen = () => setAgentStatus('live');
+      ws.onmessage = (e) => {
+        const img = agentImgRef.current;
+        if (!img) return;
+        const url = URL.createObjectURL(e.data as Blob);
+        const old = prevUrl;
+        img.onload = () => { if (old) URL.revokeObjectURL(old); };
+        img.src = url;
+        prevUrl = url;
+        frames++;
+        const now = Date.now();
+        if (now - lastReport >= 1000) {
+          setAgentFps(frames);
+          frames = 0;
+          lastReport = now;
+        }
+      };
+      ws.onclose = () => {
+        if (closed) return;
+        setAgentStatus('reconnecting');
+        reconnectTimer = setTimeout(connect, 1500);
+      };
+    };
+    connect();
+
+    return () => {
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (ws) ws.close();
+      if (prevUrl) URL.revokeObjectURL(prevUrl);
+    };
+  }, [activeTab, showVmScreen, activeScreen]);
+
+  const handleUpdateTitle = (sessionId: string, newTitle: string) => {
+    if (chat && chat.id === sessionId) {
+      setChat({ ...chat, title: newTitle });
+    }
+  };
+
+  // Toggle functions
+  const togglePO = (poId: string) => {
+    setExpandedPOs((prev) => {
+      const next = new Set(prev);
+      if (next.has(poId)) next.delete(poId);
+      else next.add(poId);
+      return next;
+    });
+  };
+
+  const toggleSO = (soId: string) => {
+    setExpandedSOs((prev) => {
+      const next = new Set(prev);
+      if (next.has(soId)) next.delete(soId);
+      else next.add(soId);
+      return next;
+    });
+  };
+
+  // Check if invoice shipment details can be provided (legacy SO-level path)
+  const canProvideShipmentDetails = (so: SalesOrder) => {
+    const allLSCompleted = so.items.every((ls) => ls.status === 'completed');
+    const soCompleted = so.status === 'completed';
+    const invoiceCreated = so.invoice && so.invoice.status === 'created';
+    const noShipmentYet = !so.lrNumber;
+    const notAlreadyTriggered = !so.invoice || (so.invoice.status !== 'shipment-triggered' && so.invoice.status !== 'shipped');
+    return allLSCompleted && soCompleted && invoiceCreated && noShipmentYet && notAlreadyTriggered;
+  };
+
+  // Per-shipment gate: enabled while the Shipment is still in 'created' state
+  // (OBD generated, but VTO1N hasn't fired yet for this bundle).
+  const canProvideShipmentDetailsForShipment = (sh: Shipment) =>
+    sh.status === 'created' && !!sh.obdNumber;
+
+  // Open modals
+  const openNewPOModal = () => {
+    setInputType('new-po');
+    setNewPOForm({ customerName: '', poNumber: '' });
+    setNewPOSOs([{
+      id: 1,
+      customerName: '',
+      soNumbers: [''],
+      weight: '',
+      containerType: '',
+      deliveryLocations: '',
+      vehicleNumber: '',
+      driverMobile: '',
+      containerNumber: '',
+      sealNumber: '',
+      specialInstructions: '',
+    }]);
+    setShowInputModal(true);
+  };
+
+  const openNewSOModal = (po: PurchaseOrder) => {
+    setInputType('new-so');
+    setSelectedPO(po);
+    setNewSOForm({
+      soNumber: '',
+      vehicleNumber: '',
+      transportId: '',
+      driverMobile: '',
+      containerNumber: '',
+      sealNumber: '',
+      weight: '',
+      containerType: '',
+      deliveryLocations: '',
+      specialInstructions: '',
+    });
+    setShowInputModal(true);
+  };
+
+  const openSODetailsModal = (so: SalesOrder) => {
+    setInputType('so-details');
+    setSelectedSO(so);
+    setSODetailsForm({
+      vehicleNumber: so.vehicleNumber || '',
+      transportId: so.transportId || '',
+      driverMobile: so.driverMobile || '',
+      containerNumber: so.containerNumber || '',
+      sealNumber: so.sealNumber || '',
+      weight: so.weight || '',
+      containerType: so.containerType || '',
+      deliveryLocations: so.deliveryLocations || '',
+      specialInstructions: so.specialInstructions || '',
+    });
+    setShowInputModal(true);
+  };
+
+  const openShipmentModal = (so: SalesOrder) => {
+    if (!so.invoice) return;
+    setInputType('shipment-details');
+    setSelectedSO(so);
+    setSelectedInvoice(so.invoice);
+    setSelectedShipment(null);
+    setShipmentForm({
+      lrNumber: so.lrNumber || '',
+      lrDate: so.lrDate ? so.lrDate.split('T')[0] : '',
+      vehicleNumber: so.vehicleNumber || '',
+      shipmentType: so.invoice.shipmentType || '',
+      plantCode: so.invoice.plantCode || '',
+      notes: so.invoice.notes || '',
+    });
+    setShowInputModal(true);
+  };
+
+  // Per-shipment modal opener: scoped to ONE Shipment (Bundle, SO) row.
+  // Submit fires VTO1N-B for only this shipment via the new per-shipment endpoint.
+  const openShipmentModalForShipment = (so: SalesOrder, sh: Shipment) => {
+    setInputType('shipment-details');
+    setSelectedSO(so);
+    setSelectedInvoice(null);
+    setSelectedShipment(sh);
+    setShipmentForm({
+      lrNumber: sh.lrNumber || '',
+      lrDate: sh.lrDate ? sh.lrDate.split('T')[0] : '',
+      vehicleNumber: '',
+      shipmentType: '',
+      plantCode: '',
+      notes: '',
+    });
+    setShowInputModal(true);
+  };
+
+  // Handle form submissions
+  const handleCreatePO = async () => {
+    // Check if at least one SO has required fields (at least one SO number and customer name)
+    const validSOs = newPOSOs.filter(so => so.soNumbers.some(num => num.trim()) && so.customerName);
+    if (validSOs.length === 0) return;
+
+    try {
+      // Create PO first
+      const poRes = await fetch('/backend/orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          customerName: validSOs[0].customerName, // Use first SO's customer name for PO
+          poNumber: newPOForm.poNumber || undefined,
+        }),
+      });
+
+      if (poRes.ok) {
+        const poData = await poRes.json();
+        const poId = poData.purchaseOrder.id;
+
+        // Create all SOs for this PO - each SO number becomes a separate SO
+        for (const so of validSOs) {
+          for (const soNumber of so.soNumbers) {
+            if (soNumber.trim()) {
+              await fetch(`/backend/orders/${poId}/sales-orders`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  soNumber: soNumber.trim(),
+                  vehicleNumber: so.vehicleNumber || undefined,
+                  driverMobile: so.driverMobile || undefined,
+                  containerNumber: so.containerNumber || undefined,
+                  sealNumber: so.sealNumber || undefined,
+                  weight: so.weight || undefined,
+                  containerType: so.containerType || undefined,
+                  deliveryLocations: so.deliveryLocations || undefined,
+                  specialInstructions: so.specialInstructions || undefined,
+                }),
+              });
+            }
+          }
+        }
+
+        setShowInputModal(false);
+        setNewPOSOs([{
+          id: 1,
+          customerName: '',
+          soNumbers: [''],
+          weight: '',
+          containerType: '',
+          deliveryLocations: '',
+          vehicleNumber: '',
+          driverMobile: '',
+          containerNumber: '',
+          sealNumber: '',
+          specialInstructions: '',
+        }]);
+        fetchOrders();
+      }
+    } catch (err) {
+      console.error('Failed to create PO:', err);
+    }
+  };
+
+  const handleCreateSO = async () => {
+    if (!selectedPO || !newSOForm.soNumber) return;
+    try {
+      const res = await fetch(`/backend/orders/${selectedPO.id}/sales-orders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          soNumber: newSOForm.soNumber,
+          vehicleNumber: newSOForm.vehicleNumber || undefined,
+          transportId: newSOForm.transportId || undefined,
+          driverMobile: newSOForm.driverMobile || undefined,
+          containerNumber: newSOForm.containerNumber || undefined,
+          sealNumber: newSOForm.sealNumber || undefined,
+          weight: newSOForm.weight || undefined,
+          containerType: newSOForm.containerType || undefined,
+          deliveryLocations: newSOForm.deliveryLocations || undefined,
+          specialInstructions: newSOForm.specialInstructions || undefined,
+        }),
+      });
+      if (res.ok) {
+        setShowInputModal(false);
+        setSelectedPO(null);
+        fetchOrders();
+      }
+    } catch (err) {
+      console.error('Failed to create SO:', err);
+    }
+  };
+
+  const handleUpdateSO = async () => {
+    if (!selectedSO) return;
+    try {
+      const res = await fetch(`/backend/orders/sales-orders/${selectedSO.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...soDetailsForm,
+          status: 'in-progress',
+          requiresInput: false,
+        }),
+      });
+      if (res.ok) {
+        setShowInputModal(false);
+        fetchOrders();
+      }
+    } catch (err) {
+      console.error('Failed to update SO:', err);
+    }
+  };
+
+  const handleUpdateShipment = async () => {
+    // Per-shipment path: PATCH the new shipments endpoint, which writes LR
+    // onto Shipment, mirrors metadata to legacy Invoice, and fires VTO1N-B
+    // for only that one shipment.
+    if (selectedShipment) {
+      try {
+        const res = await fetch(`/backend/orders/shipments/${selectedShipment.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            lrNumber: shipmentForm.lrNumber,
+            lrDate: shipmentForm.lrDate,
+            vehicleNumber: shipmentForm.vehicleNumber || undefined,
+            shipmentType: shipmentForm.shipmentType || undefined,
+            plantCode: shipmentForm.plantCode || undefined,
+            notes: shipmentForm.notes || undefined,
+          }),
+        });
+        if (res.ok) {
+          setShowInputModal(false);
+          fetchOrders();
+        }
+      } catch (err) {
+        console.error('Failed to update shipment:', err);
+      }
+      return;
+    }
+
+    // Legacy SO-level path (kept for older POs without Shipment rows).
+    if (!selectedSO || !selectedInvoice) return;
+    try {
+      const soRes = await fetch(`/backend/orders/sales-orders/${selectedSO.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lrNumber: shipmentForm.lrNumber,
+          lrDate: shipmentForm.lrDate,
+          vehicleNumber: shipmentForm.vehicleNumber,
+        }),
+      });
+
+      const invRes = await fetch(`/backend/orders/invoices/${selectedInvoice.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          shipmentType: shipmentForm.shipmentType,
+          plantCode: shipmentForm.plantCode,
+          notes: shipmentForm.notes,
+        }),
+      });
+
+      if (soRes.ok && invRes.ok) {
+        setShowInputModal(false);
+        fetchOrders();
+      }
+    } catch (err) {
+      console.error('Failed to update shipment:', err);
+    }
+  };
+
+  // Status badge component
+  const getStatusBadge = (status: string, requiresInput = false) => {
+    if (requiresInput) {
+      return (
+        <span className="px-2 py-1 bg-orange-600 text-white text-xs rounded-full flex items-center gap-1">
+          <AlertCircle className="w-3 h-3" />
+          Input Required
+        </span>
+      );
+    }
+
+    const configs: Record<string, { bg: string; text: string; icon: typeof CheckCircle2 }> = {
+      completed: { bg: 'bg-emerald-600', text: 'Completed', icon: CheckCircle2 },
+      'in-progress': { bg: 'bg-blue-600', text: 'In Progress', icon: Clock },
+      pending: { bg: 'bg-slate-600', text: 'Pending', icon: Clock },
+      created: { bg: 'bg-purple-600', text: 'Created', icon: FileText },
+      shipped: { bg: 'bg-emerald-600', text: 'Shipped', icon: CheckCircle2 },
+      'shipment-triggered': { bg: 'bg-yellow-600', text: 'Creating Shipment', icon: Clock },
+      'pending-input': { bg: 'bg-orange-600', text: 'Needs Input', icon: AlertCircle },
+      stock_approved: { bg: 'bg-teal-600', text: 'Stock Approved', icon: CheckCircle2 },
+      ls_created: { bg: 'bg-indigo-600', text: 'LS Created', icon: FileText },
+    };
+
+    const config = configs[status] || configs['pending'];
+    const Icon = config.icon;
+
+    return (
+      <span className={`px-2 py-1 ${config.bg} text-white text-xs rounded-full flex items-center gap-1`}>
+        <Icon className="w-3 h-3" />
+        {config.text}
+      </span>
+    );
+  };
+
+  const [askingVehicle, setAskingVehicle] = useState<Set<string>>(new Set());
+
+  const askVehicleDetails = async (soId: string, soNumber: string) => {
+    setAskingVehicle((prev) => new Set(prev).add(soId));
+    try {
+      const res = await fetch(`/backend/orders/ask-vehicle-details`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ soNumber }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      alert(`Vehicle details email sent for SO ${soNumber}`);
+    } catch (err) {
+      alert(`Failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    } finally {
+      setAskingVehicle((prev) => {
+        const next = new Set(prev);
+        next.delete(soId);
+        return next;
+      });
+    }
+  };
+
+  // Calculate stats
+  const totalSOs = purchaseOrders.reduce((acc, po) => acc + po.salesOrders.length, 0);
+  const totalInvoices = purchaseOrders.reduce(
+    (acc, po) => acc + po.salesOrders.filter((so) => so.invoice).length,
+    0
+  );
+  const pendingInputs = purchaseOrders.reduce(
+    (acc, po) => acc + po.salesOrders.filter((so) => so.requiresInput).length,
+    0
+  );
+
+  if (loading) {
+    return (
+      <div className="satori-v2 min-h-screen flex items-center justify-center" style={{ background: 'var(--s-bg)' }}>
+        <div className="flex flex-col items-center gap-4">
+          <Loader2 className="h-8 w-8 animate-spin" style={{ color: 'var(--s-amber)' }} />
+          <p style={{ color: 'var(--s-muted)' }}>Loading work station…</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="satori-v2 min-h-screen flex items-center justify-center" style={{ background: 'var(--s-bg)' }}>
+        <div className="text-xl font-semibold" style={{ color: 'var(--s-danger)' }}>Error: {error}</div>
+      </div>
+    );
+  }
+
+  const NAV_ITEMS: { id: typeof activeTab; label: string; icon: typeof Layers }[] = [
+    { id: 'hierarchy', label: 'Orders', icon: Layers },
+    { id: 'chat', label: 'Agent Chat', icon: MessageSquare },
+    { id: 'screen', label: 'Agent Screen', icon: Monitor },
+    { id: 'queue', label: 'Work Queue', icon: ListChecks },
+    { id: 'logs', label: 'Logs', icon: ScrollText },
+    { id: 'inventory', label: 'Inventory', icon: Boxes },
+  ];
+  const activeQueueCount = queueItems.filter((i) => i.state === 'queued' || i.state === 'firing').length;
+
+  return (
+    <div
+      className="satori-v2 min-h-screen flex"
+      style={{ background: 'var(--s-bg)', color: 'var(--s-text)' }}
+    >
+      {/* ── Left Sidebar Nav ───────────────────────────────────────────── */}
+      <aside
+        className="fixed inset-y-0 left-0 z-40 w-60 flex flex-col border-r"
+        style={{ background: 'var(--s-bg-2)', borderColor: 'var(--s-border)' }}
+      >
+        <div className="px-5 py-5 border-b" style={{ borderColor: 'var(--s-border-soft)' }}>
+          <SatoriWordmark />
+        </div>
+
+        <nav className="flex-1 px-3 py-4 space-y-1">
+          {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
+            const active = activeTab === id;
+            return (
+              <button
+                key={id}
+                onClick={() => setActiveTab(id)}
+                className="group relative w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors"
+                style={{
+                  background: active ? 'var(--s-panel-2)' : 'transparent',
+                  color: active ? 'var(--s-text)' : 'var(--s-muted)',
+                }}
+                onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--s-panel)'; }}
+                onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+              >
+                {active && (
+                  <span
+                    className="absolute left-0 top-1/2 -translate-y-1/2 h-6 w-1 rounded-r"
+                    style={{ background: 'var(--s-amber)' }}
+                  />
+                )}
+                <Icon className="w-4.5 h-4.5" style={{ color: active ? 'var(--s-amber)' : 'var(--s-muted)' }} />
+                <span className="flex-1 text-left">{label}</span>
+                {id === 'screen' && (
+                  <span
+                    className="w-1.5 h-1.5 rounded-full"
+                    style={{ background: agentStatus === 'live' ? 'var(--s-success)' : 'var(--s-muted-2)' }}
+                  />
+                )}
+                {id === 'queue' && activeQueueCount > 0 && (
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded-full font-semibold"
+                    style={{ background: 'var(--s-amber-soft)', color: 'var(--s-amber)' }}
+                  >
+                    {activeQueueCount}
+                  </span>
+                )}
+                {id === 'logs' && (
+                  <span
+                    className="w-1.5 h-1.5 rounded-full"
+                    style={{ background: connected ? 'var(--s-success)' : 'var(--s-danger)' }}
+                  />
+                )}
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* Sidebar footer — quick stats */}
+        <div className="px-4 py-4 border-t text-xs space-y-2" style={{ borderColor: 'var(--s-border-soft)' }}>
+          <div className="flex items-center justify-between">
+            <span style={{ color: 'var(--s-muted-2)' }}>Active POs</span>
+            <span className="font-semibold" style={{ color: 'var(--s-sand)' }}>{purchaseOrders.length}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span style={{ color: 'var(--s-muted-2)' }}>Total SOs</span>
+            <span className="font-semibold" style={{ color: 'var(--s-sand)' }}>{totalSOs}</span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span style={{ color: 'var(--s-muted-2)' }}>Pending Inputs</span>
+            <span className="font-semibold" style={{ color: pendingInputs > 0 ? 'var(--s-amber)' : 'var(--s-sand)' }}>{pendingInputs}</span>
+          </div>
+        </div>
+      </aside>
+
+      {/* ── Main column (offset by sidebar) ────────────────────────────── */}
+      <div className="flex-1 ml-60 flex flex-col min-h-screen">
+        {/* Top bar */}
+        <header
+          className="sticky top-0 z-30 flex items-center justify-between gap-4 px-6 py-3.5 border-b backdrop-blur"
+          style={{ background: 'rgba(28,24,19,0.85)', borderColor: 'var(--s-border)' }}
+        >
+          <div className="flex items-center gap-3 min-w-0">
+            <h1 className="text-base font-semibold truncate">SAP Workflow Automation</h1>
+            <span className="hidden md:inline text-xs truncate" style={{ color: 'var(--s-muted-2)' }}>
+              PO → SO → Loading Sheet → Invoice
+            </span>
+          </div>
+          <div className="flex items-center gap-3">
+            {/* Live workflow status pill */}
+            <div
+              className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full text-xs"
+              style={{ background: 'var(--s-panel)', border: '1px solid var(--s-border)' }}
+            >
+              <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: 'var(--s-success)' }} />
+              <span style={{ color: 'var(--s-muted)' }}>
+                Stage <span style={{ color: 'var(--s-sand)' }}>{purchaseOrders[0]?.stage || 1}/6</span>
+                {purchaseOrders[0]?.poNumber && <> · {purchaseOrders[0].poNumber}</>}
+              </span>
+            </div>
+            <button
+              className="px-4 py-2 rounded-lg font-medium text-sm flex items-center gap-2 transition-colors"
+              style={{ background: 'var(--s-amber)', color: '#1a1206' }}
+            >
+              <Play className="w-4 h-4" />
+              Start
+            </button>
+            <button
+              className="px-4 py-2 rounded-lg font-medium text-sm flex items-center gap-2 transition-colors"
+              style={{ background: 'var(--s-panel-2)', color: 'var(--s-text)' }}
+            >
+              <Pause className="w-4 h-4" />
+              Pause
+            </button>
+          </div>
+        </header>
+
+        {/* Main Content Area */}
+        <div className="flex-1 p-6 pb-20">
+        {/* Order Hierarchy Tab */}
+        {activeTab === 'hierarchy' && (
+          <div
+            className="s-panel p-6"
+            style={{ minHeight: 'calc(100vh - 340px)' }}
+          >
+            <div className="flex items-center justify-between mb-6">
+              <h2 className="text-xl font-semibold flex items-center gap-3">
+                <span className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <Package className="w-5 h-5 s-accent" />
+                </span>
+                Order Hierarchy View
+              </h2>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-4 text-sm text-slate-400">
+                  <div className="flex items-center gap-2">
+                    <div className="w-3 h-3 bg-emerald-600 rounded"></div>
+                    <span>PO Level</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-3 h-3 bg-cyan-600 rounded"></div>
+                    <span>SO Level</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-3 h-3 bg-slate-600 rounded"></div>
+                    <span>LS Level</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-3 h-3 bg-purple-600 rounded"></div>
+                    <span>Invoice</span>
+                  </div>
+                </div>
+                <button
+                  onClick={openNewPOModal}
+                  className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm flex items-center gap-2 font-medium"
+                >
+                  <Plus className="w-4 h-4" />
+                  New PO
+                </button>
+              </div>
+            </div>
+
+            {ordersLoading ? (
+              <div className="flex items-center justify-center py-20">
+                <Loader2 className="w-8 h-8 animate-spin s-accent" />
+              </div>
+            ) : purchaseOrders.length === 0 ? (
+              <div className="text-center py-20 text-slate-400">
+                <Package className="w-16 h-16 mx-auto mb-4 opacity-50" />
+                <p>No purchase orders yet. Click &quot;New PO&quot; to create one.</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {purchaseOrders.map((po) => (
+                  <div key={po.id} className="border border-slate-700 rounded-lg overflow-hidden">
+                    {/* PO Level */}
+                    <div
+                      className="bg-emerald-900/30 border-l-4 border-emerald-500 p-4 cursor-pointer hover:bg-emerald-900/40 transition-colors"
+                      onClick={() => togglePO(po.id)}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          {expandedPOs.has(po.id) ? (
+                            <ChevronDown className="w-5 h-5" />
+                          ) : (
+                            <ChevronRight className="w-5 h-5" />
+                          )}
+                          <div>
+                            <div className="flex items-center gap-3">
+                              <span className="font-semibold text-lg">{po.poNumber}</span>
+                              {getStatusBadge(po.status)}
+                              <span className="text-xs bg-slate-700 px-2 py-1 rounded">
+                                Stage {po.stage}/6
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-400 mt-1">
+                              {po.customer?.name ?? po.customerName} - Purchase Order
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-4 text-sm text-slate-400">
+                          {po.weightage != null && (
+                            <span className="px-2 py-0.5 rounded bg-slate-700 text-slate-200 text-xs" title={`Truck capacity for this PO`}>
+                              {po.weightage} t
+                            </span>
+                          )}
+                          {po.salesOrders.length > 1 && (() => {
+                            const total = po.salesOrders.length;
+                            const done = po.salesOrders.filter(
+                              (s) => s.visibilityState === 'received' || s.visibilityState === 'failed'
+                            ).length;
+                            if (done === total) return null;
+                            return (
+                              <span className="px-2 py-0.5 rounded bg-amber-700 text-amber-100 text-xs">
+                                {done}/{total} visibility done
+                              </span>
+                            );
+                          })()}
+                          <span>{po.salesOrders.length} Sales Orders</span>
+                          <span>-</span>
+                          <span>
+                            {po.salesOrders.reduce((acc, so) => acc + so.items.length, 0)} Items
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* SO Level */}
+                    {expandedPOs.has(po.id) && (
+                      <div className="bg-slate-800/50 p-4 space-y-3">
+                        {po.bundles && po.bundles.length > 0 && (
+                          <div className="space-y-2">
+                            <p className="text-xs uppercase tracking-wide text-slate-400">
+                              Vehicle Details ({po.bundles.length} {po.bundles.length === 1 ? 'truck' : 'trucks'})
+                            </p>
+                            {po.bundles.map((b: Bundle) => (
+                              <BundleVehicleEditor
+                                key={b.id}
+                                bundle={b}
+                                onSaved={fetchOrders}
+                              />
+                            ))}
+                          </div>
+                        )}
+                        {/* Add SO Button */}
+                        <div className="flex justify-end mb-2">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              openNewSOModal(po);
+                            }}
+                            className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-700 rounded text-sm flex items-center gap-1.5 font-medium transition-colors"
+                          >
+                            <Plus className="w-4 h-4" />
+                            Add SO
+                          </button>
+                        </div>
+                        {po.salesOrders.length === 0 ? (
+                          <p className="text-sm text-slate-400 text-center py-4">
+                            No sales orders yet. Click &quot;Add SO&quot; to create one.
+                          </p>
+                        ) : (
+                          po.salesOrders.map((so) => {
+                            const itemsByLS = groupItemsByLsNumber(so.items);
+                            const lsNumbers = Array.from(itemsByLS.keys()).sort();
+
+                            return (
+                              <div
+                                key={so.id}
+                                className="border border-slate-600 rounded-lg overflow-hidden"
+                              >
+                                <div
+                                  className="bg-cyan-900/30 border-l-4 border-cyan-500 p-3 cursor-pointer hover:bg-cyan-900/40 transition-colors"
+                                  onClick={() => toggleSO(so.id)}
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <div className="flex items-center gap-3 flex-1">
+                                      {expandedSOs.has(so.id) ? (
+                                        <ChevronDown className="w-4 h-4" />
+                                      ) : (
+                                        <ChevronRight className="w-4 h-4" />
+                                      )}
+                                      <div className="flex-1">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                          <span className="font-semibold text-base">
+                                            {so.soNumber}
+                                          </span>
+                                          {getStatusBadge(so.status, so.requiresInput && so.items.length > 0 && so.items.every(item => item.status === 'completed'))}
+                                          {so.visibilityState && so.visibilityState !== 'received' && (
+                                            <span
+                                              className={`px-2 py-0.5 rounded text-xs ${
+                                                so.visibilityState === 'queued'
+                                                  ? 'bg-slate-700 text-slate-200'
+                                                  : so.visibilityState === 'firing'
+                                                    ? 'bg-amber-700 text-amber-100'
+                                                    : 'bg-red-700 text-red-100'
+                                              }`}
+                                              title={`Visibility: ${so.visibilityState}`}
+                                            >
+                                              {so.visibilityState === 'queued'
+                                                ? 'Queued'
+                                                : so.visibilityState === 'firing'
+                                                  ? 'Visibility running'
+                                                  : 'Visibility failed'}
+                                            </span>
+                                          )}
+                                          <span className="text-xs text-slate-400">
+                                            {lsNumbers.length} LS - {so.items.length} Items
+                                          </span>
+                                        </div>
+                                        <p className="text-xs text-slate-400 mt-0.5">Sales Order</p>
+                                      </div>
+                                    </div>
+                                    <div className="flex items-center gap-2 ml-2">
+                                      {so.status === 'ls_created' && (
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            askVehicleDetails(so.id, so.soNumber);
+                                          }}
+                                          disabled={askingVehicle.has(so.id)}
+                                          className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 rounded text-sm flex items-center gap-1.5"
+                                        >
+                                          {askingVehicle.has(so.id) ? (
+                                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                          ) : (
+                                            <Truck className="w-3.5 h-3.5" />
+                                          )}
+                                          Ask Vehicle Details
+                                        </button>
+                                      )}
+                                      {so.requiresInput && so.items.length > 0 && so.items.every(item => item.status === 'completed') && (
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            openSODetailsModal(so);
+                                          }}
+                                          className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 rounded text-sm flex items-center gap-1.5"
+                                        >
+                                          <Edit className="w-3.5 h-3.5" />
+                                          Provide Input
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                {/* LS and Invoice Level */}
+                                {expandedSOs.has(so.id) && (
+                                  <div className="bg-slate-900/50 p-4">
+                                    <div className="grid grid-cols-2 gap-4">
+                                      {/* Loading Sheets Column */}
+                                      <div>
+                                        <div className="flex items-center gap-2 mb-3 pb-2 border-b border-slate-700">
+                                          <FileText className="w-4 h-4 text-slate-400" />
+                                          <h4 className="text-sm font-semibold text-slate-300">
+                                            Loading Sheets ({lsNumbers.length})
+                                          </h4>
+                                        </div>
+                                        <div className="space-y-2 max-h-60 overflow-y-auto">
+                                          {lsNumbers.map((lsNumber) => {
+                                            const items = itemsByLS.get(lsNumber) || [];
+                                            const allCompleted = items.every(
+                                              (i) => i.status === 'completed'
+                                            );
+                                            const lsStatus = allCompleted
+                                              ? 'completed'
+                                              : items.some((i) => i.status === 'in-progress')
+                                              ? 'in-progress'
+                                              : 'pending';
+
+                                            return (
+                                              <div
+                                                key={lsNumber}
+                                                className="bg-slate-800/70 p-3 rounded border border-slate-700"
+                                              >
+                                                <div className="flex items-center justify-between">
+                                                  <div className="flex items-center gap-2">
+                                                    <FileText className="w-4 h-4 text-slate-400" />
+                                                    <span className="text-sm font-medium">
+                                                      {lsNumber}
+                                                    </span>
+                                                    <span className="text-xs text-slate-500">
+                                                      ({items.length} items)
+                                                    </span>
+                                                  </div>
+                                                  {getStatusBadge(lsStatus)}
+                                                </div>
+                                              </div>
+                                            );
+                                          })}
+                                          {lsNumbers.length === 0 && (
+                                            <p className="text-sm text-slate-500 text-center py-4">
+                                              No loading sheets
+                                            </p>
+                                          )}
+                                        </div>
+                                      </div>
+
+                                      {/* Invoice Column */}
+                                      <div>
+                                        <div className="flex items-center gap-2 mb-3 pb-2 border-b border-slate-700">
+                                          <Package className="w-4 h-4 text-purple-400" />
+                                          <h4 className="text-sm font-semibold text-slate-300">
+                                            Invoice
+                                          </h4>
+                                        </div>
+                                        {so.shipments && so.shipments.length > 0 ? (
+                                          <div className="space-y-2">
+                                            {so.shipments.map((sh) => (
+                                              <div
+                                                key={sh.id}
+                                                className="bg-purple-900/20 border border-purple-700/50 p-3 rounded"
+                                              >
+                                                <div className="flex items-center justify-between mb-2">
+                                                  <div className="flex items-center gap-2">
+                                                    <Package className="w-4 h-4 text-purple-400" />
+                                                    <span className="text-sm font-medium">
+                                                      {sh.invoiceNumber ?? '—'}
+                                                    </span>
+                                                    <span className="text-xs text-slate-400">
+                                                      Bundle {sh.bundle.bundleNumber}
+                                                    </span>
+                                                  </div>
+                                                  {getStatusBadge(sh.status)}
+                                                </div>
+                                                {sh.obdNumber && (
+                                                  <div className="flex items-center justify-between text-sm mb-2">
+                                                    <span className="text-slate-400">OBD:</span>
+                                                    <span className="text-slate-300">
+                                                      {sh.obdNumber}
+                                                    </span>
+                                                  </div>
+                                                )}
+                                                {canProvideShipmentDetailsForShipment(sh) && (
+                                                  <button
+                                                    onClick={() => openShipmentModalForShipment(so, sh)}
+                                                    className="w-full mt-2 px-3 py-2 bg-orange-600 hover:bg-orange-700 rounded text-sm flex items-center justify-center gap-1.5"
+                                                  >
+                                                    <Edit className="w-3.5 h-3.5" />
+                                                    Provide Shipment Details
+                                                  </button>
+                                                )}
+                                              </div>
+                                            ))}
+                                            {so.lrNumber && (
+                                              <div className="px-3 py-2 text-xs text-slate-400 border border-slate-700 rounded">
+                                                <p>LR: {so.lrNumber}</p>
+                                                {so.vehicleNumber && (
+                                                  <p>Vehicle: {so.vehicleNumber}</p>
+                                                )}
+                                              </div>
+                                            )}
+                                          </div>
+                                        ) : so.invoice ? (
+                                          <div className="bg-purple-900/20 border border-purple-700/50 p-3 rounded">
+                                            <div className="flex items-center justify-between mb-2">
+                                              <div className="flex items-center gap-2">
+                                                <Package className="w-4 h-4 text-purple-400" />
+                                                <span className="text-sm font-medium">
+                                                  {so.invoice.invoiceNumber}
+                                                </span>
+                                              </div>
+                                              {getStatusBadge(so.invoice.status)}
+                                            </div>
+                                            {so.invoice.amount && (
+                                              <div className="flex items-center justify-between text-sm mb-2">
+                                                <span className="text-slate-400">Amount:</span>
+                                                <span className="font-semibold text-purple-300">
+                                                  {so.invoice.amount}
+                                                </span>
+                                              </div>
+                                            )}
+                                            {so.invoice.obdNumber && (
+                                              <div className="flex items-center justify-between text-sm mb-2">
+                                                <span className="text-slate-400">OBD:</span>
+                                                <span className="text-slate-300">
+                                                  {so.invoice.obdNumber}
+                                                </span>
+                                              </div>
+                                            )}
+                                            {canProvideShipmentDetails(so) && (
+                                              <button
+                                                onClick={() => openShipmentModal(so)}
+                                                className="w-full mt-2 px-3 py-2 bg-orange-600 hover:bg-orange-700 rounded text-sm flex items-center justify-center gap-1.5"
+                                              >
+                                                <Edit className="w-3.5 h-3.5" />
+                                                Provide Shipment Details
+                                              </button>
+                                            )}
+                                            {so.lrNumber && (
+                                              <div className="mt-2 pt-2 border-t border-purple-700/50 text-xs text-slate-400">
+                                                <p>LR: {so.lrNumber}</p>
+                                                {so.vehicleNumber && (
+                                                  <p>Vehicle: {so.vehicleNumber}</p>
+                                                )}
+                                              </div>
+                                            )}
+                                          </div>
+                                        ) : (
+                                          <div className="bg-slate-800/50 border border-slate-700 p-4 rounded text-center">
+                                            <Package className="w-8 h-8 mx-auto mb-2 text-slate-600" />
+                                            <p className="text-sm text-slate-500">
+                                              Invoice not created yet
+                                            </p>
+                                            <p className="text-xs text-slate-600 mt-1">
+                                              Will be created at Stage 4
+                                            </p>
+                                          </div>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Agent Chat Tab */}
+        {activeTab === 'chat' && (
+          <div
+            className="s-panel flex flex-col"
+            style={{ height: 'calc(100vh - 340px)' }}
+          >
+            <WorkChat session={chat} onUpdateTitle={handleUpdateTitle} />
+          </div>
+        )}
+
+        {/* Inventory Tab */}
+        {activeTab === 'inventory' && <InventoryEditor />}
+
+        {/* Agent Screen Tab */}
+        {activeTab === 'screen' && (
+          <div
+            className="s-panel overflow-hidden flex flex-col"
+            style={{ height: 'calc(100vh - 160px)' }}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-700">
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <Monitor className="w-5 h-5 s-accent" />
+                </div>
+                <div>
+                  <h2 className="font-semibold text-lg leading-tight">
+                    {activeScreen ? activeScreen.label : 'Agent Screen'}
+                  </h2>
+                  <p className="flex items-center gap-1.5 text-xs text-slate-400">
+                    <span
+                      className={`inline-block w-1.5 h-1.5 rounded-full ${
+                        agentStatus === 'live'
+                          ? 'bg-emerald-500 animate-pulse'
+                          : agentStatus === 'reconnecting'
+                          ? 'bg-amber-500 animate-pulse'
+                          : 'bg-slate-500'
+                      }`}
+                    />
+                    {agentStatus === 'live' && agentFps != null
+                      ? `Live · ${agentFps} fps`
+                      : agentStatus === 'reconnecting'
+                      ? 'Reconnecting…'
+                      : 'Connecting…'}
+                  </p>
+                </div>
+              </div>
+
+              {/* Screen selector — shown only when more than one feed is configured */}
+              {AGENT_SCREENS.length > 1 && (
+                <div className="flex items-center gap-1 bg-slate-900/50 rounded-lg p-1 overflow-x-auto">
+                  {AGENT_SCREENS.map((screen, idx) => (
+                    <button
+                      key={screen.id}
+                      onClick={() => setActiveScreenId(screen.id)}
+                      title={screen.label}
+                      className={`px-3 py-1.5 text-sm font-medium rounded-md whitespace-nowrap transition-colors ${
+                        screen.id === activeScreenId
+                          ? 'bg-cyan-600 text-white'
+                          : 'text-slate-400 hover:text-slate-200 hover:bg-slate-700'
+                      }`}
+                    >
+                      {idx + 1}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div className="flex items-center gap-2">
+                <div className="flex items-center gap-1 bg-slate-900/50 rounded-lg p-1">
+                  <button
+                    onClick={() => setScreenZoom(Math.max(50, screenZoom - 10))}
+                    className="p-2 hover:bg-slate-700 rounded transition-colors"
+                  >
+                    <ZoomOut className="w-4 h-4" />
+                  </button>
+                  <span className="px-3 text-sm font-medium">{screenZoom}%</span>
+                  <button
+                    onClick={() => setScreenZoom(Math.min(150, screenZoom + 10))}
+                    className="p-2 hover:bg-slate-700 rounded transition-colors"
+                  >
+                    <ZoomIn className="w-4 h-4" />
+                  </button>
+                </div>
+                <button
+                  onClick={() => setScreenZoom(100)}
+                  className="p-2 hover:bg-slate-700 rounded-lg transition-colors"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => setShowVmScreen(!showVmScreen)}
+                  className={`p-2 rounded-lg transition-colors ${
+                    showVmScreen ? 'bg-cyan-600' : 'hover:bg-slate-700'
+                  }`}
+                >
+                  {showVmScreen ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
+                </button>
+              </div>
+            </div>
+
+            {!activeScreen && (
+              <div className="flex-1 flex items-center justify-center text-slate-400 py-20">
+                <div className="text-center">
+                  <Monitor className="w-12 h-12 mx-auto mb-3 opacity-40" />
+                  <p className="text-slate-300">No screens configured</p>
+                  <p className="text-slate-500 mt-1 text-sm">
+                    Add a feed to <span className="font-mono">src/lib/agent-screens.ts</span>
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {activeScreen && showVmScreen && (
+              // Flex-fills the panel; never scrolls. The frame clips, and the
+              // image is contained within it. Zoom scales the image in place
+              // (clipping at the edges) rather than growing the layout.
+              <div className="flex-1 min-h-0 p-4 bg-slate-900">
+                <div
+                  className="relative w-full h-full rounded-lg overflow-hidden ring-1 ring-slate-700 shadow-2xl flex items-center justify-center"
+                  style={{ background: '#000' }}
+                >
+                  <img
+                    ref={agentImgRef}
+                    alt={activeScreen.label}
+                    className="transition-transform"
+                    style={{
+                      maxWidth: '100%',
+                      maxHeight: '100%',
+                      objectFit: 'contain',
+                      transform: `scale(${screenZoom / 100})`,
+                      transformOrigin: 'center center',
+                      userSelect: 'none',
+                      pointerEvents: 'none',
+                    }}
+                  />
+                  <div style={{ position: 'absolute', top: 10, left: 10, background: 'rgba(0,0,0,0.7)', padding: '4px 10px', borderRadius: 6, fontSize: 12, color: '#ddd' }}>
+                    {agentStatus === 'live' && agentFps != null ? `live · ${agentFps} fps` : agentStatus}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {activeScreen && !showVmScreen && (
+              <div className="flex-1 flex items-center justify-center text-slate-400 py-20">
+                <div className="text-center">
+                  <EyeOff className="w-12 h-12 mx-auto mb-3 opacity-70" />
+                  <p className="text-slate-300">Screen hidden</p>
+                  <button
+                    onClick={() => setShowVmScreen(true)}
+                    className="mt-2 s-accent hover:text-cyan-300"
+                  >
+                    Click to show
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Logs Tab */}
+        {activeTab === 'queue' && (
+          <div
+            className="s-panel flex flex-col"
+            style={{ height: 'calc(100vh - 200px)' }}
+          >
+            {/* Queue Header */}
+            <div className="flex items-center justify-between p-4 border-b border-slate-700">
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <ListChecks className="w-5 h-5 s-accent" />
+                </div>
+                <div>
+                  <h2 className="font-semibold text-lg leading-tight">Work Queue</h2>
+                  <p className="text-xs text-slate-400">
+                    Queued items can be cancelled. Items already firing are being worked on.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={fetchQueue}
+                className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-slate-400 hover:s-accent"
+                title="Refresh"
+              >
+                <RotateCcw className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Queue Items */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-2">
+              {queueLoading ? (
+                <div className="flex items-center justify-center h-full text-slate-500">
+                  <Loader2 className="w-6 h-6 animate-spin" />
+                </div>
+              ) : queueItems.length === 0 ? (
+                <div className="flex items-center justify-center h-full text-slate-500">
+                  <div className="text-center">
+                    <ListChecks className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                    <p>Queue is empty</p>
+                  </div>
+                </div>
+              ) : (
+                queueItems.map((item) => {
+                  const stateStyle: Record<string, { dot: string; label: string; text: string }> = {
+                    queued:    { dot: 'bg-yellow-500 animate-pulse', label: 'Queued', text: 'text-yellow-300' },
+                    firing:    { dot: 'bg-cyan-500 animate-pulse', label: 'Working…', text: 'text-cyan-300' },
+                    done:      { dot: 'bg-emerald-500', label: 'Done', text: 'text-emerald-300' },
+                    failed:    { dot: 'bg-red-500', label: 'Failed', text: 'text-red-300' },
+                    cancelled: { dot: 'bg-slate-500', label: 'Cancelled', text: 'text-slate-400' },
+                  };
+                  const style = stateStyle[item.state] || stateStyle.queued;
+                  const isInactive = item.state === 'done' || item.state === 'cancelled';
+                  return (
+                    <div
+                      key={item.id}
+                      className={`flex items-center gap-3 px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/40 ${
+                        isInactive ? 'opacity-60' : ''
+                      }`}
+                    >
+                      <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${style.dot}`} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono text-sm font-medium">{item.step}</span>
+                          {item.soNumber && (
+                            <span className="text-xs px-1.5 py-0.5 bg-slate-700 rounded text-slate-300">
+                              SO {item.soNumber}
+                            </span>
+                          )}
+                          {item.attemptCount > 0 && (
+                            <span className="text-xs text-amber-400">retry {item.attemptCount}</span>
+                          )}
+                        </div>
+                        {item.error && (
+                          <p className="text-xs text-red-400 mt-0.5 truncate" title={item.error}>
+                            {item.error}
+                          </p>
+                        )}
+                      </div>
+                      <span className={`text-xs font-medium flex-shrink-0 ${style.text}`}>{style.label}</span>
+                      {item.cancellable ? (
+                        <button
+                          onClick={() => cancelQueueItem(item.id)}
+                          disabled={cancellingId === item.id}
+                          className="flex items-center gap-1 px-2.5 py-1.5 text-xs rounded-lg bg-red-900/40 hover:bg-red-900/70 text-red-300 hover:text-red-200 transition-colors disabled:opacity-50 flex-shrink-0"
+                          title="Cancel this queued item"
+                        >
+                          {cancellingId === item.id ? (
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          ) : (
+                            <X className="w-3.5 h-3.5" />
+                          )}
+                          Cancel
+                        </button>
+                      ) : item.state === 'firing' ? (
+                        <span
+                          className="flex items-center gap-1 px-2.5 py-1.5 text-xs rounded-lg bg-slate-700/50 text-slate-500 flex-shrink-0 cursor-not-allowed"
+                          title="Already running — cannot be cancelled"
+                        >
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          In progress
+                        </span>
+                      ) : null}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'logs' && (
+          <div
+            className="s-panel flex flex-col"
+            style={{ height: 'calc(100vh - 200px)' }}
+          >
+            {/* Logs Header */}
+            <div className="flex flex-wrap items-center justify-between gap-3 p-4 border-b border-slate-700">
+              <div className="flex items-center gap-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg s-icon-chip">
+                  <ScrollText className="w-5 h-5 s-accent" />
+                </div>
+                <div>
+                  <h2 className="font-semibold text-lg leading-tight">Agent Logs</h2>
+                  <p className="flex items-center gap-1.5 text-xs text-slate-400">
+                    <span className={`inline-block w-1.5 h-1.5 rounded-full ${connected ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+                    {connected ? 'Streaming from auto_gui2' : 'Disconnected'} &middot; {logs.length} entries
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={logFilter}
+                  onChange={(e) => setLogFilter(e.target.value)}
+                  placeholder="Filter logs..."
+                  className="px-3 py-1.5 text-sm bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none w-48"
+                />
+                <button
+                  onClick={() => {
+                    const next = !autoScroll;
+                    setAutoScroll(next);
+                    if (next) scrollLogsToBottom();
+                  }}
+                  className={`p-2 rounded-lg transition-colors ${
+                    autoScroll ? 'bg-cyan-600 text-white' : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+                  }`}
+                  title={autoScroll ? 'Following latest — click to pause' : 'Paused — click to follow latest'}
+                >
+                  <ArrowDown className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={() => { setLogs([]); setHasNewLogs(false); }}
+                  className="p-2 bg-slate-700 hover:bg-slate-600 rounded-lg transition-colors text-slate-400 hover:text-red-400"
+                  title="Clear logs"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Log Entries */}
+            <div className="relative flex-1 min-h-0">
+            <div
+              ref={logContainerRef}
+              className="absolute inset-0 overflow-y-auto p-4 font-mono text-xs leading-relaxed"
+              onScroll={() => {
+                // Ignore scrolls we triggered ourselves (auto-follow / jump).
+                if (programmaticScrollRef.current) return;
+                if (!logContainerRef.current) return;
+                const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
+                const atBottom = scrollHeight - scrollTop - clientHeight < 40;
+                if (autoScroll !== atBottom) setAutoScroll(atBottom);
+                if (atBottom) setHasNewLogs(false);
+              }}
+            >
+              {logs.length === 0 ? (
+                <div className="flex-1 flex items-center justify-center text-slate-500 h-full">
+                  <div className="text-center">
+                    <ScrollText className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                    <p>No logs yet</p>
+                    <p className="text-slate-600 mt-1">
+                      Set LOG_WEBHOOK_URL to {typeof window !== 'undefined' ? window.location.origin : ''}/backend/logs/ingest
+                    </p>
+                    <p className="text-slate-600">
+                      Set STATUS_WEBHOOK_URL to {typeof window !== 'undefined' ? window.location.origin : ''}/backend/logs/status
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                logs
+                  .filter((log) => {
+                    if (!logFilter) return true;
+                    const q = logFilter.toLowerCase();
+                    return (
+                      log.message.toLowerCase().includes(q) ||
+                      log.level.toLowerCase().includes(q) ||
+                      (log.logger && log.logger.toLowerCase().includes(q)) ||
+                      (log.agent && log.agent.toLowerCase().includes(q)) ||
+                      (log.statusType && log.statusType.toLowerCase().includes(q))
+                    );
+                  })
+                  .map((log, i) => {
+                    const ts = log.timestamp.split('T')[1]?.split('.')[0] || log.timestamp;
+                    const hasDetails = log.details && Object.keys(log.details).length > 0;
+                    const isExpanded = expandedDetails.has(i);
+
+                    // Status messages get special rendering
+                    if (log.source === 'status') {
+                      const typeStyles: Record<string, { bg: string; border: string; icon: string; text: string }> = {
+                        milestone: { bg: 'bg-purple-900/30', border: 'border-l-purple-500', icon: '🏁', text: 'text-purple-300' },
+                        success:   { bg: 'bg-emerald-900/30', border: 'border-l-emerald-500', icon: '✓', text: 'text-emerald-300' },
+                        error:     { bg: 'bg-red-900/30', border: 'border-l-red-500', icon: '✗', text: 'text-red-300' },
+                        action:    { bg: 'bg-blue-900/20', border: 'border-l-blue-500', icon: '▶', text: 'text-blue-300' },
+                        waiting:   { bg: 'bg-yellow-900/20', border: 'border-l-yellow-500', icon: '⏳', text: 'text-yellow-300' },
+                        info:      { bg: 'bg-slate-800/50', border: 'border-l-cyan-500', icon: 'ℹ', text: 'text-cyan-300' },
+                      };
+                      const style = typeStyles[log.statusType || 'info'] || typeStyles.info;
+
+                      return (
+                        <div key={`${log.receivedAt}-${i}`} className={`${style.bg} border-l-2 ${style.border} rounded-r px-3 py-1.5 mb-1`}>
+                          <div className="flex items-center gap-2">
+                            <span className="text-slate-600 flex-shrink-0 text-xs">{ts}</span>
+                            <span className="flex-shrink-0 w-5 text-center">{style.icon}</span>
+                            {log.agent && (
+                              <span className="text-purple-400 flex-shrink-0 text-xs px-1.5 py-0.5 bg-purple-900/40 rounded">{log.agent}</span>
+                            )}
+                            <span className={`${style.text} flex-1`}>{log.message}</span>
+                            {log.step != null && log.totalSteps != null && (
+                              <span className="text-slate-500 flex-shrink-0 text-xs">
+                                {log.step}/{log.totalSteps}
+                              </span>
+                            )}
+                            {hasDetails && (
+                              <button
+                                onClick={() => {
+                                  setExpandedDetails((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(i)) next.delete(i);
+                                    else next.add(i);
+                                    return next;
+                                  });
+                                }}
+                                className="text-slate-500 hover:text-slate-300 flex-shrink-0 text-xs px-1"
+                              >
+                                {isExpanded ? '▾ JSON' : '▸ JSON'}
+                              </button>
+                            )}
+                          </div>
+                          {log.step != null && log.totalSteps != null && (
+                            <div className="mt-1 h-1 bg-slate-700 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-cyan-500 rounded-full transition-all"
+                                style={{ width: `${(log.step / log.totalSteps) * 100}%` }}
+                              />
+                            </div>
+                          )}
+                          {isExpanded && hasDetails && (
+                            <pre className="mt-2 text-xs text-slate-400 bg-slate-900/60 rounded p-2 overflow-x-auto">
+                              {JSON.stringify(log.details, null, 2)}
+                            </pre>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    // Regular debug log rendering
+                    const levelColor: Record<string, string> = {
+                      DEBUG: 'text-slate-500',
+                      INFO: 's-accent',
+                      WARNING: 'text-yellow-400',
+                      ERROR: 'text-red-400',
+                      CRITICAL: 'text-red-500 font-bold',
+                    };
+                    const color = levelColor[log.level] || 'text-slate-300';
+
+                    return (
+                      <div key={`${log.receivedAt}-${i}`} className="flex gap-3 hover:bg-slate-700/30 px-2 py-0.5 rounded">
+                        <span className="text-slate-600 flex-shrink-0">{ts}</span>
+                        <span className={`flex-shrink-0 w-16 text-right ${color}`}>{log.level}</span>
+                        {log.logger && (
+                          <span className="text-purple-400 flex-shrink-0 max-w-32 truncate">{log.logger}</span>
+                        )}
+                        <span className="text-slate-300 break-all">{log.message}</span>
+                      </div>
+                    );
+                  })
+              )}
+            </div>
+
+            {/* Jump-to-latest affordance — shown when paused and new logs arrived */}
+            {hasNewLogs && !autoScroll && (
+              <button
+                onClick={() => { setAutoScroll(true); scrollLogsToBottom(); }}
+                className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-full bg-cyan-600 text-white shadow-lg hover:bg-cyan-500 transition-colors"
+              >
+                <ArrowDown className="w-3.5 h-3.5" />
+                New logs
+              </button>
+            )}
+            </div>
+          </div>
+        )}
+        </div>
+      </div>
+
+      {/* Input Modal */}
+      {showInputModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-6">
+          <div
+            className="rounded-xl border shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-auto"
+            style={{ background: 'var(--s-panel)', borderColor: 'var(--s-border)' }}
+          >
+            <div
+              className="flex items-center justify-between p-6 border-b sticky top-0 z-10"
+              style={{ background: 'var(--s-panel)', borderColor: 'var(--s-border)' }}
+            >
+              <div>
+                <h2 className="text-xl font-semibold">
+                  {inputType === 'new-po'
+                    ? 'Create New Purchase Order'
+                    : inputType === 'new-so'
+                    ? 'Add Sales Order'
+                    : inputType === 'so-details'
+                    ? 'Sales Order Details Required'
+                    : selectedShipment
+                    ? `Shipment Details — Bundle ${selectedShipment.bundle.bundleNumber}`
+                    : 'Shipment Details Required'}
+                </h2>
+                <p className="text-sm text-slate-400 mt-1">
+                  {inputType === 'new-po'
+                    ? 'Enter PO details and add multiple Sales Orders'
+                    : inputType === 'new-so'
+                    ? `Add a new Sales Order to ${selectedPO?.poNumber || 'PO'}`
+                    : inputType === 'so-details'
+                    ? `Provide details for ${selectedSO?.soNumber} to continue workflow`
+                    : selectedShipment
+                    ? `Provide shipment details for SO ${selectedSO?.soNumber}, Bundle ${selectedShipment.bundle.bundleNumber} (Invoice ${selectedShipment.invoiceNumber ?? '—'}, OBD ${selectedShipment.obdNumber ?? '—'})`
+                    : `Provide shipment details for invoice ${selectedInvoice?.invoiceNumber}`}
+                </p>
+              </div>
+              <button
+                onClick={() => setShowInputModal(false)}
+                className="p-2 hover:bg-slate-700 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6">
+              {inputType === 'new-po' && (
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-300 mb-2">PO Number *</label>
+                    <input
+                      type="text"
+                      value={newPOForm.poNumber}
+                      onChange={(e) => setNewPOForm({ ...newPOForm, poNumber: e.target.value })}
+                      placeholder="e.g., PO-2024-002"
+                      className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                    />
+                  </div>
+
+                  <div className="border-t border-slate-700 pt-4 mt-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-base font-semibold text-slate-200">Sales Orders</h3>
+                      <button
+                        type="button"
+                        onClick={() => setNewPOSOs([...newPOSOs, {
+                          id: newPOSOs.length + 1,
+                          customerName: '',
+                          soNumbers: [''],
+                          weight: '',
+                          containerType: '',
+                          deliveryLocations: '',
+                          vehicleNumber: '',
+                          driverMobile: '',
+                          containerNumber: '',
+                          sealNumber: '',
+                          specialInstructions: '',
+                        }])}
+                        className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-700 rounded text-sm flex items-center gap-1"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        Add SO
+                      </button>
+                    </div>
+
+                    <div className="space-y-4 max-h-[50vh] overflow-y-auto">
+                      {newPOSOs.map((so, index) => (
+                        <div key={so.id} className="border border-slate-700 rounded-lg p-4 bg-slate-900/50">
+                          <div className="flex items-center justify-between mb-3">
+                            <h4 className="text-sm font-medium s-accent">SO #{index + 1}</h4>
+                            {newPOSOs.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={() => setNewPOSOs(newPOSOs.filter(s => s.id !== so.id))}
+                                className="p-1 hover:bg-slate-700 rounded text-slate-400 hover:text-red-400"
+                              >
+                                <X className="w-4 h-4" />
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-3">
+                            <div className="col-span-2">
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Customer Name *</label>
+                              <input
+                                type="text"
+                                value={so.customerName}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, customerName: e.target.value } : s))}
+                                placeholder="e.g., Maa Vaishnav Marble"
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              />
+                            </div>
+
+                            <div className="col-span-2">
+                              <div className="flex items-center justify-between mb-1.5">
+                                <label className="block text-xs font-medium text-slate-400">SO Number *</label>
+                                <button
+                                  type="button"
+                                  onClick={() => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, soNumbers: [...s.soNumbers, ''] } : s))}
+                                  className="p-1 bg-cyan-600 hover:bg-cyan-700 rounded text-white"
+                                  title="Add another SO number"
+                                >
+                                  <Plus className="w-3 h-3" />
+                                </button>
+                              </div>
+                              <div className="space-y-2">
+                                {so.soNumbers.map((soNum, soNumIndex) => (
+                                  <div key={soNumIndex} className="flex items-center gap-2">
+                                    <input
+                                      type="text"
+                                      value={soNum}
+                                      onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? {
+                                        ...s,
+                                        soNumbers: s.soNumbers.map((n, i) => i === soNumIndex ? e.target.value : n)
+                                      } : s))}
+                                      placeholder="e.g., 3313383"
+                                      className="flex-1 px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                                    />
+                                    {so.soNumbers.length > 1 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? {
+                                          ...s,
+                                          soNumbers: s.soNumbers.filter((_, i) => i !== soNumIndex)
+                                        } : s))}
+                                        className="p-1.5 hover:bg-slate-700 rounded text-slate-400 hover:text-red-400"
+                                        title="Remove this SO number"
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Weight (Tons) *</label>
+                              <input
+                                type="number"
+                                value={so.weight}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, weight: e.target.value } : s))}
+                                placeholder="e.g., 31"
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Container Type *</label>
+                              <select
+                                value={so.containerType}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, containerType: e.target.value } : s))}
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              >
+                                <option value="">Select type...</option>
+                                <option value="standard">Standard Height</option>
+                                <option value="low">Low Height Container</option>
+                              </select>
+                            </div>
+
+                            <div className="col-span-2">
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Delivery Locations *</label>
+                              <textarea
+                                rows={2}
+                                value={so.deliveryLocations}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, deliveryLocations: e.target.value } : s))}
+                                placeholder="1) Location 1&#10;2) Location 2"
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none font-mono"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Vehicle Number *</label>
+                              <input
+                                type="text"
+                                value={so.vehicleNumber}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, vehicleNumber: e.target.value } : s))}
+                                placeholder="e.g., GJ12AZ6734"
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Driver Mobile *</label>
+                              <input
+                                type="tel"
+                                value={so.driverMobile}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, driverMobile: e.target.value } : s))}
+                                placeholder="e.g., 6352484019"
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Container Number</label>
+                              <input
+                                type="text"
+                                value={so.containerNumber}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, containerNumber: e.target.value } : s))}
+                                placeholder="e.g., ILKU1600857"
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Seal Number</label>
+                              <input
+                                type="text"
+                                value={so.sealNumber}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, sealNumber: e.target.value } : s))}
+                                placeholder="e.g., 30763"
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              />
+                            </div>
+
+                            <div className="col-span-2">
+                              <label className="block text-xs font-medium text-slate-400 mb-1.5">Special Instructions</label>
+                              <textarea
+                                rows={2}
+                                value={so.specialInstructions}
+                                onChange={(e) => setNewPOSOs(newPOSOs.map(s => s.id === so.id ? { ...s, specialInstructions: e.target.value } : s))}
+                                placeholder="Any special notes..."
+                                className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {inputType === 'new-so' && (
+                <div className="border border-slate-700 rounded-lg p-4 bg-slate-900/50">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="col-span-2">
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Customer Name *</label>
+                      <input
+                        type="text"
+                        value={newSOForm.transportId}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, transportId: e.target.value })}
+                        placeholder="e.g., Maa Vaishnav Marble"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="col-span-2">
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">SO Number *</label>
+                      <input
+                        type="text"
+                        value={newSOForm.soNumber}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, soNumber: e.target.value })}
+                        placeholder="e.g., 3313383/3313381/3313385"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Weight (Tons) *</label>
+                      <input
+                        type="number"
+                        value={newSOForm.weight}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, weight: e.target.value })}
+                        placeholder="e.g., 31"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Container Type *</label>
+                      <select
+                        value={newSOForm.containerType}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, containerType: e.target.value })}
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      >
+                        <option value="">Select type...</option>
+                        <option value="standard">Standard Height</option>
+                        <option value="low">Low Height Container</option>
+                      </select>
+                    </div>
+
+                    <div className="col-span-2">
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Delivery Locations *</label>
+                      <textarea
+                        rows={2}
+                        value={newSOForm.deliveryLocations}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, deliveryLocations: e.target.value })}
+                        placeholder="1) Location 1&#10;2) Location 2"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none font-mono"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Vehicle Number *</label>
+                      <input
+                        type="text"
+                        value={newSOForm.vehicleNumber}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, vehicleNumber: e.target.value })}
+                        placeholder="e.g., GJ12AZ6734"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Driver Mobile *</label>
+                      <input
+                        type="tel"
+                        value={newSOForm.driverMobile}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, driverMobile: e.target.value })}
+                        placeholder="e.g., 6352484019"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Container Number</label>
+                      <input
+                        type="text"
+                        value={newSOForm.containerNumber}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, containerNumber: e.target.value })}
+                        placeholder="e.g., ILKU1600857"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Seal Number</label>
+                      <input
+                        type="text"
+                        value={newSOForm.sealNumber}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, sealNumber: e.target.value })}
+                        placeholder="e.g., 30763"
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+
+                    <div className="col-span-2">
+                      <label className="block text-xs font-medium text-slate-400 mb-1.5">Special Instructions</label>
+                      <textarea
+                        rows={2}
+                        value={newSOForm.specialInstructions}
+                        onChange={(e) => setNewSOForm({ ...newSOForm, specialInstructions: e.target.value })}
+                        placeholder="Any special notes..."
+                        className="w-full px-3 py-2 text-sm bg-slate-800 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {inputType === 'so-details' && (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Vehicle Number *
+                      </label>
+                      <input
+                        type="text"
+                        value={soDetailsForm.vehicleNumber}
+                        onChange={(e) =>
+                          setSODetailsForm({ ...soDetailsForm, vehicleNumber: e.target.value })
+                        }
+                        placeholder="e.g., GJ12AZ6734"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Driver Mobile *
+                      </label>
+                      <input
+                        type="tel"
+                        value={soDetailsForm.driverMobile}
+                        onChange={(e) =>
+                          setSODetailsForm({ ...soDetailsForm, driverMobile: e.target.value })
+                        }
+                        placeholder="e.g., 6352484019"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Container Number
+                      </label>
+                      <input
+                        type="text"
+                        value={soDetailsForm.containerNumber}
+                        onChange={(e) =>
+                          setSODetailsForm({ ...soDetailsForm, containerNumber: e.target.value })
+                        }
+                        placeholder="e.g., ILKU1600857"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Seal Number
+                      </label>
+                      <input
+                        type="text"
+                        value={soDetailsForm.sealNumber}
+                        onChange={(e) =>
+                          setSODetailsForm({ ...soDetailsForm, sealNumber: e.target.value })
+                        }
+                        placeholder="e.g., 30763"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Weight (Tons)
+                      </label>
+                      <input
+                        type="number"
+                        value={soDetailsForm.weight}
+                        onChange={(e) =>
+                          setSODetailsForm({ ...soDetailsForm, weight: e.target.value })
+                        }
+                        placeholder="e.g., 31"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Container Type
+                      </label>
+                      <select
+                        value={soDetailsForm.containerType}
+                        onChange={(e) =>
+                          setSODetailsForm({ ...soDetailsForm, containerType: e.target.value })
+                        }
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      >
+                        <option value="">Select type...</option>
+                        <option value="standard">Standard Height</option>
+                        <option value="low">Low Height Container</option>
+                      </select>
+                    </div>
+                    <div className="col-span-2">
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Delivery Locations
+                      </label>
+                      <textarea
+                        rows={3}
+                        value={soDetailsForm.deliveryLocations}
+                        onChange={(e) =>
+                          setSODetailsForm({ ...soDetailsForm, deliveryLocations: e.target.value })
+                        }
+                        placeholder="Enter delivery locations..."
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Special Instructions
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={soDetailsForm.specialInstructions}
+                        onChange={(e) =>
+                          setSODetailsForm({
+                            ...soDetailsForm,
+                            specialInstructions: e.target.value,
+                          })
+                        }
+                        placeholder="Any special notes..."
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {inputType === 'shipment-details' && (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        LR Number *
+                      </label>
+                      <input
+                        type="text"
+                        value={shipmentForm.lrNumber}
+                        onChange={(e) =>
+                          setShipmentForm({ ...shipmentForm, lrNumber: e.target.value })
+                        }
+                        placeholder="e.g., LR-2024-5678"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        LR Date *
+                      </label>
+                      <input
+                        type="date"
+                        value={shipmentForm.lrDate}
+                        onChange={(e) =>
+                          setShipmentForm({ ...shipmentForm, lrDate: e.target.value })
+                        }
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Vehicle Number *
+                      </label>
+                      <input
+                        type="text"
+                        value={shipmentForm.vehicleNumber}
+                        onChange={(e) =>
+                          setShipmentForm({ ...shipmentForm, vehicleNumber: e.target.value })
+                        }
+                        placeholder="e.g., MH-12-XY-5678"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Shipment Type *
+                      </label>
+                      <select
+                        value={shipmentForm.shipmentType}
+                        onChange={(e) =>
+                          setShipmentForm({ ...shipmentForm, shipmentType: e.target.value })
+                        }
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      >
+                        <option value="">Select type...</option>
+                        <option value="road">Road</option>
+                        <option value="rail">Rail</option>
+                        <option value="air">Air</option>
+                      </select>
+                    </div>
+                    <div className="col-span-2">
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Plant Code *
+                      </label>
+                      <input
+                        type="text"
+                        value={shipmentForm.plantCode}
+                        onChange={(e) =>
+                          setShipmentForm({ ...shipmentForm, plantCode: e.target.value })
+                        }
+                        placeholder="e.g., PLT-001"
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                    <div className="col-span-2">
+                      <label className="block text-sm font-medium text-slate-300 mb-2">
+                        Additional Notes
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={shipmentForm.notes}
+                        onChange={(e) =>
+                          setShipmentForm({ ...shipmentForm, notes: e.target.value })
+                        }
+                        placeholder="Any special shipment instructions..."
+                        className="w-full px-4 py-2 bg-slate-900 border border-slate-600 rounded-lg focus:border-cyan-500 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="bg-blue-900/20 border border-blue-700/50 rounded-lg p-3 flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 text-blue-400 flex-shrink-0 mt-0.5" />
+                    <div className="text-xs text-blue-300">
+                      <p className="font-medium">Stage 5 - Shipment Creation:</p>
+                      <p className="mt-1">
+                        After submitting, agent will execute VA02, VTO1N, and VF02 transactions to
+                        create shipment document.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex gap-3 mt-6">
+                <button
+                  onClick={() => setShowInputModal(false)}
+                  className="flex-1 px-4 py-2.5 bg-slate-700 hover:bg-slate-600 rounded-lg font-medium transition-all"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    if (inputType === 'new-po') handleCreatePO();
+                    else if (inputType === 'new-so') handleCreateSO();
+                    else if (inputType === 'so-details') handleUpdateSO();
+                    else handleUpdateShipment();
+                  }}
+                  className="flex-1 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 rounded-lg font-medium transition-all flex items-center justify-center gap-2"
+                >
+                  <Save className="w-4 h-4" />
+                  {inputType === 'new-po' ? 'Create PO & Start Workflow' : inputType === 'new-so' ? 'Create SO' : 'Submit & Continue'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Slim status footer — fixed to the main column (offset past sidebar) */}
+      <div
+        className="fixed bottom-0 right-0 left-60 backdrop-blur border-t px-6 py-2.5 z-30"
+        style={{ background: 'rgba(28,24,19,0.9)', borderColor: 'var(--s-border)' }}
+      >
+        <div className="flex items-center justify-between text-xs" style={{ color: 'var(--s-muted)' }}>
+          <div className="flex items-center gap-5">
+            <div className="flex items-center gap-2">
+              <span className="w-1.5 h-1.5 rounded-full animate-pulse" style={{ background: 'var(--s-success)' }} />
+              <span>System Active</span>
+            </div>
+            <span>Processing: <span style={{ color: 'var(--s-sand)' }}>{purchaseOrders[0]?.poNumber || 'None'}</span></span>
+          </div>
+          <div className="flex items-center gap-5">
+            <span>Invoices: <span className="font-semibold" style={{ color: 'var(--s-info)' }}>{totalInvoices}</span></span>
+            <span>Pending Inputs: <span className="font-semibold" style={{ color: pendingInputs > 0 ? 'var(--s-amber)' : 'var(--s-sand)' }}>{pendingInputs}</span></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

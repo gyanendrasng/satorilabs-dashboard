@@ -1,15 +1,11 @@
 import { prisma } from './prisma';
 import { downloadFromS3 } from './s3';
 import { sendPlainEmail, sendReplyEmail, sendHtmlEmail, sendHtmlReplyEmail, getMessageRfc822Id } from './gmail';
-import { buildDispatchApprovalHtml, type DispatchSoSection } from './dispatch-email-template';
+import { kgPerUnitOf, kgToUnits } from './units';
+import { buildDispatchApprovalHtml, substituteSourcePlant, type DispatchSoSection } from './dispatch-email-template';
 import { enqueueWork, pumpQueue } from './work-queue';
 import { computeBundlesForPo } from './bundler';
 import { sendLSEmail } from './email-service';
-import { classifyDispatchConfirmation } from './dispatch-confirmation-classifier';
-import { classifyVehicleSplitReply } from './vehicle-split-classifier';
-import { classifyBranchReply } from './branch-reply-classifier';
-import OpenAI from 'openai';
-import { z } from 'zod';
 
 const AUTO_GUI_HOST = process.env.AUTO_GUI_HOST || 'localhost';
 const AUTO_GUI_PORT = process.env.AUTO_GUI_PORT || '8000';
@@ -43,11 +39,13 @@ export async function checkAndSendBatchToAman(
   const scopeLabel = bundleId ? `(Bundle ${bundleId.slice(-6)}, SO ${salesOrderId})` : `SO ${salesOrderId}`;
   log(`[BatchSender] Checking if all replies received for ${scopeLabel}`);
 
-  // Items are filtered to the (bundle, SO) pair when bundleId is provided.
+  // Load the LoadingSlips for this (SO, bundle) pair. Each LS has a plant_ls
+  // email; the reply PDF lives on that Email row (replyPdfUrl, R2 key). When
+  // bundleId is unspecified, take every LS on this SO.
   const salesOrder = await prisma.salesOrder.findUnique({
     where: { id: salesOrderId },
     include: {
-      items: {
+      loadingSlips: {
         where: bundleId ? { bundleId } : undefined,
         include: { emails: true },
       },
@@ -89,50 +87,52 @@ export async function checkAndSendBatchToAman(
     }
   }
 
-  log(`[BatchSender] ${scopeLabel} has ${salesOrder.items.length} item(s):`);
-  for (const item of salesOrder.items) {
-    const repliedEmail = item.emails.find((e) => e.status === 'replied' && e.replyPdfUrl);
+  const loadingSlips = salesOrder.loadingSlips;
+
+  log(`[BatchSender] ${scopeLabel} has ${loadingSlips.length} loading slip(s):`);
+  for (const ls of loadingSlips) {
+    const repliedEmail = ls.emails.find((e) => e.status === 'replied' && e.replyPdfUrl);
     const status = repliedEmail ? `replied (PDF: ${repliedEmail.replyPdfUrl})` : 'waiting';
-    log(`  - LS ${item.lsNumber}: ${status}`);
+    log(`  - LS ${ls.lsNumber}: ${status}`);
   }
 
-  if (salesOrder.items.length === 0) {
-    log(`[BatchSender] No items in scope for ${scopeLabel} — nothing to fire`);
+  if (loadingSlips.length === 0) {
+    log(`[BatchSender] No loading slips in scope for ${scopeLabel} — nothing to fire`);
     return { success: false, logs };
   }
 
-  const allReplied = salesOrder.items.every((item) =>
-    item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
+  const allReplied = loadingSlips.every((ls) =>
+    ls.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
   );
 
   if (!allReplied) {
-    const repliedCount = salesOrder.items.filter((item) =>
-      item.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
+    const repliedCount = loadingSlips.filter((ls) =>
+      ls.emails.some((email) => email.status === 'replied' && email.replyPdfUrl)
     ).length;
     log(
-      `[BatchSender] Not ready yet for ${scopeLabel}: ${repliedCount}/${salesOrder.items.length} items have replies`
+      `[BatchSender] Not ready yet for ${scopeLabel}: ${repliedCount}/${loadingSlips.length} LS(s) have replies`
     );
     return { success: false, logs };
   }
 
-  log(`[BatchSender] All ${salesOrder.items.length} item(s) replied for ${scopeLabel}. Enqueueing ZLOAD3-B1...`);
+  log(`[BatchSender] All ${loadingSlips.length} LS(s) replied for ${scopeLabel}. Enqueueing ZLOAD3-B1...`);
 
   const attachments: Array<{ filename: string; content_base64: string }> = [];
 
   try {
-    for (const item of salesOrder.items) {
-      const repliedEmail = item.emails.find(
+    for (const ls of loadingSlips) {
+      const repliedEmail = ls.emails.find(
         (e) => e.status === 'replied' && e.replyPdfUrl
       );
       if (!repliedEmail || !repliedEmail.replyPdfUrl) {
-        log(`[BatchSender] Item LS ${item.lsNumber} missing replyPdfUrl despite allReplied check — aborting`);
+        log(`[BatchSender] LS ${ls.lsNumber} missing replyPdfUrl despite allReplied check — aborting`);
         return { success: false, logs };
       }
-      log(`[BatchSender] Downloading PDF from R2 for LS ${item.lsNumber}: ${repliedEmail.replyPdfUrl}`);
+      log(`[BatchSender] Downloading PDF from R2 for LS ${ls.lsNumber}: ${repliedEmail.replyPdfUrl}`);
       const pdfBuffer = await downloadFromS3(repliedEmail.replyPdfUrl);
-      log(`[BatchSender] Downloaded PDF for LS ${item.lsNumber}: ${pdfBuffer.length} bytes`);
+      log(`[BatchSender] Downloaded PDF for LS ${ls.lsNumber}: ${pdfBuffer.length} bytes`);
       attachments.push({
-        filename: `${item.lsNumber}.pdf`,
+        filename: `${ls.lsNumber}.pdf`,
         content_base64: pdfBuffer.toString('base64'),
       });
     }
@@ -169,6 +169,16 @@ export async function checkAndSendBatchToAman(
     await pumpQueue();
 
     log(`[BatchSender] Enqueued ZLOAD3-B1 for ${scopeLabel} with ${attachments.length} attachment(s)`);
+
+    // Advance any active scenario past 'await_plant_invoice'. Safe no-op when
+    // engine is disabled or no scenario is in flight.
+    try {
+      const { maybeAdvanceScenario } = await import('./scenario-engine');
+      await maybeAdvanceScenario(salesOrderId, 'zload3b1');
+    } catch (advErr) {
+      log(`[BatchSender] maybeAdvanceScenario warning: ${advErr instanceof Error ? advErr.message : advErr}`);
+    }
+
     return { success: true, logs };
   } catch (error) {
     log(
@@ -275,201 +285,13 @@ interface ReleaseItem {
   weight_kg: number;
 }
 
-interface SoReleasePlan {
+export interface SoReleasePlan {
   soNumber: string;
   salesOrderId: string;
   items: ReleaseItem[];
   totalWeightKg: number;
 }
 
-/**
- * Classify a single SO's branch reply and (for release intents) compute the
- * release plan from the persisted Material rows. Does NOT fire ZLOAD1 yet —
- * that decision lives outside, after summing weights across the whole PO.
- *
- * For 'wait' intent, sends the production inquiry email immediately
- * (production replies are scoped per SO and don't go through the weight gate).
- */
-async function classifyAndPlanForSo(args: {
-  parentLoadingSlipItemId: string | null;
-  soNumber: string;
-  salesOrderId: string;
-  originalEmailHtml: string;
-  replyHtml: string;
-  log: (msg: string) => void;
-}): Promise<
-  | { success: true; intent: 'release_all' | 'release_part'; plan: SoReleasePlan }
-  | { success: true; intent: 'wait' }
-  | { success: false; intent?: string }
-> {
-  const {
-    parentLoadingSlipItemId,
-    soNumber,
-    salesOrderId,
-    originalEmailHtml,
-    replyHtml,
-    log,
-  } = args;
-
-  log(`[BranchReply] Classifying for SO ${soNumber}`);
-
-  const replyPreview = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  const previewMax = 800;
-  const previewSuffix = replyPreview.length > previewMax ? ` ...(truncated, full length=${replyPreview.length})` : '';
-  log(`[BranchReply] SO ${soNumber} reply text fed to classifier: "${replyPreview.slice(0, previewMax)}${previewSuffix}"`);
-
-  let result: {
-    intent: string;
-    materials?: Array<{ material_code?: string; batch?: string }>;
-    missing_materials?: string[];
-  };
-  try {
-    result = await classifyBranchReply({
-      originalEmailHtml,
-      branchReplyHtml: replyHtml,
-      salesOrder: soNumber,
-    });
-  } catch (err) {
-    log(`[BranchReply] local classifier failed for SO ${soNumber}: ${err instanceof Error ? err.message : String(err)}`);
-    return { success: false };
-  }
-
-  log(`[BranchReply] SO ${soNumber} intent=${result.intent}`);
-
-  if (result.intent === 'release_all' || result.intent === 'release_part') {
-    // Source the release plan from the canonical Material rows (fresh DB read).
-    // Always clamp per-line quantity at availability — we cannot physically
-    // ship more than what's in stock, regardless of intent.
-    // Honor explicit exclusions: if the classifier returns a `materials`
-    // list, only include DB rows that match (by material+batch). When the
-    // classifier omits a row the branch wanted dropped, it stays out.
-    // If the classifier didn't return a list, default to all DB materials.
-    const materials = await prisma.material.findMany({
-      where: { salesOrderId },
-      orderBy: { createdAt: 'asc' },
-    });
-
-    const classifierMaterials = (Array.isArray(result.materials) ? result.materials : []) as Array<{
-      material_code?: string;
-      material?: string;
-      batch?: string;
-      quantity?: number;
-    }>;
-    const classifierByKey = new Map<string, { quantity?: number }>();
-    for (const r of classifierMaterials) {
-      const code = r.material_code ?? r.material ?? '';
-      const batch = r.batch ?? '';
-      classifierByKey.set(`${code}|${batch}`, { quantity: r.quantity });
-    }
-    const useAllowList = classifierByKey.size > 0;
-
-    const items: ReleaseItem[] = [];
-    let totalWeightKg = 0;
-    for (const m of materials) {
-      const key = `${m.material}|${m.batch}`;
-      if (useAllowList && !classifierByKey.has(key)) {
-        log(`[BranchReply] SO ${soNumber} excluding ${m.material}/${m.batch} — not in classifier list`);
-        continue;
-      }
-      // Honor branch-requested quantity (e.g. "send only 50 of X") when the
-      // classifier returns a positive integer for this material — clamp at
-      // orderQuantity so the branch can shrink but never inflate the order.
-      const classifierQty = classifierByKey.get(key)?.quantity;
-      const branchRequested = typeof classifierQty === 'number' && classifierQty > 0
-        ? Math.min(classifierQty, m.orderQuantity)
-        : m.orderQuantity;
-      const available = m.availableStock ?? branchRequested;
-      const qty = Math.min(branchRequested, Math.max(available, 0));
-      if (qty <= 0) continue;
-      if (qty < m.orderQuantity) {
-        log(`[BranchReply] SO ${soNumber} ${m.material}/${m.batch}: shipping ${qty} (ordered ${m.orderQuantity}, branch asked ${classifierQty ?? 'n/a'}, stock ${m.availableStock ?? 'n/a'})`);
-      }
-      const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
-      const perUnit = m.orderQuantity > 0 ? fullWeight / m.orderQuantity : 0;
-      const itemWeight = perUnit * qty;
-      items.push({
-        material_code: m.material,
-        batch: m.batch,
-        quantity: qty,
-        weight_kg: itemWeight,
-      });
-      totalWeightKg += itemWeight;
-    }
-
-    log(`[BranchReply] SO ${soNumber} plan: ${items.length} item(s), ${(totalWeightKg / 1000).toFixed(2)} t`);
-
-    // Branch is releasing — clear any open shortages for this SO so they
-    // don't pollute future MB51 FCFS runs.
-    const cleared = await prisma.materialShortage.updateMany({
-      where: { salesOrderId, resolvedAt: null },
-      data: { resolvedAt: new Date() },
-    });
-    if (cleared.count > 0) {
-      log(`[BranchReply] SO ${soNumber} resolved ${cleared.count} open shortage row(s)`);
-    }
-
-    return {
-      success: true,
-      intent: result.intent,
-      plan: { soNumber, salesOrderId, items, totalWeightKg },
-    };
-  }
-
-  if (result.intent === 'wait') {
-    // Simplified flow: branch wants us to wait a few days and re-check
-    // stock availability. No production team contact — just schedule a
-    // recheck. The cron will re-fire ZSO-VISIBILITY when waitUntil elapses.
-    const waitDays = parseInt(process.env.WAIT_RECHECK_DAYS || '3', 10);
-    const waitUntil = new Date(Date.now() + waitDays * 86400000);
-
-    await prisma.salesOrder.update({
-      where: { id: salesOrderId },
-      data: {
-        waitUntil,
-        waitRechecks: { increment: 1 },
-      },
-    });
-
-    // Persist per-material shortage so the daily MB51 FCFS reactivator can
-    // tell when fresh production covers this SO. Use the classifier's
-    // missing_materials (material codes only) when present; otherwise fall
-    // back to every Material row where availableStock < orderQuantity.
-    const allMaterials = await prisma.material.findMany({ where: { salesOrderId } });
-    const missingSet = new Set((result.missing_materials ?? []).map((m) => m.toUpperCase()));
-    const shortByMaterial = new Map<string, number>();
-    for (const m of allMaterials) {
-      const inMissing = missingSet.size === 0
-        ? (m.availableStock ?? 0) < m.orderQuantity
-        : missingSet.has(m.material.toUpperCase());
-      if (!inMissing) continue;
-      const shortQty = Math.max(0, m.orderQuantity - (m.availableStock ?? 0));
-      if (shortQty <= 0) continue;
-      shortByMaterial.set(m.material, (shortByMaterial.get(m.material) ?? 0) + shortQty);
-    }
-
-    if (shortByMaterial.size > 0) {
-      await prisma.materialShortage.createMany({
-        data: [...shortByMaterial.entries()].map(([material, shortQty]) => ({
-          salesOrderId,
-          material,
-          shortQty,
-        })),
-      });
-      const summary = [...shortByMaterial.entries()]
-        .map(([m, q]) => `${m}=${q}`)
-        .join(', ');
-      log(`[BranchReply] SO ${soNumber} recorded shortages: ${summary}`);
-    } else {
-      log(`[BranchReply] SO ${soNumber} 'wait' but no per-material shortage derivable`);
-    }
-
-    log(`[BranchReply] SO ${soNumber} 'wait' → recheck scheduled at ${waitUntil.toISOString()} (${waitDays} day${waitDays === 1 ? '' : 's'})`);
-    return { success: true, intent: 'wait' };
-  }
-
-  log(`[BranchReply] SO ${soNumber}: unknown intent "${result.intent}"`);
-  return { success: false, intent: result.intent };
-}
 
 /**
  * Email the branch asking whether to split a multi-vehicle dispatch.
@@ -513,7 +335,7 @@ async function sendVehicleSplitInquiry(args: {
     })
     .join('\n');
 
-  const subject = `Vehicle Split Confirmation Required - PO ${po.poNumber}`;
+  const purposeLabel = `Vehicle Split Confirmation Required - PO ${po.poNumber}`;
   const body = [
     `Dear Branch Team,`,
     ``,
@@ -528,17 +350,28 @@ async function sendVehicleSplitInquiry(args: {
     `Sales Order Dispatch Co-ordinator`,
   ].join('\n');
 
+  // Ride the per-PO branch conversation (shared subject) so the branch sees one
+  // thread. Falls back to the NEW ORDER combined email if no anchor resolves.
+  const { resolvePoThreadAnchor, withPurposeLine } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, body);
+
   let sent: { messageId: string; threadId: string };
   try {
-    const rfc822Id = await getMessageRfc822Id(originalCombinedEmail.gmailMessageId);
-    if (rfc822Id) {
-      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, originalCombinedEmail.gmailThreadId, rfc822Id);
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      const rfc822Id = await getMessageRfc822Id(originalCombinedEmail.gmailMessageId);
+      if (rfc822Id) {
+        sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, originalCombinedEmail.gmailThreadId, rfc822Id);
+      } else {
+        sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
+      }
     }
   } catch (err) {
     log(`[VehicleSplit] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
-    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
   }
 
   await prisma.email.create({
@@ -552,7 +385,7 @@ async function sendVehicleSplitInquiry(args: {
       status: 'sent',
       emailType: 'vehicle_split_inquiry',
       workflowState: 'awaiting_split_confirmation',
-      sentBody: body,
+      sentBody: sendBody,
       relatedMaterials: JSON.stringify({ version: 'split-v1', plans, totalTonnes, capacityTonnes }),
     },
   });
@@ -560,199 +393,6 @@ async function sendVehicleSplitInquiry(args: {
   log(`[VehicleSplit] Inquiry sent to ${BRANCH_EMAIL} for PO ${po.poNumber} (messageId=${sent.messageId})`);
 }
 
-/**
- * Handle branch's reply to the vehicle-split inquiry.
- * Reads each SO's stored releasePlan and fires ZLOAD1 if confirmed.
- */
-export async function handleVehicleSplitConfirmation(
-  emailId: string,
-  replyHtml: string
-): Promise<{ success: boolean; logs: string[] }> {
-  const logs: string[] = [];
-  const log = (msg: string) => {
-    const m = `[${new Date().toISOString()}] ${msg}`;
-    console.log(m);
-    logs.push(m);
-  };
-
-  try {
-    const email = await prisma.email.findUnique({ where: { id: emailId } });
-    if (!email || !email.purchaseOrderId) {
-      log(`[VehicleSplit] Email or purchaseOrderId missing on ${emailId}`);
-      return { success: false, logs };
-    }
-
-    // Load each SO's stored plan up-front — the classifier wants the list
-    // of valid material codes, and every branch reaches the plan loader.
-    const sos = await prisma.salesOrder.findMany({
-      where: { purchaseOrderId: email.purchaseOrderId, releasePlan: { not: null } },
-    });
-    const plans: SoReleasePlan[] = [];
-    for (const so of sos) {
-      if (!so.releasePlan) continue;
-      try {
-        plans.push(JSON.parse(so.releasePlan) as SoReleasePlan);
-      } catch {
-        log(`[VehicleSplit] could not parse stored plan for SO ${so.soNumber}`);
-      }
-    }
-    const knownMaterialCodes = Array.from(
-      new Set(plans.flatMap((p) => p.items.map((i) => i.material_code)))
-    );
-
-    const po = await prisma.purchaseOrder.findUnique({
-      where: { id: email.purchaseOrderId },
-      include: { customer: true },
-    });
-    const capacityTonnes = po?.customer?.weightage ? Number(po.customer.weightage) : 45;
-
-    let intent: 'split' | 'cancel' | 'amend' | 'ambiguous';
-    let removeCodes: string[] = [];
-    let adjustItems: { material_code: string; quantity: number }[] = [];
-    try {
-      const ai = await classifyVehicleSplitReply({ replyHtml, knownMaterialCodes });
-      intent = ai.intent;
-      if (ai.intent === 'amend') {
-        removeCodes = ai.remove;
-        adjustItems = ai.adjust;
-      }
-      log(`[VehicleSplit] AI intent=${intent}${ai.intent === 'amend' ? ` remove=[${removeCodes.join(',')}] adjust=${adjustItems.length}` : ''} reason="${ai.reason}"`);
-    } catch (aiErr) {
-      // Fall back to the legacy regex if the local classifier errors. Same
-      // capabilities as before (yes/no), no amend support.
-      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const isYes = /\b(yes|yep|yeah|confirm|approve|ok|okay|proceed|split|go ahead|two\s*vehicles?|2\s*vehicles?)\b/.test(replyText);
-      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise)\b/.test(replyText);
-      intent = isYes && !isNo ? 'split' : isNo ? 'cancel' : 'ambiguous';
-      log(`[VehicleSplit] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
-    }
-
-    if (intent === 'split') {
-      const totalKg = plans.reduce((s, p) => s + p.totalWeightKg, 0);
-      const totalTonnes = totalKg / 1000;
-      log(`[VehicleSplit] Confirmed split — sending dispatch confirmation email for ${plans.length} SO(s)`);
-      await sendDispatchConfirmationEmail({
-        purchaseOrderId: email.purchaseOrderId,
-        plans,
-        twoVehicles: true,
-        totalTonnes,
-        capacityTonnes,
-        threadAnchor: email,
-        log,
-      });
-      await prisma.email.update({
-        where: { id: emailId },
-        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
-      });
-      return { success: true, logs };
-    }
-
-    if (intent === 'cancel') {
-      log(`[VehicleSplit] Branch declined split — keeping plans on hold`);
-      await prisma.email.update({
-        where: { id: emailId },
-        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
-      });
-      return { success: true, logs };
-    }
-
-    if (intent === 'amend') {
-      // Mutate each SO's plan: drop items in removeCodes; clamp items in
-      // adjustItems at availability; recompute weight; persist.
-      const removeSet = new Set(removeCodes);
-      const adjustMap = new Map(adjustItems.map((a) => [a.material_code, a.quantity]));
-
-      for (const plan of plans) {
-        const so = sos.find((s) => s.id === plan.salesOrderId);
-        if (!so) continue;
-        const dbMaterials = await prisma.material.findMany({ where: { salesOrderId: so.id } });
-        const dbByCode = new Map(dbMaterials.map((m) => [m.material, m]));
-
-        const newItems: typeof plan.items = [];
-        for (const item of plan.items) {
-          if (removeSet.has(item.material_code)) {
-            log(`[VehicleSplit] SO ${plan.soNumber}: removing ${item.material_code} (${item.weight_kg.toFixed(0)} kg)`);
-            continue;
-          }
-          if (adjustMap.has(item.material_code)) {
-            const dbRow = dbByCode.get(item.material_code);
-            const requested = dbRow?.orderQuantity ?? item.quantity;
-            const available = dbRow?.availableStock ?? requested;
-            const target = adjustMap.get(item.material_code)!;
-            const newQty = Math.min(target, requested, Math.max(available, 0));
-            if (newQty <= 0) {
-              log(`[VehicleSplit] SO ${plan.soNumber}: adjust ${item.material_code} → 0 (clamped); dropping line`);
-              continue;
-            }
-            const fullWeight = dbRow?.orderWeightKg ? Number(dbRow.orderWeightKg) : 0;
-            const perUnit = requested > 0 ? fullWeight / requested : item.weight_kg / Math.max(item.quantity, 1);
-            const newWeight = perUnit * newQty;
-            log(`[VehicleSplit] SO ${plan.soNumber}: adjust ${item.material_code} ${item.quantity}→${newQty} (${item.weight_kg.toFixed(0)}→${newWeight.toFixed(0)} kg)`);
-            newItems.push({ ...item, quantity: newQty, weight_kg: newWeight });
-            continue;
-          }
-          newItems.push(item);
-        }
-
-        plan.items = newItems;
-        plan.totalWeightKg = newItems.reduce((s, i) => s + i.weight_kg, 0);
-
-        await prisma.salesOrder.update({
-          where: { id: so.id },
-          data: { releasePlan: JSON.stringify(plan) },
-        });
-      }
-
-      const newTotalKg = plans.reduce((s, p) => s + p.totalWeightKg, 0);
-      const newTotalTonnes = newTotalKg / 1000;
-      const survivingPlans = plans.filter((p) => p.items.length > 0);
-
-      log(`[VehicleSplit] PO ${po?.poNumber}: amended total ${newTotalTonnes.toFixed(2)} t (capacity ${capacityTonnes} t), ${survivingPlans.length} SO(s) with items`);
-
-      // Mark the current vehicle-split email completed regardless — it has
-      // been answered with an amendment and is producing a follow-up email.
-      await prisma.email.update({
-        where: { id: emailId },
-        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
-      });
-
-      if (survivingPlans.length === 0) {
-        log(`[VehicleSplit] Amendment removed all items — leaving for operator review`);
-        return { success: true, logs };
-      }
-
-      if (newTotalTonnes <= capacityTonnes) {
-        log(`[VehicleSplit] Amended load fits 1 truck — sending dispatch_confirmation`);
-        await sendDispatchConfirmationEmail({
-          purchaseOrderId: email.purchaseOrderId,
-          plans: survivingPlans,
-          twoVehicles: false,
-          totalTonnes: newTotalTonnes,
-          capacityTonnes,
-          threadAnchor: email,
-          log,
-        });
-      } else {
-        log(`[VehicleSplit] Still over capacity by ${(newTotalTonnes - capacityTonnes).toFixed(2)} t — sending fresh vehicle-split inquiry`);
-        await sendVehicleSplitInquiry({
-          purchaseOrderId: email.purchaseOrderId,
-          plans: survivingPlans,
-          totalTonnes: newTotalTonnes,
-          capacityTonnes,
-          originalCombinedEmail: email,
-          log,
-        });
-      }
-      return { success: true, logs };
-    }
-
-    log(`[VehicleSplit] Reply ambiguous — leaving in 'awaiting_split_confirmation'`);
-    return { success: false, logs };
-  } catch (err) {
-    log(`[VehicleSplit] error: ${err instanceof Error ? err.message : err}`);
-    return { success: false, logs };
-  }
-}
 
 /**
  * Send a vehicle-details email to BRANCH_EMAIL for ONE Bundle (one truck).
@@ -778,8 +418,11 @@ export async function sendVehicleDetailsForBundle(
     where: { id: bundleId },
     include: {
       purchaseOrder: true,
-      items: {
-        include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+      loadingSlips: {
+        include: {
+          items: true,
+          salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } },
+        },
       },
       materials: {
         include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
@@ -791,9 +434,10 @@ export async function sendVehicleDetailsForBundle(
     return { sent: false, logs };
   }
 
-  // Idempotency
+  // Idempotency — match both `sent` and `replied` so a branch reply on
+  // the vehicle_details email doesn't reset us into "no email yet, send one".
   const existing = await prisma.email.findFirst({
-    where: { bundleId, emailType: 'vehicle_details', status: 'sent' },
+    where: { bundleId, emailType: 'vehicle_details', status: { in: ['sent', 'replied'] } },
     select: { id: true },
   });
   if (existing) {
@@ -801,17 +445,31 @@ export async function sendVehicleDetailsForBundle(
     return { sent: false, logs };
   }
 
-  // Prefer LSI lines (if ZLOAD1 has run); otherwise list Materials (pre-ZLOAD1).
-  const lsLines = bundle.items.length > 0
-    ? bundle.items
-        .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
-        .join('\n')
+  // Flatten LSIs across all LSs in the bundle (a bundle can hold ≥1 LS
+  // when its SKUs come from multiple plants). Fall back to Material rows
+  // when ZLOAD1 hasn't fired yet.
+  // One line per (SO, LS, material) — collapse the per-batch LSI rows of a
+  // multi-batch material into a single line. Batch is intentionally NOT shown
+  // in the vehicle-details email, so two LSIs that differ only by batch would
+  // otherwise render as duplicate lines.
+  const seenMatLines = new Set<string>();
+  const lsiLines = bundle.loadingSlips.flatMap((ls) =>
+    ls.items
+      .map((it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`)
+      .filter((line) => {
+        if (seenMatLines.has(line)) return false;
+        seenMatLines.add(line);
+        return true;
+      })
+  );
+  const lsLines = lsiLines.length > 0
+    ? lsiLines.join('\n')
     : bundle.materials
         .map((m) => `  - SO ${m.salesOrder.soNumber} / Material ${m.material} (Batch ${m.batch}, ${m.dispatchQuantity ?? m.orderQuantity} units)`)
         .join('\n');
   const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
 
-  const subject = `Vehicle Details Required - PO ${bundle.purchaseOrder.poNumber} / Bundle ${bundle.bundleNumber}`;
+  const purposeLabel = `Vehicle Details Required - PO ${bundle.purchaseOrder.poNumber} / Bundle ${bundle.bundleNumber}`;
   const body = [
     `Dear Branch Team,`,
     ``,
@@ -828,33 +486,41 @@ export async function sendVehicleDetailsForBundle(
     `Sales Order Dispatch Co-ordinator`,
   ].join('\n');
 
-  // Reply in the original NEW ORDER thread of any SO in this bundle, when possible.
-  const itemAnchor = bundle.items.find((it) => it.salesOrder.originalThreadId && it.salesOrder.originalMessageId)?.salesOrder;
+  // Ride the per-PO branch conversation (shared subject). Fall back to the
+  // NEW ORDER thread of any SO in this bundle if no anchor resolves.
+  const { resolvePoThreadAnchor, withPurposeLine } = await import('./po-thread');
+  const branchAnchor = await resolvePoThreadAnchor(bundle.purchaseOrderId, 'branch');
+  const lsAnchor = bundle.loadingSlips.find((ls) => ls.salesOrder.originalThreadId && ls.salesOrder.originalMessageId)?.salesOrder;
   const matAnchor = bundle.materials.find((m) => m.salesOrder.originalThreadId && m.salesOrder.originalMessageId)?.salesOrder;
-  const anchor = itemAnchor ?? matAnchor;
+  const anchor = lsAnchor ?? matAnchor;
+  const subject = branchAnchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, body);
   let sent: { messageId: string; threadId: string };
   try {
-    if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
+    if (branchAnchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, branchAnchor.threadId, branchAnchor.rfc822MessageId);
+    } else if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
       const rfc822Id = await getMessageRfc822Id(anchor.originalMessageId);
       if (rfc822Id) {
-        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.originalThreadId, rfc822Id);
+        sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.originalThreadId, rfc822Id);
       } else {
-        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+        sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
       }
     } else {
-      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
     }
   } catch (err) {
     log(`[VehicleDetails] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
-    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
   }
 
+  const leadSoIdForBundle = bundle.loadingSlips[0]?.salesOrderId ?? bundle.materials[0]?.salesOrderId;
   await prisma.email.create({
     data: {
       bundleId,
       purchaseOrderId: bundle.purchaseOrderId,
       // also link to the lead SO so existing reply-checker SO logging stays sane
-      salesOrderId: bundle.items[0]?.salesOrderId ?? bundle.materials[0]?.salesOrderId,
+      salesOrderId: leadSoIdForBundle,
       gmailMessageId: sent.messageId,
       gmailThreadId: sent.threadId,
       recipientEmail: BRANCH_EMAIL,
@@ -862,9 +528,29 @@ export async function sendVehicleDetailsForBundle(
       status: 'sent',
       emailType: 'vehicle_details',
       workflowState: 'awaiting_reply',
-      sentBody: body,
+      sentBody: sendBody,
     },
   });
+
+  // Audit-trail event for the LLM planner — keyed to the bundle's lead SO.
+  if (leadSoIdForBundle) {
+    try {
+      const { emitEvent } = await import('./scenario-events');
+      await emitEvent({
+        salesOrderId: leadSoIdForBundle,
+        type: 'email_sent',
+        payload: {
+          emailType: 'vehicle_details',
+          recipient: BRANCH_EMAIL,
+          subject,
+          bundle_number: bundle.bundleNumber,
+          gmailMessageId: sent.messageId,
+        },
+      });
+    } catch {
+      // Audit emission must never break the primary flow.
+    }
+  }
 
   log(`[VehicleDetails] Sent vehicle-details email for Bundle ${bundle.bundleNumber} (PO ${bundle.purchaseOrder.poNumber})`);
   return { sent: true, logs };
@@ -893,14 +579,55 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     return { sent: false, logs };
   }
 
-  // Idempotency — one combined email per PO.
+  // Idempotency — one combined email per PO, BUT only while it still
+  // describes the current set of LSs. After a pre-plant_ls modify cycle
+  // (ZLOADING_CLOSE all → … → fresh ZLOAD1) the LSs from the prior round
+  // are gone in SAP and a new wave has just landed. The prior
+  // vehicle_details email referenced LSs that no longer exist, so we must
+  // send a fresh one.
+  //
+  // Rule: an existing vehicle_details email is considered "still current"
+  // ONLY if its sentAt is newer than the latest done LS-mutation work_queue row
+  // (ZLOAD1 OR ZLOAD2) on this PO. If any LS mutation completed AFTER the email
+  // was sent, the email is stale and we send a fresh one.
+  //
+  // Both steps matter: a fresh bundle / re-bundle is a ZLOAD1, but a surgical
+  // same_bundle increase (Rule 6e preserve) revises the existing LS via ZLOAD2
+  // and fires NO ZLOAD1. Gating on ZLOAD1 alone wrongly treated that email as
+  // current and skipped it — so the branch was never asked for vehicle details
+  // for the updated plan. Consider the latest of either step.
   const existing = await prisma.email.findFirst({
-    where: { purchaseOrderId, emailType: 'vehicle_details', status: 'sent' },
-    select: { id: true },
+    where: { purchaseOrderId, emailType: 'vehicle_details', status: { in: ['sent', 'replied'] } },
+    orderBy: { sentAt: 'desc' },
+    select: { id: true, sentAt: true },
   });
   if (existing) {
-    log(`[VehicleDetails] PO ${purchaseOrderId} already has a vehicle_details email — skipping`);
-    return { sent: false, logs };
+    const latestMutation = await prisma.workQueue.findFirst({
+      where: {
+        step: { in: ['zload1', 'zload2'] },
+        state: 'done',
+        salesOrder: { purchaseOrderId },
+      },
+      orderBy: { finishedAt: 'desc' },
+      select: { finishedAt: true, id: true, step: true },
+    });
+
+    const emailSentAt = existing.sentAt.getTime();
+    const lastMutationAt = latestMutation?.finishedAt?.getTime() ?? 0;
+
+    if (lastMutationAt <= emailSentAt) {
+      log(
+        `[VehicleDetails] PO ${purchaseOrderId} already has a current vehicle_details email ` +
+          `(sentAt=${existing.sentAt.toISOString()}, latest LS mutation finishedAt=${latestMutation?.finishedAt?.toISOString() ?? 'none'}) — skipping`,
+      );
+      return { sent: false, logs };
+    }
+
+    log(
+      `[VehicleDetails] PO ${purchaseOrderId} has a STALE vehicle_details email ` +
+        `(sentAt=${existing.sentAt.toISOString()}, but ${latestMutation?.step?.toUpperCase()} ${latestMutation?.id} finished at ` +
+        `${latestMutation?.finishedAt?.toISOString()} after that — an LS modify cycle just completed). Sending fresh email.`,
+    );
   }
 
   const po = await prisma.purchaseOrder.findUnique({
@@ -909,8 +636,11 @@ export async function sendCombinedVehicleDetailsEmailForPo(
       bundles: {
         orderBy: { bundleNumber: 'asc' },
         include: {
-          items: {
-            include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
+          loadingSlips: {
+            include: {
+              items: true,
+              salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } },
+            },
           },
           materials: {
             include: { salesOrder: { select: { id: true, soNumber: true, originalThreadId: true, originalMessageId: true } } },
@@ -928,14 +658,38 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     return { sent: false, logs };
   }
 
-  // Build one section per bundle.
+  // Ask ONLY for bundles that don't already have vehicle details. Once the
+  // branch has given transport for a bundle we never re-ask for it: a
+  // post-plant_ls modification that appends an LS to an EXISTING bundle keeps
+  // that bundle's vehicle, so there's nothing to collect. We email only when a
+  // bundle still lacks details (e.g. a brand-new vehicle/bundle was added), and
+  // then only for those bundles. This is what stops the spurious "vehicle
+  // details already sent" re-ask after an other_bundle append.
+  const needDetails = po.bundles.filter((b) => !b.vehicleNumber);
+  if (needDetails.length === 0) {
+    log(`[VehicleDetails] PO ${po.poNumber} — every bundle already has vehicle details; nothing to ask, skipping`);
+    return { sent: false, logs };
+  }
+
+  // Build one section per bundle that still needs details. Each bundle has ≥1
+  // LSs (one per plant); each LS has its SKU lines.
   const bundleBlocks: string[] = [];
-  for (const bundle of po.bundles) {
+  for (const bundle of needDetails) {
     const totalT = (Number(bundle.totalWeightKg) / 1000).toFixed(2).replace(/\.00$/, '');
-    const lsLines = bundle.items.length > 0
-      ? bundle.items
-          .map((it) => `  - SO ${it.salesOrder.soNumber} / LS ${it.lsNumber} / Material ${it.material}`)
-          .join('\n')
+    // One line per (SO, LS, material) — collapse the per-batch LSI rows of a
+    // multi-batch material (batch is not shown in the vehicle-details email).
+    const seenMatLines = new Set<string>();
+    const lsiLines = bundle.loadingSlips.flatMap((ls) =>
+      ls.items
+        .map((it) => `  - SO ${ls.salesOrder.soNumber} / LS ${ls.lsNumber} / Material ${it.material}`)
+        .filter((line) => {
+          if (seenMatLines.has(line)) return false;
+          seenMatLines.add(line);
+          return true;
+        })
+    );
+    const lsLines = lsiLines.length > 0
+      ? lsiLines.join('\n')
       : bundle.materials
           .map((m) => `  - SO ${m.salesOrder.soNumber} / Material ${m.material} (Batch ${m.batch}, ${m.dispatchQuantity ?? m.orderQuantity} units)`)
           .join('\n');
@@ -947,15 +701,19 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     );
   }
 
-  const subject = `Vehicle Details Required - PO ${po.poNumber} (${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'})`;
+  const askingForAll = needDetails.length === po.bundles.length;
+  const purposeLabel = `Vehicle Details Required - PO ${po.poNumber} (${needDetails.length} bundle${needDetails.length === 1 ? '' : 's'})`;
+  const intro = askingForAll
+    ? `Loading slips for Purchase Order ${po.poNumber} are now ready in SAP. The PO is split into ${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'}:`
+    : `An additional vehicle is needed for Purchase Order ${po.poNumber}. Please provide transport details for the following new bundle${needDetails.length === 1 ? '' : 's'} (the other bundles are already arranged):`;
   const body = [
     `Dear Branch Team,`,
     ``,
-    `Loading slips for Purchase Order ${po.poNumber} are now ready in SAP. The PO is split into ${po.bundles.length} bundle${po.bundles.length === 1 ? '' : 's'}:`,
+    intro,
     ``,
     ...bundleBlocks.map((b) => b + '\n'),
     `Please reply with vehicle/transport details for each bundle in the format below:`,
-    ...po.bundles.map(
+    ...needDetails.map(
       (b) =>
         `  Bundle ${b.bundleNumber}: <Vehicle Number>, <Driver Mobile>, <Container Number>`
     ),
@@ -964,31 +722,30 @@ export async function sendCombinedVehicleDetailsEmailForPo(
     `Sales Order Dispatch Co-ordinator`,
   ].join('\n');
 
-  // Reply in the original NEW ORDER thread of any SO in this PO, when possible.
-  const allSoAnchors = po.bundles
-    .flatMap((b) => [...b.items.map((it) => it.salesOrder), ...b.materials.map((m) => m.salesOrder)])
-    .filter((so) => so.originalThreadId && so.originalMessageId);
-  const anchor = allSoAnchors[0];
+  // Anchor on the per-PO branch thread (shared subject).
+  const { resolvePoThreadAnchor, capturePoThreadAnchor, withPurposeLine } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, body);
   let sent: { messageId: string; threadId: string };
   try {
-    if (anchor && anchor.originalThreadId && anchor.originalMessageId) {
-      const rfc822Id = await getMessageRfc822Id(anchor.originalMessageId);
-      if (rfc822Id) {
-        sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, anchor.originalThreadId, rfc822Id);
-      } else {
-        sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
-      }
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
     }
   } catch (err) {
     log(`[VehicleDetails] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
-    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
+  }
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', sent.threadId, rfc822);
   }
 
   // Use lead SO for legacy `salesOrderId` linkage so reply-checker keeps logs sane.
   const leadSoId =
-    po.bundles[0]?.items[0]?.salesOrderId ?? po.bundles[0]?.materials[0]?.salesOrderId;
+    po.bundles[0]?.loadingSlips[0]?.salesOrderId ?? po.bundles[0]?.materials[0]?.salesOrderId;
 
   await prisma.email.create({
     data: {
@@ -1001,9 +758,35 @@ export async function sendCombinedVehicleDetailsEmailForPo(
       status: 'sent',
       emailType: 'vehicle_details',
       workflowState: 'awaiting_reply',
-      sentBody: body,
+      sentBody: sendBody,
     },
   });
+
+  // Audit-trail event per SO in the PO so the LLM planner sees this milestone
+  // for every SO that lands a reply on this thread.
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    const soIdsInPo = new Set<string>();
+    for (const b of po.bundles) {
+      for (const ls of b.loadingSlips) if (ls.salesOrderId) soIdsInPo.add(ls.salesOrderId);
+      for (const m of b.materials) if (m.salesOrderId) soIdsInPo.add(m.salesOrderId);
+    }
+    for (const sid of soIdsInPo) {
+      await emitEvent({
+        salesOrderId: sid,
+        type: 'email_sent',
+        payload: {
+          emailType: 'vehicle_details',
+          recipient: BRANCH_EMAIL,
+          subject,
+          bundle_count: po.bundles.length,
+          gmailMessageId: sent.messageId,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
 
   log(`[VehicleDetails] Sent combined vehicle-details email for PO ${po.poNumber} (${po.bundles.length} bundle(s))`);
   return { sent: true, logs };
@@ -1119,7 +902,7 @@ type BundleForEmail = {
     dispatchQuantity: number | null;
     orderQuantity: number;
     orderWeightKg: import('@prisma/client').Prisma.Decimal | number | null;
-    salesOrder: { soNumber: string };
+    salesOrder: { soNumber: string; plant: string | null };
   }>;
 };
 
@@ -1130,8 +913,16 @@ function renderDispatchConfirmationBody(args: {
   totalTonnes: number;
   capacityTonnes: number;
   bundles: BundleForEmail[];
+  /** Optional per-material diff from previewBundlesForPo. Rendered as a
+   *  "Changes since last plan" section above the bundle list when present.
+   *  Used on post-modification dispatch_confirmation sends so the branch sees
+   *  exactly which lines / bundles shifted vs the previously-confirmed plan. */
+  diff?: import('./bundler').BundleDiffLine[];
+  /** True when the diff is non-empty AND every line stays in its current
+   *  bundle (only qty deltas, no migration). Drives a clearer label. */
+  pureQtyChange?: boolean;
 }): string {
-  const { poNumber, customerName, twoVehicles, totalTonnes, capacityTonnes, bundles } = args;
+  const { poNumber, customerName, twoVehicles, totalTonnes, capacityTonnes, bundles, diff, pureQtyChange } = args;
 
   const fmtT = (n: number) => n.toFixed(3);
   const totalStr = fmtT(totalTonnes);
@@ -1139,6 +930,33 @@ function renderDispatchConfirmationBody(args: {
   const intro = twoVehicles
     ? `Vehicle split confirmed for Purchase Order ${poNumber} (${customerName}). Total dispatch ${totalStr} t across ${vehicleCount} vehicles (capacity ${capacityTonnes} t each).`
     : `Dispatch plan ready for Purchase Order ${poNumber} (${customerName}). Total ${totalStr} t — fits in 1 vehicle (capacity ${capacityTonnes} t).`;
+
+  // Build the diff block when present and non-empty.
+  let diffBlock = '';
+  if (diff && diff.length > 0) {
+    const heading = pureQtyChange
+      ? 'Changes since last plan (quantity adjustments only — loading slips will be updated):'
+      : 'Changes since last plan (composition shift — bundles will be re-organised):';
+    const existingBundleCount = bundles.length;
+    const diffLines = diff.map((d) => {
+      const label = `${d.material} (Batch ${d.batch})`;
+      if (d.currentQty === 0 && d.proposedQty > 0) {
+        // A proposed bundle number beyond the existing count means a brand-new
+        // vehicle is being added for this (overflow) line.
+        const newVehicle = d.proposedBundleNumber > existingBundleCount ? ' (new vehicle)' : '';
+        return `  + ${label}: NEW LINE → ${d.proposedQty} units in Bundle ${d.proposedBundleNumber}${newVehicle}`;
+      }
+      if (d.proposedQty === 0 && d.currentQty > 0) {
+        return `  - ${label}: REMOVED (was ${d.currentQty} units in Bundle ${d.currentBundleNumber ?? '?'})`;
+      }
+      const bundleNote =
+        d.currentBundleNumber !== null && d.currentBundleNumber !== d.proposedBundleNumber
+          ? ` (moved from Bundle ${d.currentBundleNumber} → Bundle ${d.proposedBundleNumber})`
+          : '';
+      return `  • ${label}: ${d.currentQty} → ${d.proposedQty} units${bundleNote}`;
+    });
+    diffBlock = [heading, '', ...diffLines, ''].join('\n');
+  }
 
   const sections = bundles
     .map((b) => {
@@ -1148,26 +966,48 @@ function renderDispatchConfirmationBody(args: {
         const orderedQty = m.orderQuantity || 0;
         const fullWeightKg = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
         const itemKg = orderedQty > 0 ? (dispatchQty / orderedQty) * fullWeightKg : 0;
-        return `  - SO ${m.salesOrder.soNumber} / ${m.material} (Batch ${m.batch}): ${dispatchQty} units, ${fmtT(itemKg / 1000)} t`;
+        // Append "(sourced from plant X)" for materials whose product-db plant
+        // differs from the SO's own plant — i.e. cross-plant substitutions
+        // chosen by stock_precheck. Branch sees explicitly which lines aren't
+        // coming from their usual plant.
+        const subPlant = substituteSourcePlant(m.material, m.salesOrder.plant);
+        const subSuffix = subPlant ? ` (sourced from plant ${subPlant})` : '';
+        return `  - SO ${m.salesOrder.soNumber} / ${m.material} (Batch ${m.batch}): ${dispatchQty} units, ${fmtT(itemKg / 1000)} t${subSuffix}`;
       });
       return `Bundle ${b.bundleNumber} — ${bundleT} t (of ${capacityTonnes} t capacity):\n${lines.join('\n')}`;
     })
     .join('\n\n');
+
+  // When we have a diff (post-modification cycle), the closing call-to-action
+  // changes slightly: confirming means we'll RUN the modification (ZLOAD2),
+  // not create LSs from scratch.
+  const closingLines = diff && diff.length > 0
+    ? [
+        'Please reply with:',
+        '  - "yes" / "confirm" to apply the above changes (we will update the existing loading slips and send the revised slips to the plant), or',
+        '  - any further adjustments you want to make.',
+        '',
+        'Once confirmed we will update the loading slips and re-share them with the plant.',
+      ]
+    : [
+        'Please reply with:',
+        '  - "yes" / "confirm" to proceed with the above plan, or',
+        '  - the changes you want (e.g. "skip OOWJ on SO 1234567", "send only 15 of OP7WJ").',
+        '',
+        'Once confirmed we will create the loading slips.',
+      ];
 
   return [
     'Dear Branch Team,',
     '',
     intro,
     '',
+    ...(diffBlock ? [diffBlock] : []),
     'Proposed dispatch (grouped by bundle):',
     '',
     sections,
     '',
-    'Please reply with:',
-    '  - "yes" / "confirm" to proceed with the above plan, or',
-    '  - the changes you want (e.g. "skip OOWJ on SO 1234567", "send only 15 of OP7WJ").',
-    '',
-    'Once confirmed we will create the loading slips.',
+    ...closingLines,
     '',
     'Best regards,',
     'Sales Order Dispatch Co-ordinator',
@@ -1189,10 +1029,9 @@ export async function sendDispatchConfirmationEmail(args: {
   twoVehicles: boolean;
   totalTonnes: number;
   capacityTonnes: number;
-  threadAnchor: { gmailThreadId: string; gmailMessageId: string };
   log: (msg: string) => void;
 }): Promise<void> {
-  const { purchaseOrderId, plans, twoVehicles, totalTonnes, capacityTonnes, threadAnchor, log } = args;
+  const { purchaseOrderId, plans, twoVehicles, totalTonnes, capacityTonnes, log } = args;
 
   if (!BRANCH_EMAIL) {
     log(`[DispatchConfirm] BRANCH_EMAIL not configured`);
@@ -1204,10 +1043,55 @@ export async function sendDispatchConfirmationEmail(args: {
     await persistDispatchPlan(plan);
   }
 
-  // 2) Compute bundles now (FFD bin-pack into trucks of customer.weightage*1000 kg)
-  //    so the email can list items truck-by-truck. Bundler is idempotent, so
-  //    handleDispatchConfirmation re-running it later produces the same result.
-  const bundleResult = await computeBundlesForPo(purchaseOrderId);
+  // 2) Compute bundles now (FFD bin-pack into trucks of po.weightage*1000 kg)
+  //    so the email can list items truck-by-truck.
+  //
+  // Two modes:
+  //  - INITIAL dispatch_confirmation (no LSs exist for this PO yet) → run the
+  //    destructive computeBundlesForPo so Bundle rows are written; ZLOAD1's
+  //    fan-out later groups by these bundle rows.
+  //  - MODIFICATION dispatch_confirmation (LSs already exist, but plant_ls
+  //    NOT yet sent — Rule 9/10b flow) → run previewBundlesForPo: compute
+  //    the proposed plan + structured diff in memory ONLY. Do NOT wipe LSs
+  //    here; ZLOAD2 (Rule 10b path b) will update them in-place after the
+  //    branch confirms this email. Wiping pre-zload2 would destroy the LSs
+  //    zload2 is meant to update.
+  //  - When po.weightage is null, the bundler throws — surface clearly and
+  //    skip the email; cron retries once weightage lands.
+  const existingLsCount = await prisma.loadingSlip.count({
+    where: { salesOrder: { purchaseOrderId } },
+  });
+  let bundleResult: { bundleCount: number; totalKg: number; capacityKg: number };
+  let previewDiff: import('./bundler').BundleDiffLine[] = [];
+  let previewPureQtyChange = false;
+  let previewUnchanged = false;
+  try {
+    if (existingLsCount > 0) {
+      const { previewBundlesForPo } = await import('./bundler');
+      const preview = await previewBundlesForPo(purchaseOrderId);
+      bundleResult = {
+        bundleCount: preview.bundleCount,
+        totalKg: preview.totalKg,
+        capacityKg: preview.capacityKg,
+      };
+      previewDiff = preview.diff;
+      previewPureQtyChange = preview.pureQtyChange;
+      previewUnchanged = preview.unchanged;
+      log(
+        `[DispatchConfirm] Preview mode (${existingLsCount} LS(s) already exist): ` +
+          `${preview.bundleCount} bundle(s), unchanged=${preview.unchanged}, pureQtyChange=${preview.pureQtyChange}, diff=${preview.diff.length} line(s)`,
+      );
+    } else {
+      bundleResult = await computeBundlesForPo(purchaseOrderId);
+    }
+  } catch (err) {
+    const { BundlerWeightageMissingError } = await import('./bundler');
+    if (err instanceof BundlerWeightageMissingError) {
+      log(`[DispatchConfirm] ${err.message} — skipping dispatch_confirmation, will retry once branch replies with tonnage.`);
+      return;
+    }
+    throw err;
+  }
   log(`[DispatchConfirm] Pre-email bundling: ${bundleResult.bundleCount} bundle(s), total ${(bundleResult.totalKg / 1000).toFixed(3)} t / ${bundleResult.capacityKg / 1000} t per truck`);
 
   const bundlesForEmail = await prisma.bundle.findMany({
@@ -1216,7 +1100,10 @@ export async function sendDispatchConfirmationEmail(args: {
     include: {
       materials: {
         where: { dispatchQuantity: { gt: 0 } },
-        include: { salesOrder: { select: { soNumber: true } } },
+        // `plant` is needed alongside soNumber so renderDispatchConfirmationBody
+        // can detect cross-plant substituted materials and surface them in the
+        // body (see substituteSourcePlant in dispatch-email-template.ts).
+        include: { salesOrder: { select: { soNumber: true, plant: true } } },
         orderBy: [{ material: 'asc' }],
       },
     },
@@ -1238,24 +1125,41 @@ export async function sendDispatchConfirmationEmail(args: {
     totalTonnes,
     capacityTonnes,
     bundles: bundlesForEmail,
+    // Only surface the diff section when we ran preview mode AND there are
+    // real differences. previewUnchanged is true when nothing changed since
+    // the last saved plan — in that case skip the diff block; the email is
+    // just a re-confirmation request and the bundle list speaks for itself.
+    diff: existingLsCount > 0 && !previewUnchanged ? previewDiff : undefined,
+    pureQtyChange: existingLsCount > 0 ? previewPureQtyChange : undefined,
   });
-  const subject = `Dispatch Confirmation - PO ${po.poNumber}`;
+  const purposeLabel = `Dispatch Confirmation - PO ${po.poNumber}`;
 
-  // 3) Send (reply in original NEW ORDER thread when possible).
+  // 3) Send (reply in the canonical per-PO branch thread, shared subject).
+  const { resolvePoThreadAnchor, capturePoThreadAnchor, withPurposeLine } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, body);
   let sent: { messageId: string; threadId: string };
   try {
-    const rfc822Id = await getMessageRfc822Id(threadAnchor.gmailMessageId);
-    if (rfc822Id) {
-      sent = await sendReplyEmail(BRANCH_EMAIL, subject, body, threadAnchor.gmailThreadId, rfc822Id);
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
     } else {
-      sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
     }
   } catch (err) {
     log(`[DispatchConfirm] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
-    sent = await sendPlainEmail(BRANCH_EMAIL, subject, body);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
   }
 
-  // 4) Track the Email row for reply detection.
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', sent.threadId, rfc822);
+  }
+
+  // 4) Track the Email row for reply detection. Stamp with the PO's current
+  // dispatchRound so the engine's round-scoped idempotency guard in
+  // `email_confirm_bundle_details` can distinguish this round's confirmation
+  // from prior rounds (post-VA02 re-cycle scenarios).
   await prisma.email.create({
     data: {
       purchaseOrderId,
@@ -1267,12 +1171,833 @@ export async function sendDispatchConfirmationEmail(args: {
       status: 'sent',
       emailType: 'dispatch_confirmation',
       workflowState: 'awaiting_dispatch_confirmation',
-      sentBody: body,
+      sentBody: sendBody,
       relatedMaterials: JSON.stringify({ version: 'dispatch-v1', plans, twoVehicles, totalTonnes, capacityTonnes }),
+      dispatchRound: po.dispatchRound,
     },
   });
 
+  // Audit-trail event for the LLM planner — one per SO in the plan.
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    for (const plan of plans) {
+      await emitEvent({
+        salesOrderId: plan.salesOrderId,
+        type: 'email_sent',
+        payload: {
+          emailType: 'dispatch_confirmation',
+          recipient: BRANCH_EMAIL,
+          subject,
+          body_excerpt: sendBody.slice(0, 200),
+          gmailMessageId: sent.messageId,
+          dispatchRound: po.dispatchRound,
+          total_tonnes: totalTonnes,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
+
   log(`[DispatchConfirm] Confirmation email sent to ${BRANCH_EMAIL} for PO ${po.poNumber} (${plans.length} SO(s), ${totalTonnes.toFixed(2)} t)`);
+}
+
+/**
+ * Post-plant_ls modify-increase variant of `sendDispatchConfirmationEmail`.
+ *
+ * Renders a dispatch_confirmation email that describes the EXISTING bundle plan
+ * (loading slips already with the plant) annotated with the UPCOMING ZLOAD2 /
+ * ZLOAD1-append changes resolved from a `bundle_capacity_assessment` verdict.
+ * Reused upcoming-changes shape: `Allocation` from `bundle-capacity.ts`, tagged
+ * with the material the allocation belongs to.
+ *
+ * NEVER calls the bundler (`computeBundlesForPo` / `previewBundlesForPo`) — both
+ * throw `BundlesFrozenError` once any LS is `sent_to_plant`. Existing rows are
+ * the source of truth.
+ *
+ * Reuses (carefully):
+ *   - `renderDispatchConfirmationBody` with its existing `diff` parameter to
+ *     surface the upcoming changes as a "Changes since last plan" block. The
+ *     diff lines synthesise from allocations (no bundler involvement).
+ *   - The per-PO branch thread anchor (`resolvePoThreadAnchor(po, 'branch')`).
+ *   - The standard Email row write + audit-trail emission so the planner and
+ *     the dashboard timeline see this email exactly like a normal
+ *     dispatch_confirmation.
+ *
+ * Does NOT touch `Material.dispatchQuantity` or any other DB write outside the
+ * Email row + audit event — Phase 3's ZLOAD2 / ZLOAD1-append callbacks write
+ * LSI rows themselves.
+ */
+export async function sendDispatchConfirmationWithUpcomingChanges(args: {
+  purchaseOrderId: string;
+  salesOrderId: string;
+  /**
+   * One row per (material, allocation leg) from the latest
+   * bundle_capacity_assessment verdict. Same shape as `Allocation` but tagged
+   * with the material code, since the verdict groups by material.
+   */
+  allocations: Array<{
+    material: string;
+    kind: 'same_bundle' | 'other_bundle' | 'new_bundle';
+    /** Null for `new_bundle` legs — the bundle doesn't exist yet at confirm time. */
+    bundleId: string | null;
+    kg: number;
+  }>;
+  /** Per-material overflow legs that will be sent to a new SO. Optional. */
+  overflowItems?: Array<{ material: string; overflowKg: number }>;
+  /**
+   * Concurrent decreases/deletes in the same request (display-only here). Each
+   * lowers the material's proposed listing qty to `toQty` so per-bundle tonnage
+   * nets the decrease, and adds a diff line so the branch sees it. `toQty: 0`
+   * means the material is removed.
+   */
+  decreases?: Array<{ material: string; fromQty: number; toQty: number }>;
+  log: (msg: string) => void;
+}): Promise<void> {
+  const { purchaseOrderId, salesOrderId, allocations, overflowItems, decreases = [], log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log('[DispatchConfirm:upcoming] BRANCH_EMAIL not configured');
+    return;
+  }
+  if (allocations.length === 0) {
+    log('[DispatchConfirm:upcoming] no allocations — nothing to confirm; caller should have routed to email_branch_request_new_so');
+    return;
+  }
+
+  const po = await prisma.purchaseOrder.findUnique({
+    where: { id: purchaseOrderId },
+    include: { customer: true },
+  });
+  if (!po) {
+    log(`[DispatchConfirm:upcoming] PO ${purchaseOrderId} not found`);
+    return;
+  }
+
+  // Existing bundles on the PO — only id + number are needed now (bundle-number
+  // lookups + new-vehicle numbering). The per-bundle material listing is built
+  // from loading-slip items below, not from these rows.
+  const bundlesForEmail = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    orderBy: { bundleNumber: 'asc' },
+    select: { id: true, bundleNumber: true },
+  });
+
+  // Look up Material rows for the placed-portion materials so we can convert
+  // each allocation's kg into a unit count (qty) for the diff row. lone_zmatana
+  // populates `orderWeightKg` on the relevant Material rows in Phase 2.5 — by
+  // the time we render here, those rows are fresh.
+  const materialCodes = [...new Set(allocations.map((a) => a.material))];
+  const materialRows = await prisma.material.findMany({
+    where: { salesOrderId, material: { in: materialCodes } },
+    select: { material: true, batch: true, orderQuantity: true, orderWeightKg: true },
+  });
+  const materialByCode = new Map<string, { batch: string; kgPerUnit: number; orderQuantity: number }>();
+  for (const m of materialRows) {
+    const fullWeight = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    const ordered = m.orderQuantity || 0;
+    const kgPerUnit = ordered > 0 && fullWeight > 0 ? fullWeight / ordered : 0;
+    materialByCode.set(m.material, { batch: m.batch ?? '', kgPerUnit, orderQuantity: ordered });
+  }
+
+  // Physical CURRENT quantity per material from the loading-slip items. ZLOAD2
+  // hasn't run yet when this email renders, so the LSI still holds the pre-change
+  // qty (e.g. 200). The diff's "current" must come from HERE — NOT from
+  // Material.dispatchQuantity, which the VA02 step already bumped to the new
+  // total (e.g. 210). Reading dispatchQuantity as "current" double-counted the
+  // increase and rendered "200 → 211" (also via a stale kgPerUnit).
+  const lsiRows = await prisma.loadingSlipItem.findMany({
+    where: { salesOrderId, material: { in: materialCodes } },
+    select: { material: true, orderQuantity: true },
+  });
+  const lsiQtyByCode = new Map<string, number>();
+  for (const r of lsiRows) {
+    lsiQtyByCode.set(r.material, (lsiQtyByCode.get(r.material) ?? 0) + (r.orderQuantity ?? 0));
+  }
+
+  // Bundle number lookup keyed by id, so the diff block can name bundles by
+  // their human-readable number ("Bundle 2") rather than cuid.
+  const bundleNumberById = new Map<string, number>();
+  for (const b of bundlesForEmail) {
+    bundleNumberById.set(b.id, b.bundleNumber);
+  }
+
+  // Build the diff: one row per allocation. Reuses BundleDiffLine shape so we
+  // can hand it straight to renderDispatchConfirmationBody — that function
+  // already knows how to format these.
+  type BundleDiffLine = import('./bundler').BundleDiffLine;
+  const diff: BundleDiffLine[] = [];
+  for (const a of allocations) {
+    const md = materialByCode.get(a.material);
+    const batch = md?.batch ?? '';
+    const kgPerUnit = md?.kgPerUnit ?? 0;
+    const addedUnits = kgPerUnit > 0 ? Math.round(a.kg / kgPerUnit) : 0;
+    const targetBundleNumber = a.bundleId ? (bundleNumberById.get(a.bundleId) ?? 0) : 0;
+
+    if (a.kind === 'same_bundle') {
+      // The existing LS on this bundle (which already carries `material`) will
+      // be ZLOAD2'd to a new total. Render the diff as a qty bump on the same
+      // bundle: CURRENT = the LS's physical qty (LSI, pre-ZLOAD2, e.g. 200),
+      // PROPOSED = the new SO-line total (Material.orderQuantity, e.g. 210).
+      // We use orderQuantity directly rather than `currentQty + addedUnits` —
+      // the kg→units conversion of the allocation is lossy (rounding) and would
+      // re-introduce off-by-one errors like "211".
+      const currentQty = lsiQtyByCode.get(a.material) ?? 0;
+      const proposedQty = md?.orderQuantity ?? currentQty + addedUnits;
+      diff.push({
+        material: a.material,
+        batch,
+        currentQty,
+        proposedQty,
+        currentBundleNumber: targetBundleNumber,
+        proposedBundleNumber: targetBundleNumber,
+      });
+    } else if (a.kind === 'new_bundle') {
+      // Overflow leg routed to a BRAND-NEW bundle (extra vehicle) created in
+      // Phase 3. The bundle doesn't exist yet, so show it as a new line on the
+      // next bundle number (current count + 1) — the renderer annotates numbers
+      // beyond the existing count as "(new vehicle)".
+      diff.push({
+        material: a.material,
+        batch,
+        currentQty: 0,
+        proposedQty: addedUnits,
+        currentBundleNumber: null,
+        proposedBundleNumber: bundlesForEmail.length + 1,
+      });
+    } else {
+      // ZLOAD1-append: a NEW LS will be created on `bundleId` carrying
+      // `addedUnits` of `material`. Render as a NEW LINE landing on the target
+      // bundle.
+      diff.push({
+        material: a.material,
+        batch,
+        currentQty: 0,
+        proposedQty: addedUnits,
+        currentBundleNumber: null,
+        proposedBundleNumber: targetBundleNumber,
+      });
+    }
+  }
+
+  // ── Build the PROPOSED post-execution per-bundle listing ──
+  // We CANNOT read the grouped listing from Material rows: a Material row has
+  // one bundleId, but an `other_bundle` append splits a material across two
+  // bundles (e.g. 63 stays on Bundle 1, +10 lands on Bundle 3). So derive the
+  // listing from the physical loading-slip items and overlay the pending
+  // allocations — this renders the split correctly on each bundle, keeps the
+  // same_bundle case right (200 LSI + 10 alloc = 210), and makes the header
+  // total exact (no double-count of the delta).
+
+  // (a) Every LSI physically on this PO's bundles (all SOs), with bundle + SO.
+  const lsiAll = await prisma.loadingSlipItem.findMany({
+    where: { loadingSlip: { bundle: { purchaseOrderId } } },
+    select: {
+      material: true,
+      batch: true,
+      orderQuantity: true,
+      salesOrderId: true,
+      loadingSlip: { select: { bundleId: true } },
+    },
+  });
+
+  // (b) Per-(SO, material) metadata: basis qty + full weight (for kgPerUnit) and
+  //     SO labels for the render. Covers both the LSI materials and the
+  //     allocation materials (all on THIS salesOrderId).
+  const metaPairs = Array.from(
+    new Map(
+      [
+        ...lsiAll.map((l) => [`${l.salesOrderId}|${l.material}`, { salesOrderId: l.salesOrderId, material: l.material }] as const),
+        ...allocations.map((a) => [`${salesOrderId}|${a.material}`, { salesOrderId, material: a.material }] as const),
+      ],
+    ).values(),
+  );
+  const metaRows = metaPairs.length > 0
+    ? await prisma.material.findMany({
+        where: { OR: metaPairs.map((p) => ({ salesOrderId: p.salesOrderId, material: p.material })) },
+        select: {
+          salesOrderId: true, material: true, batch: true, orderQuantity: true, orderWeightKg: true,
+          salesOrder: { select: { soNumber: true, plant: true } },
+        },
+      })
+    : [];
+  const metaByKey = new Map<string, { batch: string; orderQuantity: number; orderWeightKg: number; kgPerUnit: number; soNumber: string; plant: string | null }>();
+  for (const m of metaRows) {
+    const oq = m.orderQuantity || 0;
+    const w = m.orderWeightKg ? Number(m.orderWeightKg) : 0;
+    metaByKey.set(`${m.salesOrderId}|${m.material}`, {
+      batch: m.batch ?? '', orderQuantity: oq, orderWeightKg: w,
+      kgPerUnit: oq > 0 && w > 0 ? w / oq : 0,
+      soNumber: m.salesOrder.soNumber, plant: m.salesOrder.plant,
+    });
+  }
+
+  type ListLine = { material: string; batch: string; soNumber: string; plant: string | null; qty: number; orderQuantity: number; orderWeightKg: number };
+  const linesByBundle = new Map<string, Map<string, ListLine>>(); // bundleId → lineKey → line
+  const lineKeyOf = (soId: string, material: string, batch: string) => `${soId}|${material}|${batch}`;
+  const ensureBundle = (bid: string) => {
+    let m = linesByBundle.get(bid);
+    if (!m) { m = new Map(); linesByBundle.set(bid, m); }
+    return m;
+  };
+  const newLine = (soId: string, material: string, batch: string, qty: number): ListLine => {
+    const meta = metaByKey.get(`${soId}|${material}`);
+    return {
+      material, batch,
+      soNumber: meta?.soNumber ?? '', plant: meta?.plant ?? null,
+      qty,
+      orderQuantity: meta?.orderQuantity ?? qty,
+      orderWeightKg: meta?.orderWeightKg ?? 0,
+    };
+  };
+
+  // Seed from physical LSI (current state).
+  for (const l of lsiAll) {
+    const bid = l.loadingSlip?.bundleId;
+    if (!bid) continue;
+    const m = ensureBundle(bid);
+    const k = lineKeyOf(l.salesOrderId, l.material, l.batch);
+    const existing = m.get(k);
+    if (existing) existing.qty += l.orderQuantity ?? 0;
+    else m.set(k, newLine(l.salesOrderId, l.material, l.batch, l.orderQuantity ?? 0));
+  }
+
+  // Overlay pending allocations (all on THIS salesOrderId).
+  let nextNewBundleNumber = bundlesForEmail.length; // synthetic new vehicles count up from here
+  const syntheticNewBundleNumberById = new Map<string, number>();
+  for (const a of allocations) {
+    const meta = metaByKey.get(`${salesOrderId}|${a.material}`);
+    const kgPerUnit = meta?.kgPerUnit ?? materialByCode.get(a.material)?.kgPerUnit ?? 0;
+    const addedUnits = kgPerUnit > 0 ? Math.round(a.kg / kgPerUnit) : 0;
+    if (addedUnits <= 0) continue;
+    const batch = meta?.batch ?? materialByCode.get(a.material)?.batch ?? '';
+
+    if (a.kind === 'new_bundle') {
+      nextNewBundleNumber += 1;
+      const synthId = `__new_${nextNewBundleNumber}`;
+      syntheticNewBundleNumberById.set(synthId, nextNewBundleNumber);
+      ensureBundle(synthId).set(lineKeyOf(salesOrderId, a.material, batch), newLine(salesOrderId, a.material, batch, addedUnits));
+      continue;
+    }
+    if (!a.bundleId) continue;
+    const m = ensureBundle(a.bundleId);
+    if (a.kind === 'same_bundle') {
+      // Bump the material's existing line on this bundle (match by material).
+      let target: ListLine | undefined;
+      for (const line of m.values()) { if (line.material === a.material) { target = line; break; } }
+      if (target) target.qty += addedUnits;
+      else m.set(lineKeyOf(salesOrderId, a.material, batch), newLine(salesOrderId, a.material, batch, addedUnits));
+    } else {
+      // other_bundle: a NEW LS line lands on the target bundle.
+      const k = lineKeyOf(salesOrderId, a.material, batch);
+      const existing = m.get(k);
+      if (existing) existing.qty += addedUnits;
+      else m.set(k, newLine(salesOrderId, a.material, batch, addedUnits));
+    }
+  }
+
+  // ── Overlay concurrent decreases (display-only) ──
+  // Reduce each decreased material's proposed listing qty to its new total so
+  // per-bundle tonnage nets the decrease, and add a diff line so the branch sees
+  // the reduction alongside the increases. The real LS reduction happens later
+  // (Phase 3 zload2/zloading_close); this only affects what we SHOW.
+  for (const dec of decreases) {
+    const matches: Array<{ bundleId: string; line: ListLine }> = [];
+    for (const [bid, lineMap] of linesByBundle) {
+      for (const [k, line] of lineMap) {
+        if (k.startsWith(`${salesOrderId}|${dec.material}|`)) matches.push({ bundleId: bid, line });
+      }
+    }
+    const curTotal = matches.reduce((s, m) => s + m.line.qty, 0);
+    if (curTotal <= 0) continue;
+    const sorted = matches.slice().sort((a, b) => b.line.qty - a.line.qty);
+    const primary = sorted[0];
+    const bundleNo = bundleNumberById.get(primary.bundleId) ?? syntheticNewBundleNumberById.get(primary.bundleId) ?? 0;
+    diff.push({
+      material: dec.material,
+      batch: primary.line.batch,
+      currentQty: dec.fromQty || curTotal,
+      proposedQty: dec.toQty,
+      currentBundleNumber: bundleNo,
+      // For a delete (proposedQty 0) the renderer shows "REMOVED" and ignores
+      // this; for a plain decrease it stays on the same bundle.
+      proposedBundleNumber: bundleNo,
+    });
+    // Reduce the proposed listing to the new total (largest line first).
+    let toRemove = Math.max(0, curTotal - dec.toQty);
+    for (const m of sorted) {
+      if (toRemove <= 0) break;
+      const take = Math.min(m.line.qty, toRemove);
+      m.line.qty -= take;
+      toRemove -= take;
+    }
+  }
+
+  // Materialize synthetic BundleForEmail[] (sorted by bundle number).
+  const numberForBundleId = (bid: string): number =>
+    bundleNumberById.get(bid) ?? syntheticNewBundleNumberById.get(bid) ?? 0;
+  const syntheticBundles = Array.from(linesByBundle.entries())
+    .map(([bid, lineMap]) => {
+      const materials = Array.from(lineMap.values())
+        .filter((l) => l.qty > 0)
+        .sort((a, b) => a.material.localeCompare(b.material))
+        .map((l) => ({
+          material: l.material,
+          batch: l.batch,
+          dispatchQuantity: l.qty,
+          orderQuantity: l.orderQuantity,
+          orderWeightKg: l.orderWeightKg,
+          salesOrder: { soNumber: l.soNumber, plant: l.plant },
+        }));
+      const totalWeightKg = materials.reduce(
+        (s, mm) => s + (mm.orderQuantity > 0 ? (mm.dispatchQuantity / mm.orderQuantity) * Number(mm.orderWeightKg) : 0),
+        0,
+      );
+      return { bundleNumber: numberForBundleId(bid), totalWeightKg, materials };
+    })
+    .filter((b) => b.materials.length > 0)
+    .sort((a, b) => a.bundleNumber - b.bundleNumber);
+
+  const totalKg = syntheticBundles.reduce((s, b) => s + Number(b.totalWeightKg), 0);
+  const totalTonnes = totalKg / 1000;
+  const capacityTonnes = po.weightage ? Number(po.weightage) : 0;
+  const twoVehicles = syntheticBundles.length > 1;
+
+  // pureQtyChange = every allocation stays on the bundle the material already
+  // belongs to. When any leg is `other_bundle`, a new LS lands on a different
+  // bundle → composition shift → false. Mirrors the preview-bundler convention.
+  const pureQtyChange = allocations.every((a) => a.kind === 'same_bundle');
+
+  const body = renderDispatchConfirmationBody({
+    poNumber: po.poNumber,
+    customerName: po.customer?.name ?? po.customerName,
+    twoVehicles,
+    totalTonnes,
+    capacityTonnes,
+    bundles: syntheticBundles,
+    diff,
+    pureQtyChange,
+  });
+
+  // kgPerUnit for the overflow materials so the footer reads in units (boxes),
+  // not kg. needs_new_so materials aren't in materialByCode, so fetch directly.
+  const overflowKpu = new Map<string, number>();
+  if (overflowItems && overflowItems.length > 0) {
+    const ofMats = await prisma.material.findMany({
+      where: { salesOrderId, material: { in: overflowItems.map((o) => o.material) } },
+      select: { material: true, orderWeightKg: true, orderQuantity: true },
+    });
+    for (const m of ofMats) {
+      overflowKpu.set(m.material, kgPerUnitOf(m.orderWeightKg ? Number(m.orderWeightKg) : 0, m.orderQuantity));
+    }
+  }
+
+  // Optional overflow footer — branch sees the placed plan AND knows a new SO
+  // request is coming separately for the spill. Doesn't replace
+  // email_branch_request_new_so; just heads off "wait, where's the rest?"
+  // confusion in this email.
+  const overflowFooter = overflowItems && overflowItems.length > 0
+    ? '\n\nNote: ' + overflowItems
+        .map((o) => {
+          const units = kgToUnits(o.overflowKg, overflowKpu.get(o.material) ?? 0);
+          return `${o.material} has an additional ${units} units that cannot be accommodated in the current vehicle plan; a separate request for a new SO will follow.`;
+        })
+        .join(' ')
+    : '';
+  const finalBody = body + overflowFooter;
+
+  const purposeLabel = `Dispatch Confirmation - PO ${po.poNumber}`;
+
+  // Send in the per-PO branch thread (same anchoring rules as the original
+  // function), with the shared branch subject.
+  const { resolvePoThreadAnchor, capturePoThreadAnchor, withPurposeLine } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLine(purposeLabel, finalBody);
+  let sent: { messageId: string; threadId: string };
+  try {
+    if (anchor) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
+    } else {
+      sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
+    }
+  } catch (err) {
+    log(`[DispatchConfirm:upcoming] reply-in-thread failed: ${err instanceof Error ? err.message : err}`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
+  }
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(sent.messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', sent.threadId, rfc822);
+  }
+
+  // Email row + audit event identical to the original function's, including
+  // dispatchRound stamping so reply-detection / round guards work the same way.
+  await prisma.email.create({
+    data: {
+      purchaseOrderId,
+      salesOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'dispatch_confirmation',
+      workflowState: 'awaiting_dispatch_confirmation',
+      sentBody: sendBody,
+      relatedMaterials: JSON.stringify({
+        version: 'dispatch-upcoming-v1',
+        allocations,
+        overflowItems: overflowItems ?? [],
+      }),
+      dispatchRound: po.dispatchRound,
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    await emitEvent({
+      salesOrderId,
+      type: 'email_sent',
+      payload: {
+        emailType: 'dispatch_confirmation',
+        recipient: BRANCH_EMAIL,
+        subject,
+        body_excerpt: sendBody.slice(0, 200),
+        gmailMessageId: sent.messageId,
+        dispatchRound: po.dispatchRound,
+        total_tonnes: totalTonnes,
+        flow: 'upcoming_changes',
+      },
+    });
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
+
+  log(
+    `[DispatchConfirm:upcoming] Sent to ${BRANCH_EMAIL} for PO ${po.poNumber} ` +
+      `(${allocations.length} allocation(s), overflow=${overflowItems?.length ?? 0}, total ${totalTonnes.toFixed(2)} t)`,
+  );
+}
+
+/**
+ * Follow-up update to an existing dispatch_confirmation for the same round.
+ * When the round guard would have skipped a re-send but the plan has actually
+ * changed (e.g. quantity revision after the original confirmation went out),
+ * we send a short diff reply IN THE SAME thread instead of a fresh full form.
+ *
+ * Returns `{ skipped: true }` when there's no prior dispatch_confirmation for
+ * the round, when the prior has no usable plans snapshot, or when the new
+ * plan is identical to the prior (no diff to communicate).
+ */
+export async function sendDispatchConfirmationUpdate(args: {
+  purchaseOrderId: string;
+  currentRound: number;
+  plans: SoReleasePlan[];
+  totalTonnes: number;
+  log: (msg: string) => void;
+}): Promise<{ sent: boolean; skipped?: boolean; reason?: string }> {
+  const { purchaseOrderId, currentRound, plans, totalTonnes, log } = args;
+
+  if (!BRANCH_EMAIL) {
+    log(`[DispatchConfirm:update] BRANCH_EMAIL not configured`);
+    return { sent: false, skipped: true, reason: 'no_branch_email' };
+  }
+
+  // The prior dispatch_confirmation is normally `replied` by the time we
+  // reach the diff path (the reply is what triggered the re-plan), so we
+  // must match both `sent` and `replied`.
+  const prior = await prisma.email.findFirst({
+    where: {
+      purchaseOrderId,
+      emailType: 'dispatch_confirmation',
+      status: { in: ['sent', 'replied'] },
+      dispatchRound: currentRound,
+    },
+    orderBy: { sentAt: 'desc' },
+    select: { id: true, gmailThreadId: true, gmailMessageId: true, relatedMaterials: true },
+  });
+  if (!prior) {
+    return { sent: false, skipped: true, reason: 'no_prior_for_round' };
+  }
+
+  // Pull the per-(soNumber, material, batch) quantity from the prior plan
+  // snapshot so we can compute the diff.
+  type PriorItem = { material_code: string; batch: string; quantity: number };
+  const priorByKey = new Map<string, number>();
+  try {
+    const parsed = prior.relatedMaterials ? JSON.parse(prior.relatedMaterials) : null;
+    const priorPlans: Array<{ soNumber: string; items: PriorItem[] }> = parsed?.plans ?? [];
+    for (const p of priorPlans) {
+      for (const it of p.items ?? []) {
+        priorByKey.set(`${p.soNumber}|${it.material_code}|${it.batch}`, it.quantity);
+      }
+    }
+  } catch {
+    log(`[DispatchConfirm:update] prior email ${prior.id} has unparseable relatedMaterials — skipping diff`);
+    return { sent: false, skipped: true, reason: 'prior_unparseable' };
+  }
+
+  type DiffRow = { soNumber: string; material: string; batch: string; was: number; now: number };
+  const diffs: DiffRow[] = [];
+  for (const plan of plans) {
+    for (const it of plan.items) {
+      const key = `${plan.soNumber}|${it.material_code}|${it.batch}`;
+      const was = priorByKey.get(key);
+      if (was === undefined) {
+        diffs.push({ soNumber: plan.soNumber, material: it.material_code, batch: it.batch, was: 0, now: it.quantity });
+        continue;
+      }
+      if (was !== it.quantity) {
+        diffs.push({ soNumber: plan.soNumber, material: it.material_code, batch: it.batch, was, now: it.quantity });
+      }
+      priorByKey.delete(key);
+    }
+  }
+  for (const [key, was] of priorByKey.entries()) {
+    const [soNumber, material, batch] = key.split('|');
+    diffs.push({ soNumber, material, batch, was, now: 0 });
+  }
+
+  if (diffs.length === 0) {
+    log(`[DispatchConfirm:update] no diff vs prior email ${prior.id} — skipping`);
+    return { sent: false, skipped: true, reason: 'no_diff' };
+  }
+
+  const lines = diffs.map(
+    (d) => `  - SO ${d.soNumber} / ${d.material} (Batch ${d.batch}): ${d.was} → ${d.now}`,
+  );
+  const body = [
+    `Hi,`,
+    ``,
+    `Update to the dispatch plan we shared earlier on this thread:`,
+    ``,
+    ...lines,
+    ``,
+    `Revised total: ${totalTonnes.toFixed(2)} t.`,
+    ``,
+    `Please confirm.`,
+    ``,
+    `Thanks.`,
+  ].join('\n');
+  const purposeLabel = `Dispatch Plan Update`;
+
+  // Reply on the prior dispatch_confirmation's exact message so Gmail stitches
+  // it tightly. Fall back to the per-PO branch anchor if that lookup fails.
+  // Subject is the shared branch subject so it stays in one conversation.
+  const { resolvePoThreadAnchor, withPurposeLine } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+  const subject = anchor?.subject ?? `Re: ${purposeLabel}`;
+  const sendBody = withPurposeLine(purposeLabel, body);
+  let sent: { messageId: string; threadId: string };
+  try {
+    const rfc822 = await getMessageRfc822Id(prior.gmailMessageId);
+    if (rfc822) {
+      sent = await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, prior.gmailThreadId, rfc822);
+    } else {
+      sent = anchor
+        ? await sendReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId)
+        : await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
+    }
+  } catch (err) {
+    log(`[DispatchConfirm:update] send failed (${err instanceof Error ? err.message : err}); falling back to fresh email`);
+    sent = await sendPlainEmail(BRANCH_EMAIL, subject, sendBody);
+  }
+
+  await prisma.email.create({
+    data: {
+      purchaseOrderId,
+      salesOrderId: plans[0]?.salesOrderId,
+      gmailMessageId: sent.messageId,
+      gmailThreadId: sent.threadId,
+      recipientEmail: BRANCH_EMAIL,
+      subject,
+      status: 'sent',
+      emailType: 'dispatch_confirmation_update',
+      workflowState: 'awaiting_dispatch_confirmation',
+      sentBody: sendBody,
+      relatedMaterials: JSON.stringify({ version: 'dispatch-update-v1', plans, totalTonnes, diff: diffs }),
+      dispatchRound: currentRound,
+    },
+  });
+
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    for (const plan of plans) {
+      await emitEvent({
+        salesOrderId: plan.salesOrderId,
+        type: 'email_sent',
+        payload: {
+          emailType: 'dispatch_confirmation_update',
+          recipient: BRANCH_EMAIL,
+          subject,
+          body_excerpt: sendBody.slice(0, 200),
+          gmailMessageId: sent.messageId,
+          dispatchRound: currentRound,
+          diff_count: diffs.length,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
+
+  log(`[DispatchConfirm:update] Sent diff update for PO ${purchaseOrderId} round ${currentRound} (${diffs.length} change(s)) replying to prior ${prior.id}`);
+  return { sent: true };
+}
+
+/**
+ * Compute bundles for a PO (idempotent) and fire ZLOAD1 once per (Bundle, SO)
+ * pair using each Material's saved dispatchQuantity. Flips touched SOs to
+ * `stock_approved`. Two callers: handleDispatchConfirmation when the branch
+ * confirms the dispatch plan, and the scenario engine when its `zload1` step
+ * is reached on a modification scenario.
+ */
+export async function fanOutZload1ForPo(
+  purchaseOrderId: string,
+  log: (msg: string) => void,
+): Promise<{ fired: number; bundleCount: number }> {
+  let bundleResult;
+  try {
+    bundleResult = await computeBundlesForPo(purchaseOrderId);
+  } catch (err) {
+    const { BundlerWeightageMissingError } = await import('./bundler');
+    if (err instanceof BundlerWeightageMissingError) {
+      log(`[ZLOAD1-Fanout] ${err.message} — cannot fire ZLOAD1 yet.`);
+      return { fired: 0, bundleCount: 0 };
+    }
+    throw err;
+  }
+  log(`[ZLOAD1-Fanout] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
+
+  // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that SO
+  // that live in that bundle. An SO that spans bundles gets multiple fires;
+  // a bundle that holds multiple SOs also gets multiple fires. The global
+  // WorkQueue serializes everything; we just control enqueue order:
+  // bundleNumber asc, then SO createdAt asc within a bundle.
+  const bundlesWithMaterials = await prisma.bundle.findMany({
+    where: { purchaseOrderId },
+    orderBy: { bundleNumber: 'asc' },
+    include: {
+      materials: {
+        where: { dispatchQuantity: { gt: 0 } },
+        include: {
+          salesOrder: { select: { id: true, soNumber: true, createdAt: true } },
+        },
+      },
+    },
+  });
+
+  let fired = 0;
+  const stockApprovedSoIds = new Set<string>();
+
+  for (const bundle of bundlesWithMaterials) {
+    type Slot = { soNumber: string; salesOrderId: string; createdAt: Date; items: MaterialItemPayload[] };
+    const bySo = new Map<string, Slot>();
+    for (const m of bundle.materials) {
+      const slot = bySo.get(m.salesOrderId) ?? {
+        soNumber: m.salesOrder.soNumber,
+        salesOrderId: m.salesOrderId,
+        createdAt: m.salesOrder.createdAt,
+        items: [],
+      };
+      slot.items.push({
+        material_code: m.material,
+        batch: m.batch,
+        quantity: m.dispatchQuantity!,
+      });
+      bySo.set(m.salesOrderId, slot);
+    }
+
+    const slots = Array.from(bySo.values()).sort(
+      (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
+    );
+
+    for (const slot of slots) {
+      if (!stockApprovedSoIds.has(slot.salesOrderId)) {
+        await prisma.salesOrder.update({
+          where: { id: slot.salesOrderId },
+          data: { status: 'stock_approved', releasePlan: null },
+        });
+        stockApprovedSoIds.add(slot.salesOrderId);
+      }
+      const enqueued = await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
+      if (enqueued) {
+        fired++;
+        log(`[ZLOAD1-Fanout] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
+      } else {
+        log(`[ZLOAD1-Fanout] ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber} already enqueued — skipped`);
+      }
+    }
+  }
+
+  return { fired, bundleCount: bundleResult.bundleCount };
+}
+
+/**
+ * Append-mode ZLOAD1 fan-out for the post-plant-intimation flow.
+ *
+ * Used when `bundle_capacity_assessment` returns `fits_other_bundle`: the
+ * branch added/increased a material that fits in a sibling bundle on the
+ * same PO, but the existing LSs on the current bundle can't absorb it. We
+ * issue a NEW loading slip onto the target bundle for just the appended
+ * materials — bypassing computeBundlesForPo entirely (which would throw
+ * BundlesFrozenError post-plant). The zload1-data callback reads the
+ * `append_to_bundle_id` from the WorkQueue meta and links the new LS to
+ * that bundle directly, then bumps Bundle.totalWeightKg.
+ *
+ * Refuses on dispatched bundles — once a truck has rolled, no appends.
+ */
+export async function fanOutZload1AppendToBundle(args: {
+  salesOrderId: string;
+  appendToBundleId: string;
+  materials: Array<{ material_code: string; batch?: string; quantity: number }>;
+  log: (msg: string) => void;
+}): Promise<{ fired: number }> {
+  const { salesOrderId, appendToBundleId, materials, log } = args;
+  const so = await prisma.salesOrder.findUnique({
+    where: { id: salesOrderId },
+    select: { soNumber: true, purchaseOrderId: true },
+  });
+  if (!so) {
+    throw new Error(`fanOutZload1AppendToBundle: SO ${salesOrderId} not found`);
+  }
+  const bundle = await prisma.bundle.findUnique({
+    where: { id: appendToBundleId },
+    select: { id: true, bundleNumber: true, status: true, purchaseOrderId: true },
+  });
+  if (!bundle) {
+    throw new Error(`fanOutZload1AppendToBundle: Bundle ${appendToBundleId} not found`);
+  }
+  if (bundle.purchaseOrderId !== so.purchaseOrderId) {
+    throw new Error(
+      `fanOutZload1AppendToBundle: Bundle ${appendToBundleId} (PO ${bundle.purchaseOrderId}) does not belong to SO's PO (${so.purchaseOrderId})`,
+    );
+  }
+  if (bundle.status === 'dispatched') {
+    throw new Error(
+      `fanOutZload1AppendToBundle: Bundle ${appendToBundleId} is dispatched — no appends permitted`,
+    );
+  }
+
+  const payloadItems: MaterialItemPayload[] = materials.map((m) => ({
+    material_code: m.material_code,
+    batch: m.batch ?? '',
+    quantity: m.quantity,
+  }));
+
+  const enqueued = await triggerZload1(so.soNumber, payloadItems, bundle.id, bundle.bundleNumber, true);
+  if (!enqueued) {
+    // Deduped — this exact append (same round + materials) already ran. Report
+    // 0 so the engine advances instead of waiting on a callback that won't come.
+    log(
+      `[ZLOAD1-Append] Append-mode ZLOAD1 for SO ${so.soNumber} onto Bundle ${bundle.bundleNumber} (id=${bundle.id}) was a duplicate — already enqueued; nothing fired`,
+    );
+    return { fired: 0 };
+  }
+  log(
+    `[ZLOAD1-Append] Fired append-mode ZLOAD1 for SO ${so.soNumber} onto Bundle ${bundle.bundleNumber} (id=${bundle.id}): ${payloadItems.length} material(s)`,
+  );
+  return { fired: 1 };
 }
 
 /**
@@ -1281,500 +2006,30 @@ export async function sendDispatchConfirmationEmail(args: {
  * Material.dispatchQuantity values. Anything else (changes, 'no') is left
  * for the operator to handle on the dashboard.
  */
+/**
+ * Test-only thin wrapper. The production path runs the planner directly via
+ * `handleReplyV2`; this wrapper exists for `scripts/e2e-chains.ts` which
+ * simulates a dispatch_confirmation reply by importing this function. The
+ * `preClassified` argument is now ignored — the planner reads the reply
+ * itself from the email thread.
+ */
 export async function handleDispatchConfirmation(
   emailId: string,
-  replyHtml: string
-): Promise<{ success: boolean; logs: string[] }> {
-  const logs: string[] = [];
-  const log = (m: string) => {
-    const t = `[${new Date().toISOString()}] ${m}`;
-    console.log(t);
-    logs.push(t);
-  };
-
-  try {
-    const email = await prisma.email.findUnique({ where: { id: emailId } });
-    if (!email || !email.purchaseOrderId) {
-      log(`[DispatchConfirm] Email or purchaseOrderId missing on ${emailId}`);
-      return { success: false, logs };
-    }
-
-    let intent: 'yes' | 'no' | 'ambiguous';
-    try {
-      const ai = await classifyDispatchConfirmation(replyHtml);
-      intent = ai.intent;
-      log(`[DispatchConfirm] AI intent=${intent} reason="${ai.reason}"`);
-    } catch (aiErr) {
-      // Fallback to regex if AI is unreachable / errors. Quoted-text bug
-      // remains here, but at least we keep the system moving.
-      const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const isYes = /\b(yes|yep|yeah|confirm(ed)?|approve(d)?|proceed|go ahead|ok(ay)?|create (the )?ls)\b/.test(replyText);
-      const isNo = /\b(no|nope|don'?t|do not|cancel|hold|wait|revise|change|modify|amend|edit|skip|exclude)\b/.test(replyText);
-      intent = isYes && !isNo ? 'yes' : isNo ? 'no' : 'ambiguous';
-      log(`[DispatchConfirm] AI failed (${aiErr instanceof Error ? aiErr.message : String(aiErr)}); regex fallback → intent=${intent}`);
-    }
-
-    if (intent === 'yes') {
-      // Confirmed — branch finalised the dispatch plan.
-      // Order: 1) compute bundles from Material rows so the truck count is
-      // locked in; 2) fire ZLOAD1 per (Bundle, SO) pair to create LSs in SAP.
-      // Vehicle-details email is sent later by checkAndSendCombinedVehicleEmailForPo
-      // once every ZLOAD1 work row for the PO is `done` — that runs from the
-      // /zload1-data callback. LSIs created later inherit bundleId from Material.
-      const bundleResult = await computeBundlesForPo(email.purchaseOrderId);
-      log(`[DispatchConfirm] Computed ${bundleResult.bundleCount} bundle(s) for PO (${(bundleResult.totalKg / 1000).toFixed(2)} t / ${(bundleResult.capacityKg / 1000)} t)`);
-
-      // Fire ZLOAD1 once per (Bundle, SO) pair — only the materials of that
-      // SO that live in that bundle. An SO that spans bundles gets multiple
-      // fires; a bundle that holds multiple SOs also gets multiple fires.
-      // The global WorkQueue serializes everything; we just control enqueue
-      // order: bundleNumber asc, then SO createdAt asc within a bundle.
-      const bundlesWithMaterials = await prisma.bundle.findMany({
-        where: { purchaseOrderId: email.purchaseOrderId },
-        orderBy: { bundleNumber: 'asc' },
-        include: {
-          materials: {
-            where: { dispatchQuantity: { gt: 0 } },
-            include: {
-              salesOrder: { select: { id: true, soNumber: true, createdAt: true } },
-            },
-          },
-        },
-      });
-
-      let fired = 0;
-      const stockApprovedSoIds = new Set<string>();
-
-      for (const bundle of bundlesWithMaterials) {
-        // Group this bundle's materials by SO.
-        type Slot = { soNumber: string; salesOrderId: string; createdAt: Date; items: MaterialItemPayload[] };
-        const bySo = new Map<string, Slot>();
-        for (const m of bundle.materials) {
-          const slot = bySo.get(m.salesOrderId) ?? {
-            soNumber: m.salesOrder.soNumber,
-            salesOrderId: m.salesOrderId,
-            createdAt: m.salesOrder.createdAt,
-            items: [],
-          };
-          slot.items.push({
-            material_code: m.material,
-            batch: m.batch,
-            quantity: m.dispatchQuantity!,
-          });
-          bySo.set(m.salesOrderId, slot);
-        }
-
-        const slots = Array.from(bySo.values()).sort(
-          (a, b) => a.createdAt.getTime() - b.createdAt.getTime()
-        );
-
-        for (const slot of slots) {
-          if (!stockApprovedSoIds.has(slot.salesOrderId)) {
-            await prisma.salesOrder.update({
-              where: { id: slot.salesOrderId },
-              data: { status: 'stock_approved', releasePlan: null },
-            });
-            stockApprovedSoIds.add(slot.salesOrderId);
-          }
-          await triggerZload1(slot.soNumber, slot.items, bundle.id, bundle.bundleNumber);
-          fired++;
-          log(`[DispatchConfirm] Fired ZLOAD1 for SO ${slot.soNumber} / Bundle ${bundle.bundleNumber}: ${slot.items.length} item(s)`);
-        }
-      }
-
-      await prisma.email.update({
-        where: { id: emailId },
-        data: { status: 'replied', repliedAt: new Date(), workflowState: 'completed', replyHtml },
-      });
-      log(`[DispatchConfirm] Confirmed ${fired} SO(s) for PO ${email.purchaseOrderId}`);
-      return { success: true, logs };
-    }
-
-    // Amendments / 'no' / ambiguous — operator handles on the dashboard.
-    log(`[DispatchConfirm] Reply not a clean yes — leaving in awaiting state for operator review`);
-    await prisma.email.update({
-      where: { id: emailId },
-      data: { status: 'replied', repliedAt: new Date(), replyHtml },
-    });
-    return { success: true, logs };
-  } catch (err) {
-    log(`[DispatchConfirm] error: ${err instanceof Error ? err.message : err}`);
-    return { success: false, logs };
-  }
-}
-
-export async function handleBranchReply(
-  emailId: string,
   replyHtml: string,
-  originalEmailHtml: string,
-  _salesOrderId: string
+  _preClassified?: { decision: 'yes' | 'no' | 'ambiguous' },
 ): Promise<{ success: boolean; logs: string[] }> {
-  const logs: string[] = [];
-  const log = (msg: string) => {
-    const logMsg = `[${new Date().toISOString()}] ${msg}`;
-    console.log(logMsg);
-    logs.push(logMsg);
-  };
-
-  try {
-    const email = await prisma.email.findUnique({
-      where: { id: emailId },
-      include: {
-        salesOrder: true,
-        loadingSlipItem: true,
-      },
-    });
-
-    if (!email) {
-      log(`[BranchReply] Email not found: ${emailId}`);
-      return { success: false, logs };
-    }
-
-    const parsedMaterials: unknown = email.relatedMaterials
-      ? JSON.parse(email.relatedMaterials)
-      : null;
-
-    // Multi-SO mode: combined dispatch email keyed to a PO with v2 materials shape
-    if (email.purchaseOrderId && isPerSoMaterials(parsedMaterials)) {
-      log(`[BranchReply] Multi-SO mode for PO email ${emailId}: ${parsedMaterials.perSO.length} SO(s)`);
-
-      const plans: SoReleasePlan[] = [];
-      let anyFailure = false;
-
-      // Phase 1: classify each SO and either build a release plan OR
-      // dispatch a per-SO production inquiry ('wait' intent).
-      for (const entry of parsedMaterials.perSO) {
-        const r = await classifyAndPlanForSo({
-          parentLoadingSlipItemId: email.loadingSlipItemId,
-          soNumber: entry.soNumber,
-          salesOrderId: entry.salesOrderId,
-          originalEmailHtml,
-          replyHtml,
-          log,
-        });
-        if (!r.success) {
-          anyFailure = true;
-          continue;
-        }
-        if (r.intent === 'release_all' || r.intent === 'release_part') {
-          plans.push(r.plan);
-        }
-        // 'wait' SOs are already handled inside classifyAndPlanForSo
-      }
-
-      // Phase 2: weight gate. Sum across all release plans for this PO.
-      // If the total exceeds the customer's truck capacity, pause and ask
-      // for 2-vehicle confirmation before firing any ZLOAD1.
-      if (plans.length > 0) {
-        const totalKg = plans.reduce((s, p) => s + p.totalWeightKg, 0);
-        const totalTonnes = totalKg / 1000;
-
-        const po = await prisma.purchaseOrder.findUnique({
-          where: { id: email.purchaseOrderId },
-          include: { customer: true },
-        });
-        const capacityTonnes = po?.customer?.weightage
-          ? Number(po.customer.weightage)
-          : 45;
-
-        log(`[BranchReply] PO ${po?.poNumber}: total release weight ${totalTonnes.toFixed(2)} t (capacity ${capacityTonnes} t)`);
-
-        if (totalTonnes > capacityTonnes) {
-          log(`[BranchReply] Over capacity by ${(totalTonnes - capacityTonnes).toFixed(2)} t — sending vehicle-split inquiry`);
-
-          // Persist plans on each SO so the split-confirmation reply can fire ZLOAD1.
-          for (const plan of plans) {
-            await prisma.salesOrder.update({
-              where: { id: plan.salesOrderId },
-              data: { releasePlan: JSON.stringify(plan) },
-            });
-          }
-
-          await sendVehicleSplitInquiry({
-            purchaseOrderId: email.purchaseOrderId,
-            plans,
-            totalTonnes,
-            capacityTonnes,
-            originalCombinedEmail: email,
-            log,
-          });
-        } else {
-          // Under capacity — save the plan to Material rows and ask branch
-          // to confirm before we fire ZLOAD1.
-          await sendDispatchConfirmationEmail({
-            purchaseOrderId: email.purchaseOrderId,
-            plans,
-            twoVehicles: false,
-            totalTonnes,
-            capacityTonnes,
-            threadAnchor: email,
-            log,
-          });
-        }
-      }
-
-      await prisma.email.update({
-        where: { id: emailId },
-        data: { workflowState: 'completed' },
-      });
-
-      return { success: !anyFailure, logs };
-    }
-
-    // Legacy single-SO path. Treat the same way: classify, plan, weight-gate
-    // against the (optional) customer capacity if linked.
-    const soNumber = email.salesOrder!.soNumber;
-    const r = await classifyAndPlanForSo({
-      parentLoadingSlipItemId: email.loadingSlipItemId,
-      soNumber,
-      salesOrderId: email.salesOrderId!,
-      originalEmailHtml,
-      replyHtml,
-      log,
-    });
-
-    if (r.success && (r.intent === 'release_all' || r.intent === 'release_part')) {
-      const totalTonnes = r.plan.totalWeightKg / 1000;
-      const so = await prisma.salesOrder.findUnique({
-        where: { id: r.plan.salesOrderId },
-        include: { purchaseOrder: { include: { customer: true } } },
-      });
-      const capacityTonnes = so?.purchaseOrder.customer?.weightage
-        ? Number(so.purchaseOrder.customer.weightage)
-        : 45;
-
-      if (totalTonnes > capacityTonnes) {
-        log(`[BranchReply] Single-SO over capacity (${totalTonnes.toFixed(2)} t > ${capacityTonnes} t) — sending split inquiry`);
-        await prisma.salesOrder.update({
-          where: { id: r.plan.salesOrderId },
-          data: { releasePlan: JSON.stringify(r.plan) },
-        });
-        await sendVehicleSplitInquiry({
-          purchaseOrderId: so!.purchaseOrderId,
-          plans: [r.plan],
-          totalTonnes,
-          capacityTonnes,
-          originalCombinedEmail: email,
-          log,
-        });
-      } else {
-        await sendDispatchConfirmationEmail({
-          purchaseOrderId: so!.purchaseOrderId,
-          plans: [r.plan],
-          twoVehicles: false,
-          totalTonnes,
-          capacityTonnes,
-          threadAnchor: email,
-          log,
-        });
-      }
-    }
-
-    await prisma.email.update({
-      where: { id: emailId },
-      data: { workflowState: 'completed' },
-    });
-
-    return { success: r.success, logs };
-  } catch (error) {
-    const cause = error instanceof Error && (error as any).cause ? ` | cause: ${String((error as any).cause)}` : '';
-    log(
-      `[BranchReply] Error: ${error instanceof Error ? error.message : String(error)}${cause}`
-    );
-    return { success: false, logs };
-  }
+  const { handleReplyV2 } = await import('./scenario-engine');
+  const r = await handleReplyV2({
+    emailId,
+    replyHtml,
+    originalEmailHtml: '',
+    sourceEmailType: 'branch',
+  });
+  return { success: r.success, logs: r.logs };
 }
 
-/**
- * Handle production team's reply — extract days and set wait timer
- */
-export async function handleProductionReply(
-  emailId: string,
-  replyHtml: string
-): Promise<{ success: boolean; logs: string[] }> {
-  const logs: string[] = [];
-  const log = (msg: string) => {
-    const logMsg = `[${new Date().toISOString()}] ${msg}`;
-    console.log(logMsg);
-    logs.push(logMsg);
-  };
 
-  try {
-    const email = await prisma.email.findUnique({
-      where: { id: emailId },
-      include: {
-        salesOrder: true,
-        loadingSlipItem: true,
-      },
-    });
 
-    if (!email) {
-      log(`[ProductionReply] Email not found: ${emailId}`);
-      return { success: false, logs };
-    }
-
-    const soNumber = email.salesOrder!.soNumber;
-    const storedMaterials = email.relatedMaterials
-      ? JSON.parse(email.relatedMaterials)
-      : [];
-    // Extract string codes for /email/* API (accepts string[])
-    const materialCodes: string[] = storedMaterials.map((m: any) =>
-      typeof m === 'string' ? m : (m.material ?? m.material_code ?? '')
-    );
-
-    log(`[ProductionReply] Parsing production reply for SO ${soNumber}`);
-
-    const response = await fetch(
-      `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-reply`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          production_reply_html: replyHtml,
-          sales_order: soNumber,
-          materials: materialCodes,
-        }),
-      }
-    );
-
-    const result = await response.json();
-    log(`[ProductionReply] Extracted days: ${result.days}`);
-
-    if (!result.success || result.days <= 0) {
-      log(`[ProductionReply] Failed to extract days: ${result.error}`);
-      return { success: false, logs };
-    }
-
-    // Set wait timer
-    const waitUntil = new Date(Date.now() + result.days * 86400000);
-    await prisma.email.update({
-      where: { id: emailId },
-      data: {
-        status: 'replied',
-        repliedAt: new Date(),
-        replyHtml,
-        workflowState: 'waiting_timer',
-        waitUntil,
-      },
-    });
-
-    log(
-      `[ProductionReply] Timer set: wait until ${waitUntil.toISOString()} (${result.days} days)`
-    );
-    return { success: true, logs };
-  } catch (error) {
-    log(
-      `[ProductionReply] Error: ${error instanceof Error ? error.message : String(error)}`
-    );
-    return { success: false, logs };
-  }
-}
-
-/**
- * Handle production confirmation reply — ready or wait_more
- */
-export async function handleProductionConfirmation(
-  emailId: string,
-  replyHtml: string
-): Promise<{ success: boolean; logs: string[] }> {
-  const logs: string[] = [];
-  const log = (msg: string) => {
-    const logMsg = `[${new Date().toISOString()}] ${msg}`;
-    console.log(logMsg);
-    logs.push(logMsg);
-  };
-
-  try {
-    const email = await prisma.email.findUnique({
-      where: { id: emailId },
-      include: {
-        salesOrder: true,
-        loadingSlipItem: true,
-      },
-    });
-
-    if (!email) {
-      log(`[ProductionConfirmation] Email not found: ${emailId}`);
-      return { success: false, logs };
-    }
-
-    const soNumber = email.salesOrder!.soNumber;
-    const storedMaterials = email.relatedMaterials
-      ? JSON.parse(email.relatedMaterials)
-      : [];
-    // Extract string codes for /email/* API (accepts string[])
-    const materialCodes: string[] = storedMaterials.map((m: any) =>
-      typeof m === 'string' ? m : (m.material ?? m.material_code ?? '')
-    );
-
-    log(`[ProductionConfirmation] Classifying confirmation for SO ${soNumber}`);
-
-    const response = await fetch(
-      `http://${AUTO_GUI_HOST}:${AUTO_GUI_PORT}/email/production-confirmation`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          reply_html: replyHtml,
-          sales_order: soNumber,
-          materials: materialCodes,
-          context: 'production_confirmation',
-        }),
-      }
-    );
-
-    const result = await response.json();
-    log(`[ProductionConfirmation] Status: ${result.status}`);
-
-    if (!result.success) {
-      log(`[ProductionConfirmation] Classification failed: ${result.error}`);
-      return { success: false, logs };
-    }
-
-    if (result.status === 'ready') {
-      // Re-trigger ZSO-VISIBILITY to get fresh batch/material data
-      // Pipeline: ZSO-VISIBILITY → Zmatana → Policy Run → Email to Branch → Branch decides
-      await triggerZsoVisibility(soNumber);
-
-      await prisma.email.update({
-        where: { id: emailId },
-        data: {
-          status: 'replied',
-          repliedAt: new Date(),
-          replyHtml,
-          workflowState: 'completed',
-        },
-      });
-
-      log(`[ProductionConfirmation] Materials ready, ZSO-VISIBILITY re-triggered for SO ${soNumber}`);
-    } else if (result.status === 'wait_more') {
-      const additionalDays = result.additional_days || 3;
-      const waitUntil = new Date(Date.now() + additionalDays * 86400000);
-
-      await prisma.email.update({
-        where: { id: emailId },
-        data: {
-          status: 'replied',
-          repliedAt: new Date(),
-          replyHtml,
-          workflowState: 'waiting_timer',
-          waitUntil,
-        },
-      });
-
-      log(
-        `[ProductionConfirmation] Wait more: ${additionalDays} days until ${waitUntil.toISOString()}`
-      );
-    }
-
-    return { success: true, logs };
-  } catch (error) {
-    log(
-      `[ProductionConfirmation] Error: ${error instanceof Error ? error.message : String(error)}`
-    );
-    return { success: false, logs };
-  }
-}
 
 /**
  * Re-trigger ZSO-VISIBILITY so the pipeline re-checks fresh batch/material
@@ -1806,6 +2061,438 @@ export async function triggerZsoVisibility(soNumber: string): Promise<void> {
 }
 
 /**
+ * Run ZMatana standalone for one or more material codes on the current SO.
+ *
+ * Used after `stock_precheck` substitutes a short material with a cross-plant
+ * equivalent: VA02 has swapped the SO line to the new material code, and we
+ * need ZMatana to fetch its batch + per-SO availability so downstream steps
+ * (ls_dispatch, bundling) can ship it. We can't re-run ZSO_Visibility because
+ * that re-syncs the entire SO and would reset state we've intentionally
+ * changed.
+ *
+ * Enqueues ONE WorkQueue row carrying the full material list. The auto_gui2
+ * endpoint for the `LONE-ZMATANA` transaction runs the SO + materials in a
+ * single pass and POSTs back to /backend/orders/aman/zmatana-data with a
+ * `materials[]` array (batch + available_stock_for_so per material), mirroring
+ * the ZSO-VISIBILITY response shape.
+ */
+/**
+ * One material for LONE-ZMATANA. `delta` (units) is the additional quantity
+ * being added for this material — the amount ZMatana should look for stock
+ * against. The SO line already shows the NEW total after VA02, but the original
+ * quantity is reserved by existing loading slips, so only the delta needs fresh
+ * stock. Optional: when omitted (e.g. the cross-plant substitution flow) the
+ * SAP agent falls back to the SO line as before.
+ */
+export type LoneZmatanaMaterial = string | { material: string; delta?: number };
+
+/**
+ * Result of attempting to fire LONE-ZMATANA. `existingState` is the state of the
+ * matching work row when `fired` is false (a dedup) — the engine uses it to tell
+ * a still-RUNNING transaction (`queued`/`firing` → wait for the callback) from an
+ * already-FINISHED one (`done` → stop; don't re-run/re-plan).
+ */
+export interface TriggerLoneZmatanaResult {
+  fired: boolean;
+  existingState: 'queued' | 'firing' | 'done' | null;
+}
+
+export async function triggerLoneZmatana(
+  soNumber: string,
+  materials: LoneZmatanaMaterial[],
+): Promise<TriggerLoneZmatanaResult> {
+  if (materials.length === 0) {
+    console.log(`[LONE-ZMATANA] No materials provided for SO ${soNumber} — skipping`);
+    return { fired: false, existingState: null };
+  }
+  // Normalize to {material, delta?} and dedup by code (last delta wins).
+  const byCode = new Map<string, { material: string; delta?: number }>();
+  for (const m of materials) {
+    const entry = typeof m === 'string' ? { material: m } : { material: m.material, delta: m.delta };
+    byCode.set(entry.material, entry);
+  }
+  // Sort so the dedup key + instruction are stable regardless of caller ordering.
+  const normalizedItems = Array.from(byCode.values()).sort((a, b) => a.material.localeCompare(b.material));
+  const normalized = normalizedItems.map((e) => e.material);
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true, purchaseOrder: { select: { dispatchRound: true } } },
+  });
+
+  const materialsKey = normalized.join(',');
+  // Dedup key. It MUST be cycle-aware: a surgical increase re-emits LONE-ZMATANA
+  // for the same (SO, material) each cycle, so a key of (SO, materials) alone
+  // collides with a PRIOR cycle's `done` row and the new fetch is silently
+  // skipped — leaving the engine paused on a callback that never comes. Keying
+  // on the dispatch round + per-material delta lets each cycle fetch fresh stock,
+  // while a genuine re-fire within ONE cycle (same round + same deltas) is still
+  // deduped. (Pre-existing rows have no `dedup_key`, so they never match — the
+  // first run after this change fires cleanly.)
+  const dedupKey =
+    `so:${soNumber}|round:${so?.purchaseOrder?.dispatchRound ?? 0}` +
+    `|mat:${normalizedItems.map((e) => `${e.material}/${e.delta ?? ''}`).join(',')}`;
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'lone_zmatana',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"LONE-ZMATANA"` } },
+        { payload: { contains: `"dedup_key":${JSON.stringify(dedupKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(`[LONE-ZMATANA] Already exists for SO ${soNumber} materials [${materialsKey}] round ${so?.purchaseOrder?.dispatchRound ?? 0} (${existing.state}) — skipping`);
+    return { fired: false, existingState: existing.state as 'queued' | 'firing' | 'done' };
+  }
+
+  const materialList = normalized.join(', ');
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'lone_zmatana',
+    payload: {
+      instruction:
+        `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+        `Transaction ZMATANA for Sales Order number ${soNumber} for material ${materialList}.`,
+      transaction_code: 'LONE-ZMATANA',
+      meta: {
+        so_number: soNumber,
+        // The requested material codes — deliberately named `materials_codes`,
+        // NOT `materials`. auto_gui POSTs the policy-optimiser JSON file back to
+        // /zmatana-data and merges this meta OVER the file content
+        // (json_data.update(meta) in send_to_endpoint). A key named `materials`
+        // would overwrite the file's RICH materials array (objects with
+        // material_description / batch / stock) with these bare codes — which
+        // nulled materialDescription and mangled the LSIs into the family prefix
+        // (the SO 3382184 bug). The file only defines `email_body` + `materials`,
+        // so any other key name rides along harmlessly. ZSO-VISIBILITY's meta is
+        // just { so_number } for the same reason.
+        materials_codes: normalized,
+        materials_key: materialsKey,
+        dedup_key: dedupKey,
+        // Per-material delta (units) the SAP agent should look for stock
+        // against. The SO line already shows the new total post-VA02, but the
+        // original qty is reserved by existing loading slips — so only the
+        // delta needs fresh stock. Each entry: { material, delta? }. `delta`
+        // is omitted when the caller didn't supply one (substitution flow),
+        // in which case the agent falls back to the SO line.
+        materials_detail: normalizedItems.map((e) => ({ material: e.material, delta: e.delta ?? null })),
+      },
+    },
+  });
+  await pumpQueue();
+  const deltaSummary = normalizedItems
+    .map((e) => (e.delta !== undefined ? `${e.material}(Δ${e.delta})` : e.material))
+    .join(', ');
+  console.log(`[LONE-ZMATANA] Enqueued for SO ${soNumber} (${normalized.length} material(s): ${deltaSummary})`);
+  return { fired: true, existingState: null };
+}
+
+/**
+ * Trigger ZLOADING_CLOSE for one or more materials on a sales order.
+ *
+ * Builds an instruction of the form:
+ *   "VPN is connected and SAP is logged in. Just go ahead and run the SAP
+ *    Transaction ZLOADING_CLOSE for Sales Order number <soNumber>.
+ *    Close material X, Close material Y."
+ *
+ * Idempotent: dedups on (soNumber + sorted materials) by scanning WorkQueue
+ * for an existing zloading_close row in queued/firing/done state with the
+ * same materials_key in the payload.
+ */
+export async function triggerZloadingClose(
+  lsNumber: string,
+  materials: string[]
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[ZLOADING_CLOSE] No materials provided for LS ${lsNumber} — skipping`);
+    return;
+  }
+
+  const normalized = Array.from(new Set(materials)).sort();
+  const materialsKey = JSON.stringify(normalized);
+
+  // Dedup on (lsNumber, materials). Two close requests for the same materials
+  // on the same LS are a no-op.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zloading_close',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"ZLOADING_CLOSE"` } },
+        { payload: { contains: `"ls_number":"${lsNumber}"` } },
+        { payload: { contains: `"materials_key":${JSON.stringify(materialsKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOADING_CLOSE] Already exists for LS ${lsNumber} materials=${materialsKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const closeClauses = normalized.map((m) => `close material ${m}`).join(', ');
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction ZLOADING_CLOSE for Loading Slip number ${lsNumber}: ${closeClauses}.`;
+
+  // Find any LSI on this LS to link the WorkQueue row to its SalesOrder.
+  const lsi = await prisma.loadingSlipItem.findFirst({
+    where: { lsNumber },
+    select: { salesOrderId: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: lsi?.salesOrderId ?? null,
+    step: 'zloading_close',
+    payload: {
+      instruction,
+      transaction_code: 'ZLOADING_CLOSE',
+      meta: {
+        ls_number: lsNumber,
+        materials: normalized,
+        materials_key: materialsKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(
+    `[ZLOADING_CLOSE] Enqueued for LS ${lsNumber} (${normalized.length} material(s): ${normalized.join(', ')})`
+  );
+}
+
+/**
+ * Trigger VA02 to set order quantities on one or more materials of a sales order.
+ *
+ * Builds an instruction like:
+ *   "...VA02 for Sales Order number <soNumber>. For material X set the order
+ *    quantity to N, for material Y set the order quantity to M"
+ *
+ * Idempotent on the full payload: dedups against existing queued/firing/done
+ * va02 rows with the exact same SO + sorted material→quantity map. A later
+ * call with different quantities fires normally — supports legitimate
+ * sequential edits.
+ */
+/**
+ * One material line in a VA02 call. Either SET the SO line to an absolute
+ * quantity (used for increases and pending-decrease flushes), or DELETE the SO
+ * line entirely (pending-delete flush). auto_gui2's VA02 automation supports
+ * line deletion when instructed.
+ */
+export type Va02Material =
+  | { material: string; orderQuantity: number }
+  | { material: string; op: 'del' };
+
+function isVa02Delete(m: Va02Material): m is { material: string; op: 'del' } {
+  return 'op' in m && m.op === 'del';
+}
+
+export async function triggerVa02(
+  soNumber: string,
+  materials: Array<Va02Material>
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[VA02] No materials provided for SO ${soNumber} — skipping`);
+    return;
+  }
+
+  // Latest-wins on duplicate codes; sort by code for a stable payload_key.
+  const byMaterial = new Map<string, Va02Material>();
+  for (const m of materials) byMaterial.set(m.material, m);
+  const normalized = Array.from(byMaterial.values())
+    .sort((a, b) => a.material.localeCompare(b.material));
+  const payloadKey = JSON.stringify({ soNumber, materials: normalized });
+
+  // Dedup is scoped to VA02 via both `step` and a payload substring match on
+  // `"transaction_code":"VA02"` — prevents any cross-transaction collision.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'va02',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"VA02"` } },
+        { payload: { contains: `"payload_key":${JSON.stringify(payloadKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[VA02] Already exists for SO ${soNumber} payload_key=${payloadKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const clauses = normalized
+    .map((m) =>
+      isVa02Delete(m)
+        ? `for material ${m.material} delete the order line`
+        : `for material ${m.material} set the order quantity to ${m.orderQuantity}`,
+    )
+    .join(', ');
+  const clausesSentence = clauses.charAt(0).toUpperCase() + clauses.slice(1);
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction VA02 for Sales Order number ${soNumber}. ${clausesSentence}`;
+
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: so?.id ?? null,
+    step: 'va02',
+    payload: {
+      instruction,
+      transaction_code: 'VA02',
+      so_number: soNumber,
+      meta: {
+        so_number: soNumber,
+        materials: normalized,
+        payload_key: payloadKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(`[VA02] Enqueued for SO ${soNumber} (${normalized.length} material(s))`);
+}
+
+/** A pending SO-line change read off Material rows for the flush. */
+export type PendingSoChange = {
+  material: string;
+  pendingSoOp: 'dec' | 'del';
+  pendingSoQty: number | null;
+};
+
+/**
+ * Merge the planner's VA02 items (inc / dec / del) with any PENDING
+ * decreases/deletes into the single material list a VA02 call will carry. Pure —
+ * no DB, no side effects; unit-tested directly.
+ *
+ * Rules:
+ *   - Seed from pending: 'dec' → set to pendingSoQty; 'del' → delete the line.
+ *   - A planner item for the SAME material SUPERSEDES its pending entry (the
+ *     fresh op is the live truth; the stale dec/del is dropped).
+ *   - A planner 'del' deletes the line; inc AND dec both SET the line to the new
+ *     absolute total (SAP set-quantity handles both directions). Items with no
+ *     `op` are treated as increases (legacy callers).
+ *   - A pending 'dec' with a null/invalid qty is skipped defensively.
+ */
+export function mergeVa02Flush(
+  plannerItems: Array<{ material: string; op?: 'inc' | 'dec' | 'del'; orderQuantity?: number }>,
+  pending: PendingSoChange[],
+): Va02Material[] {
+  const byMaterial = new Map<string, Va02Material>();
+  for (const p of pending) {
+    if (p.pendingSoOp === 'del') {
+      byMaterial.set(p.material, { material: p.material, op: 'del' });
+    } else if (p.pendingSoOp === 'dec' && typeof p.pendingSoQty === 'number') {
+      byMaterial.set(p.material, { material: p.material, orderQuantity: p.pendingSoQty });
+    }
+  }
+  // Planner items win over any pending entry for the same code.
+  for (const it of plannerItems) {
+    if (it.op === 'del') {
+      byMaterial.set(it.material, { material: it.material, op: 'del' });
+    } else if (typeof it.orderQuantity === 'number') {
+      byMaterial.set(it.material, { material: it.material, orderQuantity: it.orderQuantity });
+    }
+  }
+  return Array.from(byMaterial.values());
+}
+
+/**
+ * Trigger ZLOAD2 for a loading slip with per-material batch + quantity.
+ *
+ * Builds an instruction like:
+ *   "...ZLOAD2 for Loading Slip number <lsNumber>. For material X batch <B>
+ *    order quantity is N, for material Y batch <B2> order quantity is M"
+ *
+ * Resolves salesOrderId from a LoadingSlipItem with the given lsNumber so the
+ * WorkQueue row is linked to the SO.
+ *
+ * Idempotent on the full payload: dedups against existing queued/firing/done
+ * zload2 rows with the exact same LS + sorted (material, batch, quantity).
+ */
+export async function triggerZload2(
+  lsNumber: string,
+  materials: Array<{ material: string; batch: string; orderQuantity: number }>
+): Promise<void> {
+  if (materials.length === 0) {
+    console.log(`[ZLOAD2] No materials provided for LS ${lsNumber} — skipping`);
+    return;
+  }
+
+  const missingBatch = materials.find((m) => !m.batch);
+  if (missingBatch) {
+    throw new Error(
+      `[ZLOAD2] Material ${missingBatch.material} has no batch — batch is required for ZLOAD2`
+    );
+  }
+
+  const byKey = new Map<string, { material: string; batch: string; orderQuantity: number }>();
+  for (const m of materials) byKey.set(`${m.material}|${m.batch}`, { ...m });
+  const normalized = Array.from(byKey.values()).sort((a, b) =>
+    a.material === b.material ? a.batch.localeCompare(b.batch) : a.material.localeCompare(b.material)
+  );
+  const payloadKey = JSON.stringify({ lsNumber, materials: normalized });
+
+  // Dedup is scoped to ZLOAD2 via both `step` and a payload substring match on
+  // `"transaction_code":"ZLOAD2"` — prevents any cross-transaction collision.
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zload2',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"ZLOAD2"` } },
+        { payload: { contains: `"payload_key":${JSON.stringify(payloadKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOAD2] Already exists for LS ${lsNumber} payload_key=${payloadKey} (${existing.state}) — skipping`
+    );
+    return;
+  }
+
+  const clauses = normalized
+    .map((m) => `for material ${m.material} batch ${m.batch} order quantity is ${m.orderQuantity}`)
+    .join(', ');
+  const clausesSentence = clauses.charAt(0).toUpperCase() + clauses.slice(1);
+  const instruction =
+    `VPN is connected and SAP is logged in. Just go ahead and run the SAP ` +
+    `Transaction ZLOAD2 for Loading Slip number ${lsNumber}. ${clausesSentence}`;
+
+  // Any item for this lsNumber works — all items of a single LS share the same SO.
+  const lsi = await prisma.loadingSlipItem.findFirst({
+    where: { lsNumber },
+    select: { salesOrderId: true },
+  });
+
+  await enqueueWork({
+    salesOrderId: lsi?.salesOrderId ?? null,
+    step: 'zload2',
+    payload: {
+      instruction,
+      transaction_code: 'ZLOAD2',
+      meta: {
+        ls_number: lsNumber,
+        materials: normalized,
+        payload_key: payloadKey,
+      },
+    },
+  });
+  await pumpQueue();
+  console.log(`[ZLOAD2] Enqueued for LS ${lsNumber} (${normalized.length} material(s))`);
+}
+
+/**
  * Aggregated dispatch email for a multi-SO PurchaseOrder.
  *
  * Each SO's `/visibility-data` callback buffers a per-SO Email row
@@ -1826,16 +2513,30 @@ export async function assembleAndSendCombinedEmail(
     logs.push(m);
   };
 
-  // Idempotency guard
+  // Round-scoped idempotency guard. After a VA02 modification, `email_2nd_release`
+  // bumps `PurchaseOrder.dispatchRound`; the next visibility callback should
+  // send a FRESH ls_dispatch tagged with the new round. We only short-circuit
+  // when the current round's ls_dispatch is already out.
+  //
+  // Match BOTH `sent` and `replied` — once branch replies on the ls_dispatch
+  // the row flips to `replied`, and a `sent`-only filter would miss it and
+  // let a duplicate Dispatch Approval Request go out on the next sweep.
+  const poRound = await prisma.purchaseOrder.findUnique({
+    where: { id: purchaseOrderId },
+    select: { dispatchRound: true },
+  });
+  const currentRound = poRound?.dispatchRound ?? 1;
+
   const existing = await prisma.email.findFirst({
     where: {
       purchaseOrderId,
       emailType: 'ls_dispatch',
-      status: 'sent',
+      status: { in: ['sent', 'replied'] },
+      dispatchRound: currentRound,
     },
   });
   if (existing) {
-    log(`[CombinedEmail] PO ${purchaseOrderId} already has sent ls_dispatch email ${existing.id} — skipping`);
+    log(`[CombinedEmail] PO ${purchaseOrderId} round ${currentRound} already has ls_dispatch ${existing.id} — skipping`);
     return { success: true, logs, alreadySent: true };
   }
 
@@ -1875,18 +2576,25 @@ export async function assembleAndSendCombinedEmail(
   // Build the HTML body (we now compose it ourselves; no longer rely on auto_gui2's email_body)
   const sections: DispatchSoSection[] = includedSOs.map((so) => ({
     soNumber: so.soNumber,
+    // Used by `proseLineFor` / `substituteSourcePlant` to flag cross-plant
+    // substituted materials (their `plant_code` in product-db differs from
+    // the SO's own plant) so the body explicitly notes the source plant.
+    soPlant: so.plant,
     materials: so.materials.map((m) => ({
       material: m.material,
       materialDescription: m.materialDescription,
       batch: m.batch,
       orderQuantity: m.orderQuantity,
+      // Carries the virtual decrease in the modify flow; null pre-dispatch in
+      // the initial new-order flow (then the template falls back to orderQuantity).
+      dispatchQuantity: m.dispatchQuantity,
       availableStock: m.availableStock,
       orderWeightKg: m.orderWeightKg ? Number(m.orderWeightKg) : null,
     })),
   }));
-  const capacityTonnes = purchaseOrder.customer?.weightage
-    ? Number(purchaseOrder.customer.weightage)
-    : 45;
+  const capacityTonnes = purchaseOrder.weightage
+    ? Number(purchaseOrder.weightage)
+    : 0;
   const combinedBody = buildDispatchApprovalHtml(purchaseOrder.poNumber, sections, capacityTonnes);
 
   // Aggregated v2 materials JSON (used by handleBranchReply to reconstruct per-SO context)
@@ -1917,7 +2625,7 @@ export async function assembleAndSendCombinedEmail(
     },
   });
   const subjectPrefix = recentlyResolved ? 'Stock Available — ' : '';
-  const subject = `${subjectPrefix}Dispatch Approval Request - PO ${purchaseOrder.poNumber}`;
+  const purposeLabel = `${subjectPrefix}Dispatch Approval Request - PO ${purchaseOrder.poNumber}`;
   const leadSO = includedSOs[0];
   const failureNote = failedSOs.length > 0
     ? ` (visibility failed for: ${failedSOs.map((so) => so.soNumber).join(', ')})`
@@ -1925,24 +2633,24 @@ export async function assembleAndSendCombinedEmail(
 
   log(`[CombinedEmail] Sending combined HTML email for PO ${purchaseOrder.poNumber} (${includedSOs.length} SOs${failureNote})`);
 
+  // Anchor on the per-PO branch thread (shared subject; purpose in the body).
+  const { resolvePoThreadAnchor, capturePoThreadAnchor, withPurposeLineHtml } = await import('./po-thread');
+  const anchor = await resolvePoThreadAnchor(purchaseOrderId, 'branch');
+  const subject = anchor?.subject ?? purposeLabel;
+  const sendBody = withPurposeLineHtml(purposeLabel, combinedBody);
   let messageId: string;
   let threadId: string;
   try {
     let sent: { messageId: string; threadId: string };
-    if (leadSO.originalThreadId && leadSO.originalMessageId) {
+    if (anchor) {
       try {
-        const rfc822Id = await getMessageRfc822Id(leadSO.originalMessageId);
-        if (rfc822Id) {
-          sent = await sendHtmlReplyEmail(BRANCH_EMAIL, subject, combinedBody, leadSO.originalThreadId, rfc822Id);
-        } else {
-          sent = await sendHtmlEmail(BRANCH_EMAIL, subject, combinedBody);
-        }
+        sent = await sendHtmlReplyEmail(BRANCH_EMAIL, subject, sendBody, anchor.threadId, anchor.rfc822MessageId);
       } catch (replyErr) {
         log(`[CombinedEmail] Reply-in-thread failed (${replyErr instanceof Error ? replyErr.message : replyErr}); sending as new email`);
-        sent = await sendHtmlEmail(BRANCH_EMAIL, subject, combinedBody);
+        sent = await sendHtmlEmail(BRANCH_EMAIL, subject, sendBody);
       }
     } else {
-      sent = await sendHtmlEmail(BRANCH_EMAIL, subject, combinedBody);
+      sent = await sendHtmlEmail(BRANCH_EMAIL, subject, sendBody);
     }
     messageId = sent.messageId;
     threadId = sent.threadId;
@@ -1950,8 +2658,14 @@ export async function assembleAndSendCombinedEmail(
     log(`[CombinedEmail] Failed to send combined email for PO ${purchaseOrder.poNumber}: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
     return { success: false, logs };
   }
+  if (!anchor) {
+    const rfc822 = await getMessageRfc822Id(messageId);
+    if (rfc822) await capturePoThreadAnchor(purchaseOrderId, 'branch', threadId, rfc822);
+  }
 
-  // Create the FINAL Email row keyed to lead SO + PO
+  // Create the FINAL Email row keyed to lead SO + PO. Stamp with the PO's
+  // current dispatchRound so the round-scoped guards above (and the engine
+  // step handlers) can distinguish this round's ls_dispatch from prior ones.
   await prisma.email.create({
     data: {
       salesOrderId: leadSO.id,
@@ -1964,9 +2678,33 @@ export async function assembleAndSendCombinedEmail(
       emailType: 'ls_dispatch',
       workflowState: 'awaiting_reply',
       relatedMaterials: JSON.stringify(aggregated),
-      sentBody: combinedBody,
+      sentBody: sendBody,
+      dispatchRound: currentRound,
     },
   });
+
+  // Audit-trail event so the LLM planner sees the ls_dispatch milestone
+  // when reasoning about the next inbound reply. Emit one per included SO
+  // (multi-SO PO emails are joint outbound but per-SO downstream flow).
+  try {
+    const { emitEvent } = await import('./scenario-events');
+    for (const so of includedSOs) {
+      await emitEvent({
+        salesOrderId: so.id,
+        type: 'email_sent',
+        payload: {
+          emailType: 'ls_dispatch',
+          recipient: BRANCH_EMAIL,
+          subject,
+          body_excerpt: sendBody.slice(0, 200),
+          gmailMessageId: messageId,
+          dispatchRound: currentRound,
+        },
+      });
+    }
+  } catch {
+    // Audit emission must never break the primary flow.
+  }
 
   // Mark all buffered rows for this PO as consumed
   await prisma.email.updateMany({
@@ -2056,6 +2794,15 @@ export async function triggerVto1n(shipmentId: string): Promise<void> {
     });
     await pumpQueue();
     console.log(`[VTO1N-B] Enqueued for Shipment ${shipmentId} (SO ${so.soNumber}, Bundle ${bundle.bundleNumber})`);
+
+    // Advance any active scenario past 'await_vt01n'. Safe no-op when engine
+    // is disabled or no scenario is in flight.
+    try {
+      const { maybeAdvanceScenario } = await import('./scenario-engine');
+      await maybeAdvanceScenario(so.id, 'vto1n');
+    } catch (advErr) {
+      console.error('[VTO1N-B] maybeAdvanceScenario warning:', advErr);
+    }
   } catch (error) {
     console.error(`[VTO1N-B] Enqueue failed for Shipment ${shipmentId}:`, error);
     await prisma.shipment.updateMany({
@@ -2127,8 +2874,15 @@ async function triggerZload1(
   soNumber: string,
   materials: MaterialItemPayload[],
   bundleId?: string,
-  bundleNumber?: number
-): Promise<void> {
+  bundleNumber?: number,
+  /**
+   * True when the planner asked for an APPEND-mode ZLOAD1: the resulting LS
+   * attaches to an EXISTING bundle and the zload1-data callback must skip
+   * the compute-bundles path. Surfaces as `meta.append_to_bundle_id` on the
+   * WorkQueue row.
+   */
+  appendMode?: boolean,
+): Promise<boolean> {
   const materialsList = materials
     .map(
       (m) =>
@@ -2139,7 +2893,62 @@ async function triggerZload1(
   const bundleSuffix = bundleNumber ? ` (Bundle ${bundleNumber})` : '';
   const instruction = `VPN is connected, SAP is logged in. Execute ZLOAD1 for sales order ${soNumber}${bundleSuffix}. Materials to dispatch:\n${materialsList}`;
 
-  const so = await prisma.salesOrder.findFirst({ where: { soNumber }, select: { id: true } });
+  // Resolve the SO (+ its PO's current dispatch round) up front — the round is
+  // part of the append-mode dedup key below, and the id is needed for enqueue.
+  const so = await prisma.salesOrder.findFirst({
+    where: { soNumber },
+    select: { id: true, purchaseOrder: { select: { dispatchRound: true } } },
+  });
+
+  // Idempotency key.
+  //
+  // INITIAL mode (no appendMode): natural key is (SO, bundleNumber). The bundle
+  // cuid changes when computeBundlesForPo re-plans, but bundleNumber is stable
+  // within a PO. If a queued/firing/done row already exists for this
+  // (SO, bundleNumber), skip — re-firing produces duplicate LSs in SAP and
+  // orphaned work_queue rows after a re-plan. When bundleNumber is absent
+  // (legacy callers) we fall back to (SO + sorted materials).
+  //
+  // APPEND mode: an append adds a NEW LS to a bundle that the INITIAL fan-out
+  // already fired ZLOAD1 for — so it MUST NOT share the initial (SO, bundle)
+  // key, or it dedup-collides with that bundle's `done` row and is silently
+  // skipped (the caller still reports fired:1 → engine waits forever). The
+  // append key therefore also carries the dispatch round and the exact
+  // materials+qty, so: it never matches the initial key; two different appends
+  // to one bundle in a cycle both fire; the same material can be appended again
+  // in a LATER cycle (higher round); but a genuine retry (same round, same
+  // materials) is still deduped.
+  const sortedMaterials = [...materials].sort((a, b) =>
+    a.material_code === b.material_code
+      ? (a.batch || '').localeCompare(b.batch || '')
+      : a.material_code.localeCompare(b.material_code)
+  );
+  const materialsSig = JSON.stringify(
+    sortedMaterials.map((m) => `${m.material_code}/${m.batch}/${m.quantity}`)
+  );
+  const dedupKey = appendMode && bundleNumber
+    ? `so:${soNumber}|bundle:${bundleNumber}|append|round:${so?.purchaseOrder?.dispatchRound ?? 0}|mat:${materialsSig}`
+    : bundleNumber
+      ? `so:${soNumber}|bundle:${bundleNumber}`
+      : `so:${soNumber}|materials:${materialsSig}`;
+
+  const existing = await prisma.workQueue.findFirst({
+    where: {
+      step: 'zload1',
+      state: { in: ['queued', 'firing', 'done'] },
+      AND: [
+        { payload: { contains: `"transaction_code":"ZLOAD1"` } },
+        { payload: { contains: `"dedup_key":${JSON.stringify(dedupKey)}` } },
+      ],
+    },
+    select: { id: true, state: true },
+  });
+  if (existing) {
+    console.log(
+      `[ZLOAD1] Skipping duplicate for SO ${soNumber}${bundleSuffix} — existing row ${existing.id} (${existing.state})`
+    );
+    return false;
+  }
 
   await enqueueWork({
     salesOrderId: so?.id ?? null,
@@ -2152,11 +2961,14 @@ async function triggerZload1(
         so_number: soNumber,
         ...(bundleId ? { bundle_id: bundleId } : {}),
         ...(bundleNumber ? { bundle_number: bundleNumber } : {}),
+        ...(appendMode && bundleId ? { append_to_bundle_id: bundleId } : {}),
+        dedup_key: dedupKey,
       },
     },
   });
   await pumpQueue();
-  console.log(`[ZLOAD1] Enqueued for SO ${soNumber}${bundleSuffix} (${materials.length} material(s))`);
+  console.log(`[ZLOAD1] Enqueued for SO ${soNumber}${bundleSuffix}${appendMode ? ' (APPEND mode)' : ''} (${materials.length} material(s))`);
+  return true;
 }
 
 /**
@@ -2168,7 +2980,21 @@ async function triggerZload1(
 export async function handleVehicleDetailsReply(
   emailId: string,
   replyHtml: string,
-  salesOrderId: string
+  salesOrderId: string,
+  /**
+   * Vehicle details extracted by the LLM planner (passed verbatim on the
+   * `email_to_plant` step's `args.vehicles`). The planner reads the email
+   * thread, fills these in, and the handler trusts them — no second LLM
+   * extractor runs here.
+   */
+  preExtracted: {
+    vehicles: Array<{
+      bundleNumber?: number;
+      vehicleNumber: string;
+      driverMobile: string;
+      containerNumber: string;
+    }>;
+  },
 ): Promise<{ success: boolean; logs: string[] }> {
   const logs: string[] = [];
   const log = (message: string) => {
@@ -2192,25 +3018,17 @@ export async function handleVehicleDetailsReply(
   }
 
   const soNumber = email.salesOrder!.soNumber;
-  log(`[VehicleDetails] Extracting vehicle details from reply for SO ${soNumber}`);
 
-  // Strip HTML tags for cleaner text
-  const replyText = replyHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  // In planner-driven mode this function runs as the deterministic worker
+  // for the `email_to_plant` step. The planner has already extracted the
+  // vehicles from the email thread and supplied them on `preExtracted`. Job
+  // here is strictly: save vehicle details onto the Bundle, then forward
+  // the LS PDFs to the plant. No LLM extractor, no reclassification.
+  log(`[VehicleDetails] using ${preExtracted.vehicles.length} pre-extracted vehicle set(s) for SO ${soNumber}`);
 
-  // Branch may reply with vehicle details for ONE bundle or for MULTIPLE
-  // bundles in the same email (e.g. when the PO needs 2 trucks). Extract an
-  // ARRAY of {bundleNumber?, vehicleNumber, driverMobile, containerNumber}.
-  const VehicleSetSchema = z.object({
-    bundleNumber: z.number().int().nullable().optional(),
-    vehicleNumber: z.string(),
-    driverMobile: z.string(),
-    containerNumber: z.string(),
-  });
-  const ExtractionSchema = z.object({
-    vehicles: z.array(VehicleSetSchema).min(1).max(10),
-  });
-
-  // Build the bundle context for the LLM so it can disambiguate multi-truck replies.
+  // Bundle lookup table used by the per-vehicle dispatch below to resolve
+  // each extracted set onto a Bundle row by its bundleNumber. PO-scoped:
+  // a vehicle reply on a multi-PO truck plan still applies per-PO.
   const poBundles = email.purchaseOrderId
     ? await prisma.bundle.findMany({
         where: { purchaseOrderId: email.purchaseOrderId },
@@ -2218,50 +3036,15 @@ export async function handleVehicleDetailsReply(
         orderBy: { bundleNumber: 'asc' },
       })
     : [];
-  const bundleContext = poBundles.length > 0
-    ? `\nBundles in this PO (truck IDs): ${poBundles.map((b) => `Bundle ${b.bundleNumber}`).join(', ')}.\n`
-    : '';
 
   try {
-    const openai = new OpenAI();
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You extract vehicle/transport details from email replies. The reply may cover ONE truck or MULTIPLE trucks (when the dispatch is split into bundles). Return strict JSON of the form {"vehicles": [{"bundleNumber": <int or null>, "vehicleNumber": "<reg no>", "driverMobile": "<10-digit>", "containerNumber": "<container>"}, ...]}. ' +
-            'For each vehicle/truck mentioned, output one entry. ' +
-            'If the reply explicitly references "Bundle 1", "Bundle 2", "truck 1", "vehicle 1" etc., set bundleNumber to that integer. ' +
-            'If only one set of details is given without a bundle reference, set bundleNumber=null. ' +
-            'If a field is not mentioned, set it to an empty string "".',
-        },
-        {
-          role: 'user',
-          content: `Extract vehicle details from this email reply.${bundleContext}\n\n${replyText}`,
-        },
-      ],
-    });
-
-    const rawJson = completion.choices[0]?.message?.content;
-    let extractedSets: Array<{ bundleNumber?: number | null; vehicleNumber: string; driverMobile: string; containerNumber: string }> = [];
-
-    if (rawJson) {
-      try {
-        const parsed = ExtractionSchema.safeParse(JSON.parse(rawJson));
-        if (parsed.success) {
-          extractedSets = parsed.data.vehicles;
-        } else {
-          log(`[VehicleDetails] Zod validation failed: ${parsed.error.message}`);
-        }
-      } catch (parseErr) {
-        log(`[VehicleDetails] JSON parse failed: ${parseErr instanceof Error ? parseErr.message : parseErr}`);
-      }
-    } else {
-      log(`[VehicleDetails] OpenAI returned empty response`);
-    }
+    const extractedSets: Array<{ bundleNumber?: number | null; vehicleNumber: string; driverMobile: string; containerNumber: string }> =
+      preExtracted.vehicles.map((v) => ({
+        bundleNumber: v.bundleNumber ?? null,
+        vehicleNumber: v.vehicleNumber,
+        driverMobile: v.driverMobile,
+        containerNumber: v.containerNumber,
+      }));
     log(`[VehicleDetails] Extracted ${extractedSets.length} vehicle set(s) for PO ${email.purchaseOrderId ?? '(legacy)'}`);
 
     // Apply each extracted set: resolve which Bundle it belongs to, save
@@ -2336,7 +3119,8 @@ export async function handleVehicleDetailsReply(
     // If any set was incomplete, send a single follow-up email naming each.
     if (incomplete.length > 0) {
       const lines = incomplete.map((i) => `  - ${i.label}: missing ${i.missing.join(', ')}`);
-      const replyBody = [
+      const purposeLabel = `Vehicle Details Required - SO ${soNumber}`;
+      const bodyText = [
         `Thank you for your reply.`,
         '',
         `The following vehicle detail(s) are still incomplete:`,
@@ -2350,20 +3134,30 @@ export async function handleVehicleDetailsReply(
 
       try {
         const so = email.salesOrder!;
+        // Ride the per-PO branch conversation (shared subject). Fall back to the
+        // SO's NEW ORDER thread if no anchor resolves.
+        const { resolvePoThreadAnchor, withPurposeLine } = await import('./po-thread');
+        const branchAnchor = email.purchaseOrderId
+          ? await resolvePoThreadAnchor(email.purchaseOrderId, 'branch')
+          : null;
+        const replySubject = branchAnchor?.subject ?? `Re: ${purposeLabel}`;
+        const replyBody = withPurposeLine(purposeLabel, bodyText);
         let replyResult: { messageId: string; threadId: string };
-        if (so.originalThreadId && so.originalMessageId) {
+        if (branchAnchor) {
+          replyResult = await sendReplyEmail(BRANCH_EMAIL, replySubject, replyBody, branchAnchor.threadId, branchAnchor.rfc822MessageId);
+        } else if (so.originalThreadId && so.originalMessageId) {
           try {
             const rfc822Id = await getMessageRfc822Id(so.originalMessageId);
             if (rfc822Id) {
-              replyResult = await sendReplyEmail(BRANCH_EMAIL, `Re: Vehicle Details - SO ${soNumber}`, replyBody, so.originalThreadId, rfc822Id);
+              replyResult = await sendReplyEmail(BRANCH_EMAIL, replySubject, replyBody, so.originalThreadId, rfc822Id);
             } else {
-              replyResult = await sendPlainEmail(BRANCH_EMAIL, `Vehicle Details Required - SO ${soNumber}`, replyBody);
+              replyResult = await sendPlainEmail(BRANCH_EMAIL, replySubject, replyBody);
             }
           } catch {
-            replyResult = await sendPlainEmail(BRANCH_EMAIL, `Vehicle Details Required - SO ${soNumber}`, replyBody);
+            replyResult = await sendPlainEmail(BRANCH_EMAIL, replySubject, replyBody);
           }
         } else {
-          replyResult = await sendPlainEmail(BRANCH_EMAIL, `Vehicle Details Required - SO ${soNumber}`, replyBody);
+          replyResult = await sendPlainEmail(BRANCH_EMAIL, replySubject, replyBody);
         }
         await prisma.email.update({
           where: { id: emailId },
@@ -2389,10 +3183,11 @@ export async function handleVehicleDetailsReply(
     }
 
     // Send LS PDFs to plant for every bundle that just got complete details.
-    // Each saved bundle's LSIs go out with that bundle's vehicle info.
+    // One plant_ls email per LoadingSlip; each LS belongs to exactly one
+    // bundle so the bundle's vehicle info is the right one to attach.
     const completedBundleIds = saved.map((s) => s.bundleId);
-    const lsItems = completedBundleIds.length > 0
-      ? await prisma.loadingSlipItem.findMany({
+    const loadingSlipsForPlant = completedBundleIds.length > 0
+      ? await prisma.loadingSlip.findMany({
           where: { bundleId: { in: completedBundleIds }, fileUrl: { not: null } },
           include: {
             bundle: {
@@ -2401,7 +3196,7 @@ export async function handleVehicleDetailsReply(
           },
         })
       : email.bundleId
-        ? await prisma.loadingSlipItem.findMany({
+        ? await prisma.loadingSlip.findMany({
             where: { bundleId: email.bundleId, fileUrl: { not: null } },
             include: {
               bundle: {
@@ -2409,37 +3204,33 @@ export async function handleVehicleDetailsReply(
               },
             },
           })
-        : (await prisma.loadingSlipItem.findMany({
+        : (await prisma.loadingSlip.findMany({
             where: { salesOrderId, fileUrl: { not: null } },
-          })).map((it) => ({ ...it, bundle: null as null | { id: string; vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } }));
+          })).map((ls) => ({ ...ls, bundle: null as null | { id: string; vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } }));
 
-    if (lsItems.length === 0) {
+    if (loadingSlipsForPlant.length === 0) {
       log(`[VehicleDetails] No LS files found, skipping plant email`);
     } else {
-      for (const item of lsItems) {
+      for (const ls of loadingSlipsForPlant) {
         try {
-          const pdfBuffer = await downloadFromS3(item.fileUrl!);
-          const filename = item.fileUrl!.split('/').pop() || `${item.lsNumber}.pdf`;
-          // Look up the LSI's own SO (for bundle emails this can differ
-          // from the email's anchor SO).
-          const itemSo = await prisma.salesOrder.findUnique({
-            where: { id: item.salesOrderId },
+          const pdfBuffer = await downloadFromS3(ls.fileUrl!);
+          const filename = ls.fileUrl!.split('/').pop() || `${ls.lsNumber}.pdf`;
+          const lsSo = await prisma.salesOrder.findUnique({
+            where: { id: ls.salesOrderId },
             select: { soNumber: true },
           });
-          const itemSoNumber = itemSo?.soNumber ?? soNumber;
-          // Use the LSI's own bundle vehicle details when available; for the
-          // legacy non-bundle path, fall back to the SalesOrder fields.
-          const itemBundle = (item as { bundle?: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } | null }).bundle;
+          const lsSoNumber = lsSo?.soNumber ?? soNumber;
+          const lsBundle = (ls as { bundle?: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null } | null }).bundle;
           let vehicleForEmail: { vehicleNumber: string | null; driverMobile: string | null; containerNumber: string | null };
-          if (itemBundle) {
+          if (lsBundle) {
             vehicleForEmail = {
-              vehicleNumber: itemBundle.vehicleNumber,
-              driverMobile: itemBundle.driverMobile,
-              containerNumber: itemBundle.containerNumber,
+              vehicleNumber: lsBundle.vehicleNumber,
+              driverMobile: lsBundle.driverMobile,
+              containerNumber: lsBundle.containerNumber,
             };
           } else {
             const soRow = await prisma.salesOrder.findUnique({
-              where: { id: item.salesOrderId },
+              where: { id: ls.salesOrderId },
               select: { vehicleNumber: true, driverMobile: true, containerNumber: true },
             });
             vehicleForEmail = {
@@ -2448,18 +3239,29 @@ export async function handleVehicleDetailsReply(
               containerNumber: soRow?.containerNumber ?? null,
             };
           }
+          // sendLSEmail historically takes an LSI id as its first arg; pick
+          // any LSI on this LS for that legacy linkage (one of them works —
+          // they're all under the same LS).
+          const anchorLsi = await prisma.loadingSlipItem.findFirst({
+            where: { loadingSlipId: ls.id },
+            select: { id: true },
+          });
+          if (!anchorLsi) {
+            log(`[VehicleDetails] LS ${ls.lsNumber} has no LSI rows — skipping plant email`);
+            continue;
+          }
           await sendLSEmail(
-            item.id,
-            item.salesOrderId,
-            itemSoNumber,
-            item.lsNumber,
+            anchorLsi.id,
+            ls.salesOrderId,
+            lsSoNumber,
+            ls.lsNumber,
             pdfBuffer,
             vehicleForEmail,
             filename
           );
-          log(`[VehicleDetails] Sent LS ${item.lsNumber} to plant for SO ${itemSoNumber} (vehicle ${vehicleForEmail.vehicleNumber ?? 'n/a'})`);
+          log(`[VehicleDetails] Sent LS ${ls.lsNumber} to plant for SO ${lsSoNumber} (vehicle ${vehicleForEmail.vehicleNumber ?? 'n/a'})`);
         } catch (sendErr) {
-          log(`[VehicleDetails] Failed to send LS ${item.lsNumber} to plant: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
+          log(`[VehicleDetails] Failed to send LS ${ls.lsNumber} to plant: ${sendErr instanceof Error ? sendErr.message : sendErr}`);
         }
       }
     }

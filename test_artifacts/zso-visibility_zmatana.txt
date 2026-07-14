@@ -1,0 +1,5 @@
+refer file test_artifacts/3260671.json
+
+{'so_number': '3260671', 'work_id': 'cmp2fzc28000jqjo5cremo1pa'}
+
+this is the complete payload
