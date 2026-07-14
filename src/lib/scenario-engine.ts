@@ -1440,6 +1440,19 @@ export async function executeScenario(args: {
           type: 'scenario_completed',
           payload: { scenario_key: progress.scenarioKey, step_count: plan.steps.length },
         });
+        // The plan just ended on a SYNCHRONOUS no-op step (advance_now) — e.g.
+        // stock_precheck 'sufficient', a bare decrease, or any engine-fetch step
+        // the planner emitted as a SINGLE step because the next step depends on
+        // this one's outcome (available → va02, short → shortage email, …).
+        // The segmented model requires a non-email terminal step to bridge a
+        // re-plan so the planner emits the next phase instead of the SO sitting
+        // idle. Mirrors the zmatana-data SAP-callback path, but for steps that
+        // complete synchronously (no SAP callback ever fires to trigger it).
+        // replanAfterEngineFetch self-guards: it no-ops when the (now-completed)
+        // plan actually ended on an outbound email or when SAP work is still in
+        // flight, so genuine wait-for-reply / wait-for-SAP boundaries are left
+        // untouched.
+        await replanAfterEngineFetch(args.salesOrderId);
         return;
       }
       await executeScenario({ salesOrderId: args.salesOrderId, log });
