@@ -99,6 +99,17 @@ export interface Bundle {
   status: string;
 }
 
+export interface Bundle {
+  id: string;
+  bundleNumber: number;
+  vehicleNumber: string | null;
+  driverMobile: string | null;
+  containerNumber: string | null;
+  transportId: string | null;
+  sealNumber: string | null;
+  status: string;
+}
+
 export interface PurchaseOrder {
   id: string;
   poNumber: string;
